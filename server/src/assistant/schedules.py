@@ -52,6 +52,8 @@ from pydantic import BaseModel, Field
 from .agent import Tool
 from . import i18n
 from .i18n import N_, t
+from .tools.connect_tools import asked_in_chat
+
 
 log = logging.getLogger("uvicorn.error")
 
@@ -362,6 +364,7 @@ class Schedules:
         self.store, self.clock = store, clock
         self.on_paused: Callable[[dict[str, Any]], None] | None = None   # set by the server: a notification when a schedule pauses itself
         self.on_deleted: Callable[[int], None] | None = None   # set by the server: what was allowed for the schedule goes with it
+        self.on_task_changed: Callable[[int], None] | None = None   # set by the server: a new task is not covered by what was allowed for the old one (audit F6)
         self.retried_tasks: dict[int, str] = {}   # task id -> history line, for runs that called schedule_retry (no notification; start_run reads it)
         with store._lock:
             store._db.executescript(SCHEMA)
@@ -576,6 +579,10 @@ class Schedules:
         gid = self._check_goal(goal_id)
         now = self.clock()
         kind = "interval" if every else ("once" if ts is not None else ("window" if window else "cron"))
+        if created_by == "agent" and (twin := self._twin(prompt.strip(), expr, None if every else ts, every, timezone or "")):
+            # 2026-11-18: the same job asked again (a repeated request, a second turn): the one saved is kept, under the name now given
+            self.store._run("UPDATE schedules SET name = ?, updated_at = ? WHERE id = ?", (name.strip(), now, twin))
+            return {**(self.get(twin) or {}), "twin": True}
         starts, ends = self._days(kind, starts_on, ends_on, tz)
         probe = {"id": 0, "every_seconds": every, "anchor_at": ts if every else None, "created_at": now, "run_at": None if every else ts,
                  "cron": expr, "timezone": timezone or "", "window_minutes": window, "starts_on": starts, "ends_on": ends}
@@ -590,6 +597,12 @@ class Schedules:
         assert r is not None
         self.store._run("UPDATE schedules SET next_run = ? WHERE id = ?", (self._next(r, now) if enabled else None, sid))
         return self.get(sid) or {}
+
+    def _twin(self, prompt: str, cron: Any, run_at: Any, every: Any, timezone: str) -> int:
+        """The id of a saved, not deleted job with the same prompt, time and zone, or 0."""
+        rows = self.store._all("SELECT id FROM schedules WHERE archived_at IS NULL AND prompt = ? AND cron IS ? AND run_at IS ? "
+                               "AND every_seconds IS ? AND timezone = ? ORDER BY id LIMIT 1", (prompt, cron, run_at, every, timezone))
+        return int(rows[0]["id"]) if rows else 0
 
     def update(self, sid: int, **changes: Any) -> dict[str, Any] | None:
         r = self._row(sid)
@@ -643,6 +656,7 @@ class Schedules:
                      "timezone": tz_name or "", "window_minutes": int(window or 0), "starts_on": starts, "ends_on": ends}
             if self._next(probe, now) is None:
                 raise ScheduleError("it never runs again before ends_on; pick a later end day" if ends else "this schedule never runs")
+        task_changed = prompt.strip() != str(r["prompt"] or "").strip()
         self.store._run(
             "UPDATE schedules SET name = ?, prompt = ?, cron = ?, run_at = ?, timezone = ?, enabled = ?, updated_at = ?, kind = ?, "
             "every_seconds = ?, anchor_at = ?, window_minutes = ?, goal_id = ?, starts_on = ?, ends_on = ?, "
@@ -652,6 +666,8 @@ class Schedules:
             "WHERE id = ?",
             (name.strip(), prompt.strip(), expr or "", None if every else ts, tz_name or "", int(enabled), now, kind, every,
              ts if every else None, int(window or 0), gid, starts, ends, int(enabled), int(enabled), int(enabled), int(enabled), sid))
+        if task_changed and self.on_task_changed is not None:   # what the owner allowed the old task goes: they are asked again (audit F6)
+            self.on_task_changed(sid)
         r = self._row(sid)
         assert r is not None
         self.store._run("UPDATE schedules SET next_run = ? WHERE id = ?", (self._next(r, now) if enabled else None, sid))
@@ -1188,8 +1204,8 @@ def schedule_tools(schedules: Schedules, scheduler: Scheduler | None = None) -> 
                 out.append({"label": t("When"), "value": when_words(args)})
             except ScheduleError:
                 pass
-        if args.get("prompt"):
-            out.append({"label": t("Task"), "value": str(args["prompt"])[:120]})
+        if args.get("prompt"):   # the whole task, not a cut: a runbook runs unattended, so the owner reads all of it before a tap (audit F6)
+            out.append({"label": t("Task"), "value": str(args["prompt"])})
         return out
 
     def extra(_approval_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -1210,6 +1226,9 @@ def schedule_tools(schedules: Schedules, scheduler: Scheduler | None = None) -> 
             return f"error: {e}"
         if scheduler:
             scheduler.poke()
+        if s.get("twin"):
+            return (f"Already had schedule #{s['id']} '{s['name']}' with the same prompt and time: kept it, no second one. "
+                    "Change it with schedule_update if the user wants something else.")
         return (f"Saved schedule #{s['id']} '{s['name']}': {s['description']}, next run {s['next_run']} ({s['timezone']}). If its runs "
                 "will sign in, pay, book, send something or change something, ask now, once, with task_allow(schedule_id="
                 f"{s['id']}, trigger, action, ...) so they do not stop for an approval nobody is there to give.")
@@ -1294,6 +1313,14 @@ def schedule_tools(schedules: Schedules, scheduler: Scheduler | None = None) -> 
             return "say why in reason (what blocks it and what the user needs to do)"
         return None
 
+    def pauses_another(args: dict[str, Any]) -> bool:
+        """A job pausing itself (its blocked run, or the default id of a scheduled run) needs no card; pausing another job does."""
+        return pause_id(args) != (current_schedule_id() or 0)
+
+    async def describe_pause(args: dict[str, Any]) -> str:
+        s = schedules.get(pause_id(args)) or {}
+        return t("Pause the schedule '{name}'? It stays paused until it is turned back on.", name=s.get("name", ""))
+
     async def pause(args: dict[str, Any]) -> str:
         s = schedules.pause(pause_id(args), str(args.get("reason") or ""))
         if s is None:
@@ -1347,29 +1374,35 @@ def schedule_tools(schedules: Schedules, scheduler: Scheduler | None = None) -> 
              "goal_id": {"type": "integer", "description": "the goal this job serves"}}
     bare = {k: {kk: vv for kk, vv in v.items() if kk != "description"} for k, v in props.items()}   # schedule_update: described once
     return [
-        Tool("schedule_create", "Save a job that runs on its own later or on a repeat; the user approves it. Give exactly one of cron, "
+        Tool("schedule_create", "Save a job that runs on its own later or on a repeat. Asked in this chat it goes ahead; otherwise the user "
+             "approves it on a card. Give exactly one of cron, "
              "every_minutes or run_at (run_at may start every_minutes). To wait for a condition that needs a sign-in or browsing, poll "
-             "with every_minutes as often as the request needs (5 for something that sells out fast). Then ask once with task_allow for "
+             "with every_minutes as often as the request needs (5 only when minutes matter). Then ask once with task_allow for "
              "what its runs will do. Tell the user the time in words, never as cron. When the user has not said when or how often "
              "it repeats, never pick it yourself: ask first in your one setup question, with quick_replies kind weekdays_time and "
-             "1-2 sensible suggestions, and create it after they answer.",
+             "1-2 sensible suggestions, and create it after they answer. A check that follows something through until its outcome is "
+             "known (an earlier answer that may change, a pending decision) is not such a job: pick a pace that fits what it follows, "
+             "write in its prompt what to look at, that an unchanged result tells nobody and when it ends; keeping it going after the "
+             "outcome is known needs the user's yes.",
              {"type": "object", "properties": props, "required": ["name", "prompt"]}, create, requires_approval=True,
-             validate=validate_create, describe=describe_create, approval_extra=extra),
+             validate=validate_create, describe=describe_create, approval_extra=extra, auto_approve=lambda a: asked_in_chat()),
         Tool("schedule_list", "List the scheduled jobs with their times, state and last result.",
              {"type": "object", "properties": {"goal_id": {"type": "integer", "description": "only this goal's"}}}, list_, read_only=True),
-        Tool("schedule_update", "Change a scheduled job (fields as in schedule_create) or turn it on/off (on also resumes a paused one). The "
-             "user approves changes; turning one off needs no approval.",
+        Tool("schedule_update", "Change a scheduled job (fields as in schedule_create) or turn it on/off (on also resumes a paused one). "
+             "Asked in this chat changes go ahead; otherwise the user approves them on a card. Turning one off needs no approval.",
              {"type": "object", "properties": {"id": {"type": "integer"}, **bare, "enabled": {"type": "boolean"}}, "required": ["id"]},
-             update, requires_approval=True, validate=validate_update, describe=describe_update, auto_approve=only_pausing,
+             update, requires_approval=True, validate=validate_update, describe=describe_update,
+             auto_approve=lambda a: only_pausing(a) or asked_in_chat(),
              approval_extra=extra),
         Tool("schedule_delete", "Delete a scheduled job (restorable in the app for 30 days); the user approves it.",
              {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}, delete, requires_approval=True,
              validate=validate_id, describe=describe_delete),
         Tool("schedule_pause", "Pause a scheduled job that something blocks for good (not a one-off failure); the user is told your reason. "
-             "In a scheduled run, id defaults to that job.",
+             "In a scheduled run, id defaults to that job. Pausing another job asks the user first.",
              {"type": "object", "properties": {"id": {"type": "integer"}, "reason": {"type": "string", "description":
                                                 "what blocks it and what the user needs to do, in the user's language"}},
-              "required": ["reason"]}, pause, validate=validate_pause),
+              "required": ["reason"]}, pause, validate=validate_pause, requires_approval=True, auto_approve=lambda a: not pauses_another(a),
+             describe=describe_pause),
         Tool("schedule_retry", "Only in a scheduled run that a temporary block stops (the site is under maintenance, down or sold out right "
              "now): run this same job again later, with the same permissions. Never make a new schedule for that.",
              {"type": "object", "properties": {

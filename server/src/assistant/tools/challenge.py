@@ -26,7 +26,7 @@ from typing import Any
 
 from ..i18n import N_, t
 
-# Reads what `detect` needs. Nothing typed by the user is read; only addresses, sizes, a few element marks and the title.
+# Reads what `detect` needs. Nothing typed by the user is read; only addresses, sizes, a few element marks and the title. One-time-code boxes are counted by structure.
 # (Kept free of words the test fakes route on: no attribute setters, no "pw:".)
 PROBE_JS = r"""() => {
   const kelo_check = 1;
@@ -44,17 +44,23 @@ PROBE_JS = r"""() => {
   const whole = document.body ? document.body.innerText : '';
   const text = whole.slice(0, 3000);
   const ins = [...document.querySelectorAll('input')].filter((e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
-  const named = (e) => [e.name, e.id, e.getAttribute('placeholder'), e.getAttribute('aria-label')].filter(Boolean).join(' ').toLowerCase();
-  const otpOne = ins.filter((e) => (e.getAttribute('autocomplete') || '').toLowerCase() === 'one-time-code'
-    || /otp|one.?time|verif\w*.?code|2fa|mfa|totp|인증\s*번호|인증\s*코드|보안\s*코드/.test(named(e))).length;
-  const singles = ins.filter((e) => e.maxLength === 1).length;
+  // a code box by STRUCTURE only (no name, id or label is read): autocomplete one-time-code; a row of 4-8 one-character boxes; or the one
+  // visible box shaped like a code (numeric input mode, or a short maxlength of 4-8) that carries no autocomplete token naming something else
   const kind = (e) => (e.getAttribute('type') || '').toLowerCase();
+  const token = (e) => (e.getAttribute('autocomplete') || '').toLowerCase();
+  const other = (e) => token(e).split(/\s+/).some((t) => t && t !== 'off' && t !== 'on' && t !== 'one-time-code');
+  const tokened = ins.filter((e) => /(^|\s)one-time-code(\s|$)/.test(token(e))).length;
+  const singles = ins.filter((e) => e.maxLength === 1 && !e.disabled && !e.readOnly && ['', 'text', 'tel', 'number', 'password'].includes(kind(e))).length;
+  const shaped = ins.filter((e) => ['', 'text', 'tel', 'number'].includes(kind(e)) && !e.disabled && !e.readOnly && !other(e) && e.maxLength !== 1
+    && ((/numeric|decimal/.test(e.inputMode || '') && !(e.maxLength > 12)) || (e.maxLength >= 4 && e.maxLength <= 8))).length;
   const secret_box = ins.some((e) => kind(e) === 'password' && getComputedStyle(e).visibility !== 'hidden');
+  // a short box a person could type into: not a search box (type or role), not a box of a search form
+  const lookup = (e) => kind(e) === 'search' || e.getAttribute('role') === 'searchbox' || !!e.closest('[role=search]');
   const short_inputs = ins.filter((e) => ['', 'text', 'tel', 'number'].includes(kind(e)) && !e.disabled && !e.readOnly
-    && !/search|query|keyword|검색/.test(named(e)) && ((e.maxLength > 0 && e.maxLength <= 12) || /numeric|decimal/.test(e.inputMode || '') || kind(e) !== 'text' || ins.length <= 3)).length;
+    && !lookup(e) && ((e.maxLength > 0 && e.maxLength <= 12) || /numeric|decimal/.test(e.inputMode || '') || kind(e) !== 'text' || ins.length <= 3)).length;
   return { kelo_check, title: (document.title || '').slice(0, 160), frames, marks, scripts, text, text_len: whole.length, url: location.href.slice(0, 300),
            secret_box, short_inputs,
-           inputs: document.querySelectorAll('input:not([type=hidden])').length, otp: otpOne + (singles >= 4 && singles <= 8 ? 1 : 0) };
+           inputs: document.querySelectorAll('input:not([type=hidden])').length, otp: tokened + (singles >= 4 && singles <= 8 ? 1 : (tokened === 0 && shaped === 1 ? 1 : 0)) };
 }"""
 
 
@@ -87,10 +93,6 @@ _FRAMES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(?:awswaf\.com|captcha\.awswaf)"), "aws_waf"),
     (re.compile(r"(?:px-cdn\.net|perimeterx\.net|px-cloud\.net|/px/captcha)"), "perimeterx"),
 ]
-_TITLES: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"^just a moment\.{0,3}$|^attention required!? \| cloudflare|^잠시만 기다리십시오|^please wait\.{0,3}$|^one more step$", re.I), "cloudflare"),
-    (re.compile(r"access to this page has been denied|^human verification$|^are you a robot\??$", re.I), "perimeterx"),
-]
 _MIN_SIDE = 30   # a frame or box smaller than this (both sides) is a badge or a hidden helper, not a check the user must do
 
 
@@ -121,10 +123,7 @@ def detect(probe: Any, *, status: int | None = None, headers: dict[str, str] | N
     if blocked_status and any(k.startswith("x-px") for k in h):
         return Challenge("perimeterx", "interstitial", [f"HTTP {status} with a PerimeterX header"])
 
-    # 2. a full-page check: its title or its running marks, or a Cloudflare server answering 403/503 with its check page
-    for rx, vendor in _TITLES:
-        if rx.search(title):
-            return Challenge(vendor, "interstitial", [f"title {title[:60]!r}"])
+    # 2. a full-page check: its running marks (never its title words), or a Cloudflare server answering 403/503 with its check page
     if "cf_running" in marks:
         return Challenge("cloudflare", "interstitial", ["Cloudflare check page elements"])
     if blocked_status and h.get("server", "").lower() == "cloudflare" and (any("challenges.cloudflare.com" in s for s in scripts) or "turnstile" in marks):
@@ -151,31 +150,22 @@ def detect(probe: Any, *, status: int | None = None, headers: dict[str, str] | N
     return None
 
 
-_DENIED = re.compile(r"access\s+denied|forbidden|request\s+blocked|blocked\s+request|you\s+don'?t\s+have\s+permission|unusual\s+traffic|"
-                     r"temporarily\s+blocked|too\s+many\s+requests|has\s+been\s+blocked|reference\s*#?\s*\d+[.\w]*|errors?\.edgesuite|"
-                     r"접근\s*(?:이\s*)?(?:거부|차단)|액세스\s*(?:가\s*)?거부|차단되었|(?:사용|접근|이용)\s*권한이\s*(?:없|제한)|권한이\s*없습니다|アクセス.{0,6}(?:拒否|できません)|访问被拒绝|存取被拒", re.I)
-_EDGE_SERVER = re.compile(r"akamaighost|cloudflare|cloudfront|fastly|varnish|awselb|imperva|incapsula|sucuri", re.I)
 BLOCKED_MAX_TEXT = 1500   # a blocking page is short; a long page that answered 403 is an ordinary page
 
 
 def blocked(status: int | None, headers: dict[str, str] | None, title: str, text: str) -> str | None:
-    """An access-denied page: the site's edge answers a short error page instead of the page (HTTP 401/403/429/503, a short body that
-    says access denied / forbidden / blocked / a reference number, or a CDN edge's bare error). It is not a puzzle a person can solve,
-    so waiting and retrying do not help. Returns what the site said ('HTTP 403 "Access Denied"') or None. A human check (challenge.detect
-    finds a vendor's check page, frame or marks, or the answer carries a check vendor's header) is never blocked here: it keeps its
-    hand-over path. `text` is the page's visible text."""
-    if status not in (401, 403, 429, 503):
+    """An access-denied page, by structure: the site answered HTTP 403, 429 or 503 for the page with a short body (a refusal page, not
+    an ordinary page that happens to answer 403) and it is not a human check (a check vendor's header, mark or frame is never blocked
+    here: it keeps its hand-over path). It is not a puzzle a person can solve, so waiting and retrying do not help. Returns what the
+    site said ('HTTP 403 "<first line>"') or None. 401 is a request to sign in, not a block. No word of any language is read.
+    `text` is the page's visible text."""
+    if status not in (403, 429, 503):
         return None
     h = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
     if h.get("cf-mitigated") or h.get("x-amzn-waf-action") or any(k.startswith(("x-px", "x-datadome", "x-dd-")) for k in h):
         return None
     title, body = (title or "").strip(), (text or "").strip()
-    if any(rx.search(title) for rx, _ in _TITLES) or len(body) > BLOCKED_MAX_TEXT:
-        return None
-    edge = bool(_EDGE_SERVER.search(h.get("server", ""))) or any(k.startswith("x-akamai") for k in h) or "x-amz-cf-id" in h \
-        or "error from cloudfront" in h.get("x-cache", "").lower()
-    said = _DENIED.search(title) or _DENIED.search(body)
-    if not said and not (edge and len(body) < 400):
+    if len(body) > BLOCKED_MAX_TEXT:
         return None
     words = " ".join((title or body.split("\n", 1)[0]).split())[:60]
     return f'HTTP {status} "{words}"' if words else f"HTTP {status}"
@@ -243,6 +233,23 @@ def handover_note(outcome: str, host: str, minutes: int = 0) -> str:
     return f"[The human check on {site} was not solved (the task is stopping). {away}{site} could not be used.]"
 
 
+def signed_out_note(site: str, login: str, *, job: bool, minutes: int) -> str:
+    """What the agent is told when a site refuses a browser that is not signed in to it: the next step is the sign-in (brief B2)."""
+    head = (f"[{site} refused Kelo's browser, and Kelo's browser is not signed in to {site}. Sites often refuse a browser that is not "
+            "signed in, so the next step is to sign in: do not retry the page, switch the view or use another address. ")
+    if login:
+        how = (f"A saved login exists: open {site}'s home page, follow the site's own sign-in link and call browser_login(name={login!r}) there "
+               "(or pass that link's ref as via and Kelo clicks it). ")
+    elif job:
+        how = (f"No login is saved for {site} and nobody can sign in during this job: report that Kelo's browser needs to be signed in "
+               f"to {site} once, and do not use {site} again in this job. ")
+    else:
+        how = (f"No login is saved for {site}: ask the user to save one (request_login) or to sign in once themselves by taking over "
+               "the browser. ")
+    return head + how + (f"For the next {minutes} minutes Kelo's browser loads {site} only to sign in; after the sign-in succeeds, "
+                         "start again from the site's home page.]")
+
+
 def blocked_note(host: str, why: str, *, job: bool | None = None, count: int = 1, second: bool = False) -> str:
     """What the agent is told when a site answers with an access-denied page."""
     site = host or "the site"
@@ -256,21 +263,12 @@ def blocked_note(host: str, why: str, *, job: bool | None = None, count: int = 1
         is_job = bool(job)
 
     if is_job:
-        if count >= 3:
-            return (f"[This site ({site}) is blocking Kelo's browser: it answered {why}. It keeps blocking even after clearing cookies. "
-                    "Do not retry again. Call report(status='blocked', summary=...) without retry_after_min, explaining that the site does not let Kelo's browser in right now. "
-                    "Do not open or click on it again.]")
-        if second or count >= 2:
-            return (f"[This site ({site}) is blocking Kelo's browser: it answered {why}. It keeps blocking after the automatic retry. "
-                    "Do not retry again. Call report(status='needs_input', summary=...) explaining that the site keeps blocking Kelo's browser, "
-                    "and ask the user whether to clear that site's cookies and try again (signing in again will be needed). "
-                    "Do not open or click on it again.]")
-        return (f"[This site ({site}) is blocking Kelo's browser: it answered {why}. Do not retry the same click or search. "
-                "Stop trying on this site and call report(status='blocked', summary=..., retry_after_min=10) so the job will "
-                "automatically retry once after 10 minutes.]")
+        return (f"[This site ({site}) is blocking Kelo's browser: it answered {why}. Stop on this site: do not retry, "
+                f"open another address of it or switch to its mobile site. Call report(status='blocked', reason='site_refused', "
+                f"summary=...) saying what you could not do there; the user can take over the browser to sign in or get past it.]")
 
-    return (f"[This site ({site}) is blocking Kelo's browser: it answered {why}. Do not retry the same click or search. "
-            "Tell the user the site is blocking Kelo's browser right now, and offer to retry in 10 minutes as a background job.]")
+    return (f"[This site ({site}) is blocking Kelo's browser: it answered {why}. Do not retry. "
+            f"Tell the user plainly that it refused Kelo's browser and that they can take over the browser to sign in or get past it.]")
 
 
 def blocked_again_note(host: str) -> str:

@@ -5,7 +5,9 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable  # noqa: F401
 from typing import TYPE_CHECKING, Any
 
+from . import tool_roles
 from .reply_text import ReplyText
+from .workers import ALREADY_SAID_NOTE, already_said
 from .turn_engine import Turn, _server  # noqa: F401
 
 if TYPE_CHECKING:
@@ -26,16 +28,20 @@ def start_worker_turn(ctx: Any, w: dict[str, Any], transcript: list[dict[str, An
     provider, model = resolve_model(None, None)
     tz = store.profile()["timezone"]
     messages = [{"role": "system", "content": system_text(provider, model, tz)}, *transcript]
+    if w.get("kind") == tool_roles.PHONE_KIND:   # the phone job's tools are not core tools: they are loaded for it up front, never searched for
+        ctx.tool_scopes.add(f"job:{w['id']}", [t.name for t in worker_tools if tool_roles.is_phone_tool(t.name) or t.name in tool_roles.PHONE_HELPERS])
     turn = start_turn(provider, model, messages, observe, source="worker", title=w["title"], unattended=True, owner=w["tab"],
                       tools_=worker_tools, max_steps=steps, tool_scope=f"job:{w['id']}")
     turn.quiet_end = True
     turn.worker_id = w["id"]
+    if getattr(ctx, "run_progress", None) is not None:
+        ctx.run_progress.set_count(f"job:{w['id']}", int(w.get("steps") or 0))
     activity.link_task(turn.task_id, w["parent_task_id"], w["id"])
     return turn
 
 
 async def worker_handoff(ctx: Any, w: dict[str, Any], text: str, head: str, quiet: bool = False, *, again: dict[str, Any] | None = None,
-                         cond: str = "") -> None:
+                         cond: str = "", self_started: bool = False, owner_asked: bool = False) -> None:
     """A job's report reaches the main conversation: stored as a hidden message (GET /api/messages leaves it out) and answered by the
     main agent in a turn of its own, one at a time and after a chat reply that is running.
     `again`: the same turn once more after a restart or a model outage ({"message_id", "note", "from", "restarts"}): the hidden
@@ -72,6 +78,9 @@ async def worker_handoff(ctx: Any, w: dict[str, Any], text: str, head: str, quie
             return
         tz = store.profile()["timezone"]
         if again is None:
+            said = already_said(store.messages(limit=12), workers.run_started(w["id"]))   # what the chat already told the owner in this run
+            if said:
+                text = f"{text}\n{ALREADY_SAID_NOTE.format(said=said)}"
             mid = store.add_message("user", text)
             ctx = TurnContext(tz, [{"role": "user", "content": text}], mid)
         else:
@@ -90,17 +99,19 @@ async def worker_handoff(ctx: Any, w: dict[str, Any], text: str, head: str, quie
                 said.feed(item)
 
         turn = start_turn(provider, model, ctx.tail, observe, source="handoff", title=w["title"], unattended=True, owner="owner",
-                          context=ctx, cond=cond)
+                          context=ctx, cond=cond, self_started=self_started, owner_asked=owner_asked)
         # a retry of an approval that ran out (followups.py) starts this again: a watcher's hit keeps working for the watcher
         # (`cond`), so what the owner allowed it at setup still covers the step, as it did on the first run
-        turn.rerun = {"kind": "background", "prompt": text[:8000], "title": w["title"], "source": "background",
-                      "owner": f"task:{secrets.token_hex(4)}", "note": BACKGROUND_NOTE,
-                      "saved_as": i18n.t("[Task handed over · {title}]", title=w["title"]), **({"cond": cond} if cond else {})}
+        if not self_started:   # a run Kelo started on its own asks nothing, so there is nothing to try again
+            turn.rerun = {"kind": "background", "prompt": text[:8000], "title": w["title"], "source": "background",
+                          "owner": f"task:{secrets.token_hex(4)}", "note": BACKGROUND_NOTE,
+                          "saved_as": i18n.t("[Task handed over · {title}]", title=w["title"]), **({"cond": cond} if cond else {})}
         turn.note_head = head
         turn.quiet_end = quiet
         activity.link_task(turn.task_id, w["parent_task_id"], w["id"])
         keep_resume(turn, {"kind": "handoff", "message_id": mid, "title": w["title"], "head": head, "quiet": quiet,
-                           "parent_task_id": w["parent_task_id"], "worker_id": w["id"], **({"cond": cond} if cond else {})},
+                           "parent_task_id": w["parent_task_id"], "worker_id": w["id"], **({"cond": cond} if cond else {}),
+                           **({"self_started": True} if self_started else {}), **({"owner_asked": True} if owner_asked else {})},
                     int((again or {}).get("restarts") or 0), (again or {}).get("from"))
         await turn.ended.wait()
         if not stopping[0]:   # the job's work is over (unless it waits for the user): its messages get their emoji
@@ -172,7 +183,8 @@ def worker_limit_text(ctx: Any, until: float | None) -> str:
     main = journal_model()
     if main and limit_guard.balance_out(main[0]):
         return i18n.t(model_limits.BALANCE_STOPPED, provider=model_limits.provider_name(main[0]))
-    return model_limits.paused_text(until if until and worker_limit_known() else None, store.profile()["timezone"])
+    busy = bool(main and limit_guard.busy_now(main[0]))   # a busy model (429, reset unknown): "busy", not "used up"
+    return model_limits.paused_text(until if until and worker_limit_known() else None, store.profile()["timezone"], busy=busy)
 
 
 def worker_limit_notice(ctx: Any, row: dict[str, Any], until: float) -> bool:

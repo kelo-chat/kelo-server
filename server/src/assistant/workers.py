@@ -16,8 +16,14 @@ interrupted) goes on where it stopped, same tab and same transcript, with `resum
 (POST /api/workers/{id}/resume), or on its own when the login it asked for is saved or the user hands its browser tab back.
 
 Every step of a job is a turn of the server (start_turn): approvals reach the user like any unattended run (card + notification, payments
-still only through confirm_purchase), browser cards and the live view work, and each run of a job is a task in the task log, linked to the
+still only through checkout_review), browser cards and the live view work, and each run of a job is a task in the task log, linked to the
 task that started the job (tasks.parent_id / worker_id).
+
+A cut job (a restart or a lost browser, job_cuts.py): the checkpoint is the finished tool call. The one call that was running at the
+cut gets a cut result chosen by what it could have done: a read is done again; a step that sends, changes or deletes is checked first
+(its ledger record is unknown until action_result); a pay press is never pressed again for the same order (the shop's page decides).
+It goes on by itself at once, then after 60 s and 300 s; a fourth cut in a row at the same step stops it as blocked, and the owner
+decides (a manual resume starts the count again). A finished tool call after a pick-up resets the count.
 
 State lives in SQLite (tables workers, worker_messages). The transcript is rebuilt from the turn's events as they happen, so a restart loses
 at most the step in flight. On start-up a job that was running is marked interrupted and resumed (in a new tab when its tab is gone, told
@@ -35,31 +41,54 @@ import secrets
 import time
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from . import tool_labels
+from . import tool_labels, tool_roles
+from .chat_views import PHONE_KEY
 from .activity import host_of, title_from
 from .agent import Tool, emit_ui, inbox
 from .agent.found_secrets import scrub
 from .agent.loop import digest_tool_results
 from .compaction import request_tokens
 from .i18n import N_, t
+from .job_cuts import Cut, cut_result, next_pickup, open_calls, pickup_note
+from .outside_rule import OWNER_SOURCES
+from .shopping import ProductResults, pages_read, verify
+from .tools.sites import registrable
 
 log = logging.getLogger("uvicorn.error")
 
-KINDS = ("browser", "research", "general")
+KINDS = ("browser", "research", "general", tool_roles.CHECKOUT_KIND, tool_roles.PHONE_KIND)
 REPORT_STATUSES = ("done", "needs_input", "blocked", "failed")
+REPORT_NEEDS = ("answer", "site_data_reset")       # report(need=...): a typed reason the code may branch on; the summary is never read
+REPORT_REASONS = ("site_refused", "sign_in", "human_check", "not_available", "site_error")
 STATUSES = ("running", "needs_input", "blocked", "done", "failed", "stopped", "interrupted")
 PAUSED = ("needs_input", "blocked", "interrupted")
 MAIN_ONLY = ("delegate", "workers_list", "worker_status", "worker_message", "worker_stop", "resume",
              "await_reply", "followup_snooze", "followup_cancel",   # these three: follow-ups (followups.py) are the main chat's
+             "set_owner_settings", "finish_first_chat",   # the first conversation is the main chat's (first_chat.py)
              "set_tone",   # how Kelo talks to the user: changed only when the user asks in the chat
-             "browser_forget_site")
+             "browser_forget_site", "browser_profiles", "browser_profile_delete",   # sign-in data controls: the owner asks the chat
+             "chat_view")   # the browser or phone shown in the chat is hidden only by the main agent (chat_views.py)
 HANDOFF_MARK = "[Handoff from a background job, not from the user]"   # leads the hidden message; GET /api/messages leaves these out
+ALREADY_SAID_NOTE = ("Already told the owner in the chat after this job was started or sent on (your own words): {said}\n"
+                     "Do not say any of that again. Say only what is new since then: what the job did or found, and what is needed now.")
+SAID_CHARS = 800
+
+
+def already_said(messages: list[dict[str, Any]], since: float) -> str:
+    """The chat's own replies written since `since` (the start of the job's run), oldest first, joined and cut to the last SAID_CHARS
+    characters; "" when there are none or the start is not known."""
+    if since <= 0:
+        return ""
+    said = [m["content"].strip() for m in messages if m.get("role") == "assistant" and isinstance(m.get("content"), str)
+            and float(m.get("created_at") or 0) >= since - 2 and m["content"].strip()]
+    return " / ".join(said)[-SAID_CHARS:]
 STATUS_HEAD = {"done": N_("Finished"), "needs_input": N_("Needs your help"), "blocked": N_("Got stuck"), "failed": N_("It did not work out")}
 RESTART_REASON = N_("Stopped because the server restarted")   # translate with t() where it is saved or shown
 LIMIT_RETRY = 1800.0   # a job paused by the usage limit with no reset time known looks again after this long
@@ -69,10 +98,44 @@ PAUSED_TAB_SECONDS = 86400.0   # a paused job keeps its tab this long (the user 
 KEPT_TAB_SECONDS = 3600.0      # a finished job that asked to keep its tab keeps it this long
 MAX_DEADLINE_MIN = 240
 CUT_NOTE = "[This step was cut off (a restart or a stop) before it gave a result. Check the page before you go on.]"
+PICKED_UP_LINE = N_("Picked up where it stopped after the Kelo server restarted")
+BROWSER_PICKED_UP_LINE = N_("The browser restarted; it went on in a new tab")
+CUT_LOOP_LINE = N_("Stopped: the Kelo server restarted {n} times while this job was at the same step. Resume it to try again.")
+DRAIN_SECONDS = 25.0   # a stop waits this long for a step that sends, changes or pays to finish before it cuts it (job_cuts.py)
 # A job that is getting somewhere never stops at its budget: it goes on in chunks, each with a fresh step / time / token budget, as long
 # as the chunk before made progress (new distinct tool calls that succeeded: a new item handled, a new result read). A chunk without any
 # is a loop (the same steps again) and stops the job; MAX_CHUNKS bounds it all.
 MAX_CHUNKS = 25
+# The payment split (docs/browser-workers.md): a job that finds things has no paying tool; a job of kind "checkout" pays and cannot search.
+FINDER_NOTE = (" You have no payment tools: you can fill a cart and read a checkout page, but you cannot pay. When the job ends at a purchase, "
+               "report done and put a checkout brief in details so a payment specialist can finish it without asking: the shop's address "
+               "and the cart or checkout page, each item with its variants and quantity, the quoted total and currency, delivery and contact "
+               "choices already made, the limits the user set, and the stage to stop at.")
+CHECKOUT_BRIEF = ("You are the payment specialist. You complete one checkout and nothing else: you cannot search the web or start other jobs. "
+                  "Start on the shop's home page named above, click to the cart like a person, check the cart against the assignment (items, variants, quantities, total, currency, delivery), "
+                  "fill the delivery and contact fields with your page tools, then pay only through checkout_review (draft, then ready) and "
+                  "checkout_submit, and read the shop's own confirmation and call purchase_result. When the cart differs from the "
+                  "assignment (another item, a higher price, an extra fee, a sign-up) or a choice is missing, do not guess: report "
+                  "needs_input and name it. When the offer is gone or the shop refuses, report blocked. Never start a second purchase for "
+                  "an order whose outcome is not settled. Put the outcome (placed, not_placed or unknown) and the confirmation in the report.")
+# The phone split (docs/phone-worker.md): only a job of kind "phone" drives the Android device; every other run has no phone tool.
+PHONE_NOTE = (" You have no phone tools: when the job needs an app on the Android device, say so in details and put a phone brief there "
+              "(the app, the goal in the user's terms, the choices already made, the limits the user set, where to stop), so a phone job "
+              "can do it without asking.")
+# The browser split (docs/browser-workers.md): the chat does not click or type on websites; the instructions every run reads say so, so a job is told it is the one.
+BROWSER_NOTE = (" Your instructions say the chat gives website work to a job: you are that job, so click, type and sign in with your own browser "
+                "tools yourself. You have no one to ask but the user: report needs_input with one clear question.")
+PHONE_BRIEF = ("You are the phone worker: the one job that drives the Android device, and you do only the assignment above, in the app it "
+               "names. You cannot search the web, use a browser or start other jobs. Look at the screen (android_look) before you tap "
+               "or type; open the app (android_open) when it is not in front. You cannot see the conversation: do not guess. When the "
+               "app shows something the assignment does not cover (a choice, a sign-in you cannot do with a saved login, a permission "
+               "dialog you may not answer, an order or a price that differs from the assignment), stop and report needs_input with the "
+               "question, the options and your recommendation. A step that needs the user's own hands (a human check, a screen you "
+               "cannot read) is theirs: report needs_input saying what they must do on the phone; the agent you report to hands them the phone "
+               "and resumes you. A new app's first screens (a permission dialog, an intro, an ad, a rating box, terms) are handled by the tool "
+               "results: when one names the controls that get through, use them, and put each \"First-run step\" line a tool result gave "
+               "into your report. Stop where the assignment says to stop; never go beyond it. The user may watch "
+               "the device on the phone card and take it over: follow what the tool results say.")
 CHUNK_PROGRESS = 1
 CHUNK_NOTE = ("[Not from the user: this job's step budget for one stretch of work is used up and a fresh one starts now ({done} so far). "
               "Go on with what is left; do not redo finished items. Finish with report when everything is done.]")
@@ -94,22 +157,20 @@ CREATE TABLE IF NOT EXISTS workers (
     input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, token_cap INTEGER NOT NULL,
     report TEXT NOT NULL DEFAULT '', wait_on TEXT NOT NULL DEFAULT '', login TEXT NOT NULL DEFAULT '', last_url TEXT NOT NULL DEFAULT '',
     status_text TEXT NOT NULL DEFAULT '', lines TEXT NOT NULL DEFAULT '[]', error TEXT NOT NULL DEFAULT '', keep_tab INTEGER NOT NULL DEFAULT 0,
-    segments INTEGER NOT NULL DEFAULT 0, auto_resume INTEGER NOT NULL DEFAULT 0, wake_at REAL NOT NULL DEFAULT 0, retries INTEGER NOT NULL DEFAULT 0);
+    segments INTEGER NOT NULL DEFAULT 0, auto_resume INTEGER NOT NULL DEFAULT 0, wake_at REAL NOT NULL DEFAULT 0, retries INTEGER NOT NULL DEFAULT 0,
+    question_id TEXT NOT NULL DEFAULT '', cut TEXT NOT NULL DEFAULT '', cuts INTEGER NOT NULL DEFAULT 0,
+    pickups INTEGER NOT NULL DEFAULT 0, picked_up_at REAL NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS worker_messages (
     worker_id TEXT NOT NULL, seq INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (worker_id, seq));
 """
 
 
+def new_question_id() -> str:
+    """The id of a job's open question: `q_` and 16 hex digits (worker_message's answer_to names it)."""
+    return "q_" + secrets.token_hex(8)
+
+
 BUSY_GIVE_UP = 48 * 3600.0   # a job waiting for a busy / unreachable model gives up after this long in all
-
-
-def _outage_text(text: str) -> bool:
-    """The job's turn failed because the model was busy or unreachable (resume.is_outage on its error), not because of the job."""
-    if not text:
-        return False
-    from .providers.types import ProviderError
-    from .resume import is_outage
-    return is_outage(ProviderError(text))
 
 
 @dataclass(slots=True)
@@ -120,7 +181,7 @@ class Limits:
     tokens: int = 4_000_000    # input + output tokens per job, counted from its last start
 
     def budget(self, kind: str, deadline_min: Any = None) -> tuple[int, int]:
-        share = {"browser": 1.0, "research": 0.5}.get(kind, 0.3)
+        share = {"browser": 1.0, "research": 0.5, tool_roles.CHECKOUT_KIND: 0.5, tool_roles.PHONE_KIND: 0.5}.get(kind, 0.3)
         steps = max(10, int(self.steps * share))
         minutes = max(5, int(self.minutes * (1.0 if kind == "browser" else 0.5)))
         try:
@@ -140,12 +201,16 @@ class WorkerHost:
     emit: Callable[[dict[str, Any], list[int], list[str]], Awaitable[None]]   # a turn event to the running turns of these tasks / ids
     tools: Callable[[], list[Tool]]                      # every tool of the app (the jobs' list is made from it)
     browser: bool = False
+    pay_split: bool = True                               # only a job of kind "checkout" has the payment tools (tool_roles.py)
+    phone_split: bool = True                             # only a job of kind "phone" has the phone tools (tool_roles.py)
+    browser_split: bool = True                           # the chat does not click or type on websites; a job does (tool_roles.py)
     tab_open: Callable[[str], bool] = lambda _k: False
     has_picture: Callable[[str], bool] = lambda _k: False
     controlled: Callable[[str], bool] = lambda _k: False
     retire_tab: Callable[[str], Awaitable[Any]] | None = None
     login_saved: Callable[[str], bool] = lambda _n: False
     window: Callable[[], int] = lambda: 150_000
+    bind_profile: Callable[[str, str], Any] = lambda _key, _profile: None   # (tab key, named browser profile id): the job's window opens in it
     on_delegate: Callable[[str, str], Any] = lambda _turn_id, _wid: None   # (parent turn id, job id): the job takes on the turn's permissions
     on_end: Callable[[str, str], Any] = lambda _wid, _status: None   # (job id, status) a job ended without a report (stopped)
     # the model's usage limit (model_limits.py): the paused line, the hold's end now (None = not held), and the one notice
@@ -155,16 +220,28 @@ class WorkerHost:
     limit_notice: Callable[[dict[str, Any], float], bool] = lambda _row, _until: True
     # how far the job's allowed items are: (done, total) from its task permissions, or None
     progress: Callable[[str], tuple[int, int] | None] = lambda _wid: None
+    # is a running turn working with this browser tab / the phone right now? (a hand-back then needs no hidden message: the turn gets the note)
+    turn_on: Callable[[str], bool] = lambda _k: False
+    # a cut job (job_cuts.py): the unknown records of a task as (id, tool, what it was); the open pay attempt of a tab; the tab book's
+    # state of a tab ("kept" | "new" | "held" | "none"); moving records to a picked-up run; is a step that sends or pays in flight?
+    cut_records: Callable[[int | None], list[tuple[int, str, str]]] = lambda _task: []
+    cut_pay: Callable[[str], str | None] = lambda _tab: None
+    tab_state: Callable[[str], str] = lambda _tab: "none"
+    adopt_records: Callable[[list[int], int | None], None] = lambda _ids, _task: None
+    step_busy: Callable[[], bool] = lambda: False
 
 
 @dataclass
 class _Live:
     task: asyncio.Task | None = None
+    started_at: float = 0.0                        # when this run of the job began (_launch)
     turn: Any = None
     inbox: list[dict[str, Any]] = field(default_factory=list)
     stop: bool = False
     timed_out: bool = False
     report: dict[str, Any] | None = None
+    product_refused: int = 0
+    report_products: list[Any] | None = None
     seen: set[str] = field(default_factory=set)   # distinct tool calls that succeeded in this job (progress)
     chunk_progress: int = 0                        # of them, in the stretch of work going on now
     chunks: int = 0                                # fresh budgets given since the job was (re)started
@@ -185,6 +262,8 @@ class _Recorder:
         self.done: dict[str, Any] | None = None
         self.error = ""
         self.login = ""
+        self.device = False   # the job showed the phone to the owner (a "device" card): it waits on the phone, not on a tab
+        self.cleared = False  # the first finished call of this stretch resets the job's cut count (a pick-up that made progress)
 
     def add(self, msg: dict[str, Any]) -> None:
         self.w._append(self.wid, self.next, msg)
@@ -229,6 +308,9 @@ class _Recorder:
             if item.get("id") in self.open:
                 self.open.pop(item["id"])
                 self.add({"role": "tool", "tool_call_id": item["id"], "content": str(item.get("output", ""))})
+            if not item.get("is_error") and not self.cleared:
+                self.cleared = True
+                self.w._clear_cuts(self.wid)
             out = str(item.get("output", ""))
             if item.get("name") == "request_login" and not item.get("is_error") and (m := re.search(r"browser_login\(name='([^']+)'\)", out)):
                 self.login = m.group(1)
@@ -244,6 +326,8 @@ class _Recorder:
             self.done = item
         elif kind == "error":
             self.error = str(item.get("message", ""))
+        elif kind == "device":
+            self.device = True
         elif kind == "browser":
             self.w._update(self.wid, last_url=str(item.get("url") or "")[:500], status_text=self.w._status(self.wid, str(item.get("status") or "")))
 
@@ -262,9 +346,13 @@ class Workers:
     def __init__(self, store: Any, host: WorkerHost, limits: Limits | None = None, *, resume_on_start: bool = True,
                  clock: Callable[[], float] = time.time):
         self.store, self.host, self.limits, self.resume_on_start, self._clock = store, host, limits or Limits(), resume_on_start, clock
+        self.products = ProductResults(store)
+        self.chat_views: Any = None   # the chat's views (chat_views.py), set by server.py
         self._live: dict[str, _Live] = {}
+        self._owner_words: dict[str, tuple[str, str]] = {}   # job -> (key, the owner's own message passed to it); done_once uses it once
         self._queue: list[tuple[str, str]] = []     # automatic resumes waiting for a free slot: (id, why)
         self._closing = False
+        self._cut_seen: set[str] = set()            # jobs this process already cut at its start (startup may run again after a Keyguard unlock)
         with store._lock:
             store._db.executescript(SCHEMA)
             have = {r[1] for r in store._db.execute("PRAGMA table_info(workers)")}
@@ -272,6 +360,14 @@ class Workers:
                 store._db.execute("ALTER TABLE workers ADD COLUMN wake_at REAL NOT NULL DEFAULT 0")
             if "retries" not in have:
                 store._db.execute("ALTER TABLE workers ADD COLUMN retries INTEGER NOT NULL DEFAULT 0")
+            if "question_id" not in have:   # the id of the open question of a job that reported needs_input ("q_" + 16 hex), "" otherwise
+                store._db.execute("ALTER TABLE workers ADD COLUMN question_id TEXT NOT NULL DEFAULT ''")
+            if "parent_cond" not in have:   # the conditional task (watcher:N / schedule:N) that handed the job over, "" for a chat
+                store._db.execute("ALTER TABLE workers ADD COLUMN parent_cond TEXT NOT NULL DEFAULT ''")
+            for col, ddl in (("profile", "TEXT NOT NULL DEFAULT ''"), ("cut", "TEXT NOT NULL DEFAULT ''"), ("cuts", "INTEGER NOT NULL DEFAULT 0"),
+                             ("pickups", "INTEGER NOT NULL DEFAULT 0"), ("picked_up_at", "REAL NOT NULL DEFAULT 0")):
+                if col not in have:   # job_cuts.py: the last cut, the cuts in a row, the pick-ups, when the last one started
+                    store._db.execute(f"ALTER TABLE workers ADD COLUMN {col} {ddl}")
             store._db.commit()
 
     # ------------------------------------------------------------------ storage
@@ -299,6 +395,18 @@ class Workers:
     def transcript(self, wid: str) -> list[dict[str, Any]]:
         return [json.loads(r["message"]) for r in self.store._all(
             "SELECT message FROM worker_messages WHERE worker_id = ? ORDER BY seq", (wid,))]
+
+    def _clear_cuts(self, wid: str) -> None:
+        self.store._run("UPDATE workers SET cuts = 0 WHERE id = ? AND cuts > 0", (wid,))
+
+    def _note_line(self, wid: str, text: str) -> None:
+        """One line on the job card's steps list (not a step: nothing ran)."""
+        r = self._row(wid)
+        if r is None:
+            return
+        lines = json.loads(r["lines"] or "[]")[-(LINES_KEPT - 1):]
+        lines.append({"at": round(self._clock(), 3), "text": text})
+        self._update(wid, lines=json.dumps(lines, ensure_ascii=False))
 
     def _line(self, wid: str, item: dict[str, Any]) -> None:
         name = str(item.get("name", ""))
@@ -330,8 +438,23 @@ class Workers:
         for r in old:
             self.store._run("DELETE FROM worker_messages WHERE worker_id = ?", (r["id"],))
             self.store._run("DELETE FROM workers WHERE id = ?", (r["id"],))
+        self.products.forget_workers({r["id"] for r in self.store._all("SELECT id FROM workers")})
 
     # ------------------------------------------------------------------ what the app and the agent see
+    def open_job_for(self, turn_id: str = "", task_id: int | None = None, owner: str = "", known: Any = ()) -> dict[str, Any] | None:
+        """A job that is still open (running, needs_input, blocked) and belongs to this reply: one it handed off itself, one of the same
+        task, or one working in the reply's own tab or on the phone it shows. None when there is none."""
+        rows = self.store._all("SELECT * FROM workers WHERE status = 'running' OR status IN (%s) ORDER BY created_at DESC"
+                               % ",".join("?" * len(PAUSED)), PAUSED)
+        for r in rows:
+            if r["id"] in known or (task_id is not None and r["parent_task_id"] == task_id) or (turn_id and r["turn_id"] == turn_id):
+                return r
+            if owner and r["tab"] == owner:
+                return r
+            if r["status"] in PAUSED and (json.loads(r["wait_on"] or "{}")).get("kind") == "device":
+                return r
+        return None
+
     def running_count(self) -> int:
         return int(self.store._all("SELECT COUNT(*) AS n FROM workers WHERE status = 'running'")[0]["n"])
 
@@ -344,7 +467,13 @@ class Workers:
         elif r["status"] == "interrupted":
             reason = r["error"] or t(RESTART_REASON)
         wake_at = float(r["wake_at"]) if float(r.get("wake_at") or 0) > 0 else None
+        if wait.get("kind") == "cut" and r["status"] == "interrupted":   # a cut job goes on at this time (job_cuts.next_pickup)
+            wake_at = float(wait.get("until") or 0) or None
         status = "waiting" if r["status"] == "blocked" and wake_at is not None else r["status"]
+        picked = None
+        if r.get("picked_up_at") and r["status"] == "running":
+            cut = Cut.of(r.get("cut") or "")
+            picked = {"at": float(r["picked_up_at"]), "why": cut.why if cut is not None else "restart"}
         out = {"id": r["id"], "kind": r["kind"], "title": r["title"], "status": status, "parent_task_id": r["parent_task_id"],
                "task_id": r["task_id"], "turn_id": r["turn_id"] or None, "tab": r["tab"], "started_at": r["created_at"],
                "updated_at": r["updated_at"], "finished_at": r["finished_at"], "steps": r["steps"], "max_steps": r["max_steps"],
@@ -352,7 +481,9 @@ class Workers:
                "waiting_for": wait.get("kind"),
                "login": wait.get("login"), "reason": reason, "status_text": r["status_text"] or None, "last_url": r["last_url"] or None,
                "thumbnail": f"/api/browser/sessions/{r['tab']}/screenshot" if self.host.has_picture(r["tab"]) else None,
-               "progress": ({"done": p[0], "total": p[1]} if (p := self.progress_of(r["id"])) else None)}
+               "progress": ({"done": p[0], "total": p[1]} if (p := self.progress_of(r["id"])) else None), "picked_up": picked}
+        if r["status"] in ("needs_input", "blocked") and r.get("question_id"):   # a paused job's question: answer_to names it
+            out["question_id"] = r["question_id"]
         if full:
             out.update(task=r["task"], url=r["url"] or None, files=json.loads(r["files"] or "[]"), report=report,
                        lines=json.loads(r["lines"] or "[]"), segments=r["segments"], input_tokens=r["input_tokens"],
@@ -371,6 +502,19 @@ class Workers:
     def get(self, wid: str) -> dict[str, Any] | None:
         r = self._row(wid)
         return self.public(r, full=True) if r else None
+
+    def waits_for_owner(self, key: str) -> bool:
+        """A job's tab ("task:<job id>") whose job ended its run asking the owner for something (needs_input): the browser list
+        shows it as "waiting", not as an idle tab (owner report 2026-11-19)."""
+        if not key.startswith("task:w"):
+            return False
+        r = self._row(key[5:])
+        return r is not None and r["status"] == "needs_input"
+
+    def kind_of(self, wid: str) -> str:
+        """The kind of a job ("browser", "research", ...), "" when there is no such job."""
+        r = self._row(wid)
+        return str(r["kind"] or "") if r else ""
 
     def prompt_block(self, within: float = 86400) -> str:
         """For the main agent's turn lines: the jobs that run or wait now and the ones that ended in the last day, with their state
@@ -409,20 +553,39 @@ class Workers:
         return bool(r["keep_tab"]) and r["status"] == "done" and now - (r["finished_at"] or 0) < KEPT_TAB_SECONDS
 
     # ------------------------------------------------------------------ starting, going on, stopping
+    def _notes(self) -> str:
+        """What a job that is not the payment specialist or the phone worker is told it does not have (the splits that are on)."""
+        return ((FINDER_NOTE if self.host.pay_split else "") + (PHONE_NOTE if self.host.phone_split else "")
+                + (BROWSER_NOTE if self.host.browser_split else ""))
+
     def _brief(self, wid: str, task: str, kind: str, url: str, files: list[str], steps: int, minutes: int) -> str:
         lines = [f"[Not from the user: you are a background job ({wid}) the main assistant started for the user. Nobody watches this run "
                  "and nobody reads text you write: work with your tools until the job is finished, then call report. The job:]", task]
-        if url:
+        if url and kind == tool_roles.CHECKOUT_KIND:   # owner answer 2026-11-19 (S7b): the cart address is never opened; the shop's home page is
+            parts = urlsplit(url)
+            lines.append(f"Start at: {parts.scheme}://{parts.netloc}/ (the shop's home page; the cart is reached by clicking the shop's own "
+                         "cart link or button, never by an address you were given)")
+        elif url:
             lines.append(f"Start at: {url}")
         if files:
             lines.append("Files to use (in your files; read them with read_file or extract_document): " + ", ".join(files))
-        if kind == "browser":
-            lines.append("Use your browser tools; this job has a browser tab of its own.")
+        if kind == tool_roles.CHECKOUT_KIND:
+            lines.append(CHECKOUT_BRIEF + (BROWSER_NOTE if self.host.browser_split else ""))
+        elif kind == "browser":
+            lines.append("Use your browser tools; this job has a browser tab of its own." + self._notes())
         elif kind == "research":
             lines.append("Look things up with web_search and web_fetch (the browser only for pages that need it) and read the sources; "
-                         "put the addresses you used in details.")
-        lines.append("If the job does the same kind of step on many items (all / every / these N), find the items first, then call "
-                     "request_task_permission once with the real count and the list, then do them one after another. Work in order and "
+                         "put the addresses you used in details. This browser is not signed in to any site. When a step needs a "
+                         "sign-in, skip it and say in your report what you could not check." + self._notes())
+        elif kind == tool_roles.PHONE_KIND:
+            lines.append(PHONE_BRIEF)
+        elif self.host.phone_split or self.host.browser_split:
+            lines.append(((PHONE_NOTE if self.host.phone_split else "") + (BROWSER_NOTE if self.host.browser_split else "")).strip())
+        many = ("If the job does the same kind of step on many items (all / every / these N), find the items first, then ask once with "
+                "the real count and the list (report needs_input), then do them one after another. " if kind == tool_roles.PHONE_KIND else
+                "If the job does the same kind of step on many items (all / every / these N), find the items first, then call "
+                "request_task_permission once with the real count and the list, then do them one after another. ")
+        lines.append(many + "Work in order and "
                      "keep track of what is done: when a stretch of work uses its budget and you were getting somewhere, a fresh budget "
                      "follows by itself. Keep going until every item is done or something really stops you (a limit, a refusal, a check you "
                      "cannot solve, an approval declined); do not stop to ask whether to continue. Show how far you are with "
@@ -430,8 +593,10 @@ class Workers:
         lines.append(
             f"Budget: about {steps} steps and {minutes} minutes. Finish by calling report(status, summary, details?, keep_tab?) once, as your last step:\n"
             "- done: the job is complete. summary: the result in the user's language, with facts (prices, times, numbers) copied exactly.\n"
-            "- needs_input: you need the user: a login, a choice, a one-time code, or a step they must do on the page. Before you pause "
-            "for anything but a login or a code, try 2-3 other ways yourself (the per-item action again, the site's own request, another "
+            "- needs_input: you need the user: a login, a choice, a one-time code, or a step they must do on the page. A step the site requires "
+            "before it goes on that your task forbids or does not mention is the user's choice: do not take it, and do not back out of the site's "
+            "flow to look for a way around; report needs_input at once, naming that step and what it does, and asking whether to take it. Before "
+            "you pause for anything else but a login or a code, try 2-3 other ways yourself (the per-item action again, the site's own request, another "
             "page or tool). Then the summary says in 2-4 lines what you tried and why each failed, the concrete options with your "
             "recommendation, and ends with one question; never just \"tell me how\". When a website login "
             "is missing, call request_login for that site first. You will be resumed here, with this history and this tab, once it is "
@@ -446,8 +611,10 @@ class Workers:
             "background jobs.")
         return "\n".join(lines)
 
-    async def delegate(self, args: dict[str, Any]) -> str:
-        if current_worker.get():
+    async def delegate(self, args: dict[str, Any], *, by_app: bool = False) -> str:
+        """The `delegate` tool. `by_app`: the app itself starts the job (the hand-over of a final checkout step, tools/checkout_handover.py),
+        so the caller may be a job."""
+        if current_worker.get() and not by_app:
             return ("Error: you are a background job yourself and cannot start another. Do the work with your own tools, or call "
                     "report(status='needs_input') if you need the user.")
         task = str(args.get("task") or "").strip()
@@ -456,17 +623,38 @@ class Workers:
         kind = str(args.get("kind") or "general").strip().lower()
         if kind not in KINDS:
             return f"Error: kind must be one of {', '.join(KINDS)}."
-        if kind == "browser" and not self.host.browser:
-            return "Error: this copy has no browser, so a browser job cannot run. Use kind research or general, or do it yourself."
+        if kind in ("browser", tool_roles.CHECKOUT_KIND) and not self.host.browser:
+            return f"Error: this copy has no browser, so a {kind} job cannot run. Use kind research or general, or do it yourself."
+        if kind == tool_roles.PHONE_KIND:
+            if not any(tool_roles.is_phone_tool(t.name) for t in self.host.tools()):
+                return "Error: this copy has no Android device set up, so a phone job cannot run. Tell the user the device is not set up."
+            if (other := self._open_phone()) is not None:
+                return (f"Error: phone job {other} is still open. There is one device, so one phone job at a time: continue that job with "
+                        "worker_message (a correction, the user's answer) or resume instead of starting another.")
         if (n := self.running_count()) >= self.limits.concurrent:
             return (f"Error: {n} background jobs are running already (the most at once). Wait for one to report, or stop one with "
                     "worker_stop, then try again.")
         url = str(args.get("url") or "").strip()
+        if kind == tool_roles.PHONE_KIND:
+            url = ""   # the device is the job's surface, there is no page to start on
         if url and not re.match(r"^https?://[^\s/]+", url):
             if re.match(r"^[\w.-]+\.[a-z]{2,}(/\S*)?$", url, re.I):
                 url = "https://" + url
             else:
                 return "Error: url must be a web address (https://...)."
+        if kind == tool_roles.CHECKOUT_KIND:
+            if not url:
+                return ("Error: a checkout job needs url: the shop's home page (it clicks to the cart itself). Write the whole assignment in task: the items "
+                        "with variants and quantities, the quoted total and currency, delivery and contact choices, the limits the user set.")
+            if (other := self._open_checkout(host_of(url))) is not None:
+                return (f"Error: checkout job {other} for this shop is still open. A shop gets one checkout window at a time: continue that "
+                        "job with worker_message or resume instead of starting another (a new job is not a way to retry an unresolved order).")
+        profile = str(args.get("profile") or "").strip()
+        if profile and kind == "browser":   # another account on the same site: a browser job only (research is signed out, a checkout is the owner's)
+            if not any(p["id"] == profile for p in self.store.browser_profiles()):
+                return "Error: there is no browser profile with this id. browser_profiles lists them; leave profile out for the default one."
+        else:
+            profile = ""
         files = [str(f).strip()[:200] for f in (args.get("files") or []) if str(f).strip()][:10] if isinstance(args.get("files"), list) else []
         steps, minutes = self.limits.budget(kind, args.get("deadline_min"))
         parent = current_turn.get() or {}
@@ -474,12 +662,16 @@ class Workers:
         while self._row(wid) is not None:
             wid = "w" + secrets.token_hex(3)
         now = self._clock()
-        title = title_from(task)
+        title = str(args.get("title") or "").strip()[:80] or title_from(task)
         self.store._run(
-            "INSERT INTO workers(id, kind, title, task, url, files, status, parent_task_id, parent_source, tab, created_at, updated_at, "
-            "max_steps, deadline_at, minutes, token_cap) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO workers(id, kind, title, task, url, files, status, parent_task_id, parent_source, parent_cond, tab, created_at, "
+            "updated_at, max_steps, deadline_at, minutes, token_cap) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (wid, kind, title, task[:8000], url, json.dumps(files, ensure_ascii=False), "running", parent.get("task_id"),
-             str(parent.get("source") or "chat"), f"task:{wid}", now, now, steps, now + minutes * 60, minutes, self.limits.tokens))
+             str(parent.get("source") or "chat"), str(parent.get("cond") or "")[:80], f"task:{wid}", now, now, steps, now + minutes * 60,
+             minutes, self.limits.tokens))
+        if profile:
+            self.store._run("UPDATE workers SET profile = ? WHERE id = ?", (profile, wid))
+            self.host.bind_profile(f"task:{wid}", profile)
         self._append(wid, 0, {"role": "user", "content": self._brief(wid, task, kind, url, files, steps, minutes)})
         try:
             self.host.on_delegate(str(parent.get("turn_id") or ""), wid)
@@ -488,12 +680,46 @@ class Workers:
         self._prune()
         self._launch(wid, "")
         await emit_ui({"type": "worker", "id": wid, "status": "running", "title": title})
-        return (f"Handed off; you will hear back when it is done. (job {wid}: {kind}, up to {steps} steps / {minutes} min, in a browser tab of its own.) "
+        if self.chat_views is not None and str(parent.get("source") or "chat") in ("chat", "api"):
+            # a job a chat asked for shows its tab (or the phone) in the chat from its start (chat_views.py); its first card follows
+            if kind == tool_roles.PHONE_KIND:
+                self.chat_views.open(PHONE_KEY, "phone", worker_id=wid)
+            elif kind in ("browser", tool_roles.CHECKOUT_KIND):
+                self.chat_views.open(f"task:{wid}", "browser", worker_id=wid)
+        where = "on the Android device" if kind == tool_roles.PHONE_KIND else "in a browser tab of its own"
+        return (f"Handed off; you will hear back when it is done. (job {wid}: {kind}, up to {steps} steps / {minutes} min, {where}.) "
                 "It runs on its own; its report comes back to you by itself as a handoff message. Do not check on it with workers_list "
                 "or worker_status now: tell the user in one short line that it is underway, and go on.")
 
+    def job_kind(self, wid: str) -> str:
+        r = self._row(wid)
+        return str(r["kind"]) if r is not None else ""
+
+    def open_checkout(self, host: str) -> str | None:
+        return self._open_checkout(host)
+
+    def _open_checkout(self, host: str) -> str | None:
+        """The id of a checkout job on this shop that is running or paused (one checkout window per shop at a time), else None."""
+        for r in self.store._all("SELECT id, url FROM workers WHERE kind = ? AND status IN ('running', 'needs_input', 'blocked', 'interrupted')",
+                                 (tool_roles.CHECKOUT_KIND,)):
+            if host and host_of(r["url"]) == host:
+                return str(r["id"])
+        return None
+
+    def _open_phone(self) -> str | None:
+        """The id of a phone job that is running or paused (there is one device), else None."""
+        rows = self.store._all("SELECT id FROM workers WHERE kind = ? AND status IN ('running', 'needs_input', 'blocked', 'interrupted') "
+                               "ORDER BY created_at LIMIT 1", (tool_roles.PHONE_KIND,))
+        return str(rows[0]["id"]) if rows else None
+
+    def run_started(self, wid: str) -> float:
+        """When this run of the job began (0 when it is not known)."""
+        live = self._live.get(wid)
+        return live.started_at if live else 0.0
+
     def _launch(self, wid: str, note: str) -> None:
         live = self._live.setdefault(wid, _Live())
+        live.started_at = self._clock()
         live.stop = live.timed_out = False
         live.report, live.turn = None, None
         live.chunk_progress = live.chunks = 0
@@ -503,9 +729,10 @@ class Workers:
         except RuntimeError:
             live.task = None
 
-    def resume(self, wid: str, note: str = "", *, why: str = "", auto: bool = False) -> tuple[bool, str]:
+    def resume(self, wid: str, note: str = "", *, why: str = "", auto: bool = False, cut: Cut | None = None) -> tuple[bool, str]:
         """Go on with a job that is not running: same transcript, same tab (a new one when it is gone), a fresh budget from here.
-        (ok, "resumed" | "queued" | "running" | "limit" | "missing")."""
+        `cut`: an automatic pick-up of a cut job (its pick-up note in `why` says the tab; the cut count stays). Any other resume starts
+        the count again. (ok, "resumed" | "queued" | "running" | "limit" | "missing")."""
         r = self._row(wid)
         if r is None:
             return False, "missing"
@@ -522,12 +749,13 @@ class Workers:
         parts = [why or "You are resumed."]
         if note.strip():
             parts.append(f"Message for you: {note.strip()}")
-        if r["last_url"] and not self.host.tab_open(r["tab"]):
-            parts.append(f"Your browser tab was closed meanwhile; a new blank tab will open. Continue from the history above: open "
-                         f"{r['last_url']} again if you need it.")
-        parts.append("Go on from where you stopped and finish with report.")
-        self._update(wid, status="running", wait_on="", report="", error="", finished_at=None, auto_resume=0, keep_tab=0,
-                     wake_at=0.0, max_steps=r["steps"] + steps, deadline_at=now + minutes * 60, minutes=minutes,
+        if cut is None and r["last_url"] and not self.host.tab_open(r["tab"]):
+            parts.append(f"Your browser tab was closed meanwhile; a new blank tab will open. Continue from the history above. Your last page "
+                         f"was {r['last_url']}: if you need it, open that site's home page and get back to it through the site's own links.")
+        if cut is None:   # a pick-up's note ends with its own tail (job_cuts.PICKUP_TAIL)
+            parts.append("Go on from where you stopped and finish with report.")
+        self._update(wid, status="running", wait_on="", report="", error="", finished_at=None, auto_resume=0, keep_tab=0, question_id="",
+                     wake_at=0.0, cuts=r["cuts"] if cut is not None else 0, max_steps=r["steps"] + steps, deadline_at=now + minutes * 60, minutes=minutes,
                      token_cap=r["input_tokens"] + r["output_tokens"] + self.limits.tokens)
         self._queue = [q for q in self._queue if q[0] != wid]
         self._launch(wid, "[Not from the user: " + " ".join(parts) + "]")
@@ -538,6 +766,7 @@ class Workers:
         r = self._row(wid)
         if r is None:
             return False
+        self._owner_words.pop(wid, None)
         live = self._live.get(wid)
         self._queue = [q for q in self._queue if q[0] != wid]
         if live and live.task and not live.task.done():
@@ -551,7 +780,7 @@ class Workers:
             return True
         if r["status"] in ("done", "failed", "stopped"):
             return True
-        self._update(wid, status="stopped", finished_at=self._clock(), wait_on="", keep_tab=0, wake_at=0.0)
+        self._update(wid, status="stopped", finished_at=self._clock(), wait_on="", keep_tab=0, wake_at=0.0, question_id="")
         self._emit(wid)
         try:
             self.host.on_end(wid, "stopped")
@@ -560,11 +789,36 @@ class Workers:
         await self._retire(r["tab"])
         return True
 
-    def message(self, wid: str, text: str) -> tuple[bool, str]:
-        """A word for a job: a running one reads it before its next step; one that is not running is resumed with it."""
+    def owner_said(self, wid: str, text: str) -> None:
+        """The owner's own words reach this job (their chat message relayed by the main agent, or typed in the app for it)."""
+        if text.strip():
+            self._owner_words[wid] = (secrets.token_hex(4), text.strip()[:2000])
+
+    def owner_words(self, wid: str) -> tuple[str, str] | None:
+        """(key, the owner's own words) passed to this job and not used yet, or None. Only the server sets them (owner_said)."""
+        return self._owner_words.get(wid) if wid else None
+
+    def owner_words_used(self, wid: str, key: str) -> None:
+        """done_once ran a step again on these words: they are used up (one "again" per message)."""
+        if wid in self._owner_words and self._owner_words[wid][0] == key:
+            self._owner_words.pop(wid, None)
+
+    def message(self, wid: str, text: str, answer_to: str = "", *, owner_text: str = "") -> tuple[bool, str]:
+        """A word for a job: a running one reads it before its next step; one that is not running is resumed with it. `answer_to` (the
+        question id a job's needs_input report carries) makes it the answer to that question: refused ("stale" / "wrong") unless it is
+        the job's open question. `owner_text`: the owner's own words this message carries (their chat message, or the app's text); a
+        job's repeat check may use them once (done_once.py)."""
         r = self._row(wid)
         if r is None:
             return False, "missing"
+        if owner_text:
+            self.owner_said(wid, owner_text)
+        if answer_to:
+            if r["status"] not in ("needs_input", "blocked") or not r.get("question_id"):
+                return False, "stale"
+            if answer_to != r["question_id"]:
+                return False, "wrong"
+            return self.resume(wid, text, why="The user answered your question.")
         live = self._live.get(wid)
         if r["status"] == "running" and live and live.task and not live.task.done():
             live.inbox.append({"role": "user", "content": f"[Not from the user directly: a message for you from the main assistant: {text.strip()}]"})
@@ -586,23 +840,55 @@ class Workers:
 
     def control_changed(self, key: str, device: str | None) -> None:
         """A tab changed hands. The user handing a paused job's tab back (they did a step on the page, solved a check) lets it go on."""
-        if device is not None or not key.startswith("task:w"):
+        if device is None:
+            self.handed_back(key, "", "owner", "browser")
+
+    def handed_back(self, key: str, summary: str = "", reason: str = "owner", kind: str = "browser") -> None:
+        """The owner handed a browser tab (`key`) or the phone back, or lost it by a time-out (`reason`). `summary`: what they did there (the
+        tools' own note for the agent's next look; never typed text). Paused jobs waiting on that tab / the phone go on by themselves. When no
+        job and no running turn takes it up, the summary is written into the chat as hidden context (it does not wake the model; the next
+        message sees it): a chat turn that ended still learns what the owner did and that handing back approved nothing."""
+        woke = False
+        if kind == "phone":
+            rows = [r for r in self.store._all("SELECT * FROM workers WHERE status IN ('needs_input', 'blocked')")
+                    if (json.loads(r["wait_on"] or "{}")).get("kind") == "device"]
+            what = "phone"
+        else:
+            r = self._row(key[5:]) if key.startswith("task:w") else None
+            rows = [r] if r is not None and r["status"] in ("needs_input", "blocked") else []
+            what = "browser"
+        for r in rows:
+            lead = "The owner's control timed out, so it came back to you. " if reason == "timeout" else ""
+            ok, _ = self.resume(r["id"], why=lead + (f"The user handed the {what} back to you (they may have done a step on it themselves). "
+                                                     + ("Look at the screen with android_look and go on. " if what == "phone"
+                                                        else "Read the page with browser_read and go on. ")
+                                                     + "Handing it back approves no purchase."), auto=True)
+            woke = woke or ok
+        if woke or not summary or self.host.turn_on(key):
             return
-        r = self._row(key[5:])
-        if r is not None and r["status"] in ("needs_input", "blocked"):
-            self.resume(r["id"], why="The user handed the browser back to you (they may have done a step on the page themselves). Read the "
-                                     "page with browser_read and go on.", auto=True)
+        try:
+            self.store.add_message("user", f"{HANDOFF_MARK}\nThe owner used the {what} themselves and handed it back; no job or reply was waiting on it.\n"
+                                           f"{summary}")
+        except Exception:  # noqa: BLE001 - the note is a courtesy; handing back never fails because of it
+            log.exception("could not record a hand-back")
 
     def _drain(self) -> None:
         while self._queue and self.running_count() < self.limits.concurrent and not self._closing:
             wid, why = self._queue.pop(0)
             r = self._row(wid)
             if r is not None and r["status"] in PAUSED:
-                self.resume(wid, why=why, auto=True)
+                if (json.loads(r["wait_on"] or "{}")).get("kind") == "cut":
+                    self._pickup(wid)
+                else:
+                    self.resume(wid, why=why, auto=True)
 
     # ------------------------------------------------------------------ running
-    def _worker_tools(self) -> list[Tool]:
-        return [t for t in self.host.tools() if t.name not in MAIN_ONLY and t.name != "report"] + [self.progress_tool(), self.report_tool()]
+    def _worker_tools(self, kind: str = "general") -> list[Tool]:
+        """The job's tools: every tool minus the ones that steer jobs; by role (tool_roles.py) a payment specialist has the paying tools and
+        the browser's page tools only, the phone job has the phone's tools only, every other job has no paying and no phone tool."""
+        base = [t for t in self.host.tools() if t.name not in MAIN_ONLY and t.name != "report"]
+        base = tool_roles.for_kind(base, kind, pay_split=self.host.pay_split, phone_split=self.host.phone_split, browser_split=self.host.browser_split)
+        return base + [self.progress_tool(), self.report_tool()]
 
     def _fit(self, msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """A long job's history for the next request: older results as one-line digests, then the oldest steps left out (the brief stays)."""
@@ -624,6 +910,8 @@ class Workers:
     async def _run(self, wid: str, note: str) -> None:
         live = self._live[wid]
         current_worker.set(wid)
+        if (r0 := self._row(wid)) is not None and r0["profile"]:
+            self.host.bind_profile(f"task:{wid}", r0["profile"])   # a resumed job's window opens in its profile again
         if note:
             self._append(wid, self._next_seq(wid), {"role": "user", "content": note})
         nudged = False
@@ -659,7 +947,7 @@ class Workers:
 
                 token = inbox.set(take)
                 try:
-                    turn = self.host.start_turn(r, self._fit(self.transcript(wid)), left, self._worker_tools(), rec)
+                    turn = self.host.start_turn(r, self._fit(self.transcript(wid)), left, self._worker_tools(r["kind"]), rec)
                 except Exception as e:  # noqa: BLE001 - no model, ...
                     detail = getattr(e, "detail", None) or f"{type(e).__name__}: {e}"
                     outcome = ("failed", t("Could not start: {error}", error=str(detail)[:200]), "", False)
@@ -668,6 +956,7 @@ class Workers:
                     inbox.reset(token)
                 live.turn = turn
                 self._update(wid, turn_id=turn.id, task_id=turn.task_id, segments=r["segments"] + 1)
+                self._adopt_cut(wid, turn)
                 self._emit(wid)
                 try:
                     await asyncio.wait_for(asyncio.shield(turn.ended.wait()), max(1.0, time_left))
@@ -696,7 +985,7 @@ class Workers:
                 if turn.final_status == "failed" and getattr(turn, "limited", False):
                     held = (getattr(turn, "limit_reset", None) or 0.0,)   # the model's usage is used up: pause, go on after the reset
                     break
-                if turn.final_status == "failed" and _outage_text(turn.final_error or rec.error):
+                if turn.final_status == "failed" and getattr(turn, "outage", False):
                     busy = True   # 2026-11-11: Gemini's "high traffic / no capacity" ended a 130-step job twice; it waits now
                     break
                 if turn.final_status == "failed":
@@ -729,6 +1018,18 @@ class Workers:
         if busy and outcome is None:
             outcome = ("failed", t("Stopped by an error: {error}", error=t("the AI model stayed unavailable for too long")), "", False)
         await self._settle(wid, outcome, rec)
+
+    def _adopt_cut(self, wid: str, turn: Any) -> None:
+        """A picked-up run owns the unknown records of the run it was cut from (once: the cut then names none)."""
+        r = self._row(wid)
+        cut = Cut.of(r["cut"]) if r is not None else None
+        if cut is None or not cut.records:
+            return
+        try:
+            self.host.adopt_records(list(cut.records), turn.task_id)
+        except Exception:  # noqa: BLE001 - the records stay with the old run; the job goes on
+            log.exception("worker %s: could not move the unknown records of the cut run", wid)
+        self._update(wid, cut=replace(cut, records=(), texts=()).to_json())
 
     def _next_chunk(self, wid: str, r: dict[str, Any], live: _Live) -> None:
         """The job made progress in the stretch that just used its budget: a fresh step / time / token budget, and a note to go on."""
@@ -821,6 +1122,13 @@ class Workers:
                                     auto=True)
                 if ok:
                     out.append(r["id"])
+        for r in self.store._all("SELECT * FROM workers WHERE status = 'interrupted' AND wait_on LIKE '%cut%'"):
+            try:
+                wait = json.loads(r["wait_on"] or "{}")
+            except ValueError:
+                continue
+            if wait.get("kind") == "cut" and float(wait.get("until") or 0) <= now and self._pickup(r["id"]):
+                out.append(r["id"])
         for r in self.store._all("SELECT * FROM workers WHERE status = 'interrupted' AND wait_on LIKE '%model_limit%'"):
             try:
                 wait = json.loads(r["wait_on"] or "{}")
@@ -842,6 +1150,7 @@ class Workers:
         return out
 
     async def _settle(self, wid: str, outcome: tuple[str, str, str, bool] | None, rec: _Recorder | None) -> None:
+        self._owner_words.pop(wid, None)   # the owner's words were for this run
         live = self._live.get(wid) or _Live()
         r = self._row(wid)
         if r is None:
@@ -864,6 +1173,8 @@ class Workers:
             login = (rec.login if rec else "") or r["login"]
             if login and not self.host.login_saved(login):
                 wait = {"kind": "login", "login": login}
+            elif rec is not None and rec.device:
+                wait = {"kind": "device"}
             elif self.host.controlled(r["tab"]):
                 wait = {"kind": "control"}
             else:
@@ -887,8 +1198,16 @@ class Workers:
                 report["retry_after_min"] = live.report["retry_after_min"]
         if live.report and str(live.report.get("deadline") or "").strip():
             report["deadline"] = str(live.report["deadline"]).strip()[:40]   # when waiting longer is too late (followups.py reminds before it)
+        if live.report and live.report.get("need"):
+            report["need"] = live.report["need"]                             # a typed reason (REPORT_NEEDS), never read from the summary
+        if live.report and live.report.get("reason"):
+            report["reason"] = live.report["reason"]
+        if getattr(live, "report_products", None):
+            self.products.save(wid, live.report_products, now)
+            report["products"] = [p.id for p in live.report_products]
         self._update(wid, status=status, report=json.dumps(report, ensure_ascii=False), wait_on=json.dumps(wait), keep_tab=int(keep),
-                     wake_at=wake_at, finished_at=now if status in ("done", "failed") else None)
+                     wake_at=wake_at, finished_at=now if status in ("done", "failed") else None,
+                     question_id=new_question_id() if status == "needs_input" or (status == "blocked" and wake_at <= 0) else "")
         self._emit(wid)
         if status in ("done", "failed") and not keep:
             await self._retire(r["tab"])
@@ -909,23 +1228,58 @@ class Workers:
             pass
         return time.strftime("%H:%M", time.localtime(ts))
 
+    def _view_of(self, wid: str) -> Any:
+        """The chat view this job works in (its tab, or the phone), or None (chat_views.py)."""
+        views = getattr(self, "chat_views", None)
+        if views is None:
+            return None
+        return next((v for v in views.items() if v.worker_id == wid), None)
+
     def _handoff_text(self, r: dict[str, Any], rep: dict[str, Any], wait: dict[str, Any]) -> str:
         lines = [HANDOFF_MARK, f"The background job {r['id']} (\"{r['title']}\", {r['kind']}) that you started with delegate reported: "
                  f"{rep['status']}.", f"Summary: {rep['summary'] or '-'}"]
         if rep["details"]:
             lines.append(f"Details: {rep['details']}")
+        if rep.get("products"):
+            lines.append("Products this job saw on the sellers' own pages (offer only these, by id):")
+            for pid in rep["products"]:
+                p = self.products.get(pid)
+                if p:
+                    sale = f" (now {p.sale_price})" if p.sale_price else ""
+                    lines.append(f"- {p.id} · {p.name} · {p.price}{sale} · {p.seller}")
+            lines.append(
+                "Offer them as one choice card: quick_replies with one option per product (a short name as the label) and each card's product set to "
+                "its id, one of them recommended."
+            )
+            lines.append(
+                "In your text give one short takeaway and the decisive difference, naming at most two; do not list them."
+            )
+            lines.append("Do not rebuild products from the summary.")
         if progress := self._progress_line(r):
             lines.append(progress)
+        if (picks := int(r.get("pickups") or 0)) > 0:
+            lines.append(f"It was cut off {picks} time(s) by a restart and picked up where it stopped by itself; say so in a few words "
+                         "only if it matters to the owner.")
         st = rep["status"]
+        if (view := self._view_of(r["id"])) is not None:   # its tab or the phone shown in the chat: only the main agent hides it
+            target = "phone" if view.key == "android" else r["id"]
+            if st in ("done", "failed", "stopped") and not view.owner_asked:
+                lines.append(f"Its tab or the phone is still shown in the chat. When the owner no longer needs to see it, call chat_view(action='close', target='{target}', reason='done'); keep it if the owner asked to see it.")
+            elif st in ("needs_input", "blocked"):
+                lines.append("Its tab or the phone stays shown in the chat for the owner to act in; do not close it now.")
         if st == "done":
             lines.append("Pass the result on to the user.")
         elif st == "needs_input":
-            if "cookie" in rep.get("summary", "").lower() or "쿠키" in rep.get("summary", ""):
+            if rep.get("need") == "site_data_reset":
                 lines.append(f"Ask the user with quick_replies (two options: clear and retry / stop), using the user's language. If they agree to clear, call browser_forget_site first, then call resume(worker_id='{r['id']}', note='Cookies cleared. Sign in again and continue from the home page.').")
             else:
                 how = {"login": f"It goes on by itself once the user saves the login {wait.get('login')!r} in the app.",
-                       "control": "It goes on by itself once the user hands its browser tab back."}.get(
-                    wait.get("kind", ""), f"When the user answers, call resume(worker_id='{r['id']}', note=<their answer>).")
+                       "control": "It goes on by itself once the user hands its browser tab back.",
+                       "device": "It goes on by itself once the owner hands the phone back."}.get(
+                    wait.get("kind", ""), f"When the user answers, call worker_message(id='{r['id']}', text=<their answer>, "
+                                          f"answer_to='{r.get('question_id') or ''}').")
+                if r.get("question_id"):
+                    lines.append(f"Question id: {r['question_id']}")
                 lines.append(f"Tell the user exactly what is needed. {how}")
         elif st == "blocked":
             if wait.get("wake_at"):
@@ -933,8 +1287,24 @@ class Workers:
                 lines.append(f"The job will retry by itself at {time_str}. Tell the user once, in one line (e.g. that the site is "
                              f"blocking for now and it will try again at {time_str}; they can keep talking).")
             else:
-                lines.append("Say what stopped it: tell the user the site does not let Kelo's browser in right now and offer the live view "
-                             "(take over) or another shop; it goes on by itself when they hand the browser tab back.")
+                site = registrable(urlsplit(str(r.get("last_url") or "")).hostname or "") if r.get("last_url") else ""
+                if not site:
+                    site = "the site"
+                if r.get("parent_source") not in ("chat", "api"):
+                    lines.append(f"Say in the result that {site} stopped the job and why; nothing else.")
+                elif rep.get("reason") in ("site_refused", "sign_in", "human_check"):
+                    lines.append(
+                        f"Tell the user in one or two lines that {site} did not let Kelo's browser in, so nothing was found or bought there, "
+                        f"and the next step: take over the browser (the live view) to sign in or get past it, or save that site's login; the job "
+                        f"goes on by itself when they hand the browser back. If no other seller could be opened either, give only the refusal and "
+                        f"the sign-in path, no prices. Never show prices, stock or links from a text search, not even as information."
+                    )
+                else:
+                    lines.append("Say in one or two lines what stopped it and the next step. Never show prices, stock or links from a text search, not even as information.")
+                if r.get("question_id"):
+                    lines.append(f"Question id: {r['question_id']}. When the owner answers or decides, call worker_message(id='{r['id']}', "
+                                 f"text=<their words>, answer_to='{r['question_id']}') to let it go on, or worker_stop(id='{r['id']}') when "
+                                 "they no longer want it.")
         else:
             lines.append("Say that it stopped, why, and how far it got (the counts above are the server's own record: use them; never "
                          "guess that something was not done).")
@@ -1003,20 +1373,104 @@ class Workers:
 
     # ------------------------------------------------------------------ start-up and shut-down
     def startup(self) -> list[str]:
-        """After a restart: a job that was running is interrupted (said plainly), and goes on by itself when it may."""
+        """After a restart: a job that was running (or that a graceful stop marked) is cut (job_cuts.py): its open call gets a cut result,
+        and it goes on by itself at once or after the wait (limit_tick); the cuts in a row past the limit stop it (blocked, the owner
+        decides). Once per job and process: a second call (after a Keyguard unlock) only picks up what is due."""
         now = self._clock()
-        self.store._run("UPDATE workers SET status = 'interrupted', error = ?, auto_resume = 1, updated_at = ? WHERE status = 'running'",
-                        (t(RESTART_REASON), now))
+        for r in self.store._all("SELECT * FROM workers WHERE status = 'running' OR (status = 'interrupted' AND auto_resume = 1) "
+                                 "ORDER BY created_at"):
+            if r["id"] not in self._cut_seen:
+                self._cut(r, now)
         resumed = []
         if self.resume_on_start:
-            for r in self.store._all("SELECT id FROM workers WHERE status = 'interrupted' AND auto_resume = 1 ORDER BY created_at"):
+            for r in self.store._all("SELECT * FROM workers WHERE status = 'interrupted' AND auto_resume = 1 ORDER BY created_at"):
+                wait = json.loads(r["wait_on"] or "{}")
+                if wait.get("kind") == "cut":
+                    if float(wait.get("until") or 0) > now or not self._pickup(r["id"]):
+                        continue   # the wait is not over (limit_tick picks it up), or no slot: _drain does
+                    resumed.append(r["id"])
+                    continue
                 ok, _ = self.resume(r["id"], why="The server restarted while you were working.", auto=True)
                 if ok:
                     resumed.append(r["id"])
         return resumed
 
+    def _cut(self, r: dict[str, Any], now: float) -> None:
+        wid = r["id"]
+        calls = open_calls(self.transcript(wid))
+        recs = self._safe(lambda: self.host.cut_records(r["task_id"]), [])
+        pay = self._safe(lambda: self.host.cut_pay(r["tab"]), None)
+        tab = self._safe(lambda: self.host.tab_state(r["tab"]), "none")
+        if tab == "none" and r["last_url"] and not self._safe(lambda: self.host.tab_open(r["tab"]), False):
+            tab = "new"   # no browser record of the tab, and its page is not open: a new tab, the last url is known
+        by_tool = {tool: rid for rid, tool, _ in recs}
+        seq = self._next_seq(wid)
+        for call in calls:   # the open call (at most one after a hard kill) gets its cut result, so the transcript stays valid
+            self._append(wid, seq, {"role": "tool", "tool_call_id": call.call_id, "content": cut_result(call, by_tool, pay)})
+            seq += 1
+        cut = Cut(now, "restart", calls[-1] if calls else None, tuple(rid for rid, _, _ in recs), pay, tab, r["last_url"] or "",
+                  tuple(what for _, _, what in recs))
+        cuts = int(r["cuts"] or 0) + 1
+        self._cut_seen.add(wid)
+        self._update(wid, status="interrupted", error=t(RESTART_REASON), auto_resume=1, cut=cut.to_json(), cuts=cuts)
+        wait = next_pickup(cuts)
+        if wait is None:
+            self._cut_stop(wid, cuts)
+            return
+        self._update(wid, wait_on=json.dumps({"kind": "cut", "until": now + wait}))
+
+    def _cut_stop(self, wid: str, cuts: int) -> None:
+        """The job was cut too many times at the same step: it stops as blocked and the report goes to the conversation."""
+        text = t(CUT_LOOP_LINE, n=cuts)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:   # no loop (a start outside the server): the row says it, the report goes on at the next settle
+            report = {"status": "blocked", "summary": text, "details": "", "keep_tab": False, "at": self._clock()}
+            self._update(wid, status="blocked", report=json.dumps(report, ensure_ascii=False), wait_on=json.dumps({"kind": "user"}),
+                         wake_at=0.0)
+            return
+        asyncio.ensure_future(self._settle(wid, ("blocked", text, "", False), None))
+
+    def _pickup(self, wid: str) -> bool:
+        """Go on with a cut job: the pick-up note says what happened and what to check first (job_cuts.pickup_note)."""
+        r = self._row(wid)
+        if r is None:
+            return False
+        cut = Cut.of(r["cut"] or "")
+        why = pickup_note(cut) if cut is not None else "The server restarted while you were working."
+        ok, how = self.resume(wid, why=why, auto=True, cut=cut)
+        if ok and how == "resumed":
+            self._update(wid, pickups=int(r["pickups"] or 0) + 1, picked_up_at=self._clock())
+            self._note_line(wid, t(BROWSER_PICKED_UP_LINE if cut is not None and cut.why == "browser" else PICKED_UP_LINE))
+        return ok
+
+    def _safe(self, fn: Callable[[], Any], default: Any) -> Any:
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001 - a host hook that fails never stops the start
+            log.exception("worker host hook failed at a start")
+            return default
+
+    def browser_lost(self, key: str) -> None:
+        """A browser that restarted or crashed under a running tab: a job's card says it went on in a new tab (job_cuts.py)."""
+        if key.startswith("task:w"):
+            self._note_line(key[5:], t(BROWSER_PICKED_UP_LINE))
+
+    def step_busy(self) -> bool:
+        """A step that sends, changes or pays is in flight, or a payment job runs: the nightly update waits for it (D3)."""
+        if self._safe(lambda: self.host.step_busy(), False):
+            return True
+        return bool(self.store._all("SELECT id FROM workers WHERE kind = ? AND status = 'running' LIMIT 1", (tool_roles.CHECKOUT_KIND,)))
+
+    async def drain_steps(self, seconds: float = DRAIN_SECONDS) -> None:
+        """A stop waits up to `seconds` for a step that sends, changes or pays to finish (its result is then in the transcript)."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and self._safe(lambda: self.host.step_busy(), False):
+            await asyncio.sleep(0.2)
+
     async def shutdown(self) -> None:
         self._closing = True
+        await self.drain_steps()
         tasks = []
         for wid, live in self._live.items():
             if live.task is not None and not live.task.done():
@@ -1067,6 +1521,15 @@ class Workers:
                 return f"Error: status must be one of {', '.join(REPORT_STATUSES)}."
             if not summary:
                 return "Error: summary is required: say in a few sentences what came of the job, in the user's language."
+            raw = args.get("products")
+            if raw not in (None, []):
+                kept, left = verify(raw if isinstance(raw, list) else [], pages_read(self.transcript(wid)), wid)
+                if left and live.product_refused == 0:
+                    live.product_refused = 1
+                    return ("Error: not recorded. Report only products whose own page you opened in this job, with the price that page shows "
+                            "and only when it can be bought now. Left out:\n- " + "\n- ".join(left) +
+                            "\nOpen each one's page and report it again as it shows there, or leave it out, then call report again.")
+                live.report_products = kept          # second try: what passed is kept, the rest stays out (no loop)
             retry_after_min = None
             if "retry_after_min" in args and args["retry_after_min"] is not None:
                 try:
@@ -1075,6 +1538,10 @@ class Workers:
                     pass
             live.report = {"status": status, "summary": scrub(summary), "details": scrub(str(args.get("details") or "")),
                            "keep_tab": bool(args.get("keep_tab")), "deadline": str(args.get("deadline") or "")}
+            if args.get("need") in REPORT_NEEDS:
+                live.report["need"] = args["need"]
+            if args.get("reason") in REPORT_REASONS:
+                live.report["reason"] = args["reason"]
             if retry_after_min is not None:
                 live.report["retry_after_min"] = retry_after_min
             return "Report received. Stop here."
@@ -1087,7 +1554,12 @@ class Workers:
                                                       "keep_tab": {"type": "boolean", "description": "leave the tab open for the user"},
                                                       "deadline": {"type": "string", "description": "needs_input: local date-time when waiting is "
                                                                    "too late, if the page shows a cutoff"},
-                                                      "retry_after_min": {"type": "integer", "description": "blocked: minutes to wait before retrying once (5-30, use 10 for access-denied sites)"}},
+                                                      "need": {"type": "string", "enum": list(REPORT_NEEDS),
+                                                               "description": "needs_input: what you need from the user. site_data_reset = the site "
+                                                                              "keeps refusing you and clearing its cookies and site data, then retrying, may help"},
+                                                      "products": {"type": "array", "description": "products found, each from its own page you opened in this job: name, url (that page), price (as the page shows it), sale_price (only a real reduced price the page shows), image_url (a direct https picture address from the page), availability ('in_stock' only when the product page indicates it can be added to the cart or purchased now)", "items": {"type": "object", "properties": {"name": {"type": "string"}, "url": {"type": "string"}, "price": {"type": "string"}, "sale_price": {"type": "string"}, "image_url": {"type": "string"}, "availability": {"type": "string", "enum": ["in_stock"]}}, "required": ["name", "url", "price", "availability"]}},
+                                                      "reason": {"type": "string", "enum": list(REPORT_REASONS), "description": "blocked or needs_input: what stopped you. site_refused = a block or access-denied page, or the site says it does not allow assistants; sign_in = the site needs the user's sign-in and no saved login works; human_check = a check you could not pass; not_available = the site does not have or sell it; site_error = the site is down or fails"},
+                                                      "retry_after_min": {"type": "integer", "description": "blocked: minutes to wait before retrying once (5-30), only when a service asked you to slow down; never for a site that refused you"}},
                      "required": ["status", "summary"]}, report, ends_turn=True)
 
     def main_tools(self) -> list[Tool]:
@@ -1110,6 +1582,8 @@ class Workers:
             if w is None:
                 return "Error: no such job. workers_list shows them."
             out = [line(w)]
+            if w.get("question_id"):
+                out.append(f"Open question id: {w['question_id']} (answer it with worker_message and answer_to)")
             if w["report"]:
                 out.append(f"Report: {w['report']['status']}: {w['report']['summary']}")
                 if w["report"].get("details"):
@@ -1124,9 +1598,25 @@ class Workers:
             text = str(args.get("text") or "").strip()
             if not text:
                 return "Error: text is required."
-            _ok, how = self.message(str(args.get("id") or args.get("worker_id") or ""), text)
-            return {"delivered": "Sent: the job reads it before its next step.", "resumed": "The job was not running; it goes on now with your message.",
-                    "queued": "The job goes on with your message as soon as a slot is free.", "missing": "Error: no such job.",
+            wid = str(args.get("id") or args.get("worker_id") or "")
+            answer_to = str(args.get("answer_to") or "").strip()
+            turn = current_turn.get() or {}   # the owner's own message of this turn (never the model's words, never a page's)
+            own = str(turn.get("source") or "") in OWNER_SOURCES and not turn.get("unattended")
+            owner_text = str(turn.get("request") or "") if own else ""
+            _ok, how = self.message(wid, text, answer_to, owner_text=owner_text)
+            if how in ("stale", "wrong"):
+                r = self._row(wid)
+                open_id = r["question_id"] if r is not None and r["status"] in ("needs_input", "blocked") else ""
+                return ("Error: " + (f"that job has no open question with id {answer_to} (it was answered, or the job went on). "
+                        "Send the text without answer_to if it is only an update, or check worker_status." if how == "stale" or not open_id else
+                        f"answer_to {answer_to} is not the job's open question; the open question's id is {open_id}. Use that id, "
+                        "or leave answer_to out for an update."))
+            return {"delivered": "Sent: the job reads it before its next step. Its report comes back by itself: tell the owner in one short line "
+                                 "that you passed it on.",
+                    "resumed": "The job was not running; it goes on now with your message. Its report comes back to you by itself: tell the owner "
+                               "in one short line that you passed it on, and promise nothing about the result.",
+                    "queued": "The job goes on with your message as soon as a slot is free; tell the owner that in one short line.",
+                    "missing": "Error: no such job.",
                     "limit": "Error: too many jobs are running to start this one again now.", "running": "Error: the job is busy; try again."}.get(how, how)
 
         async def worker_stop(args: dict[str, Any]) -> str:
@@ -1139,20 +1629,27 @@ class Workers:
 
         wid_prop = {"id": {"type": "string", "description": "the job id"}}
         return [
-            Tool("delegate", "Hand long work (many browser steps, research across many sources) to a background job and return at once; "
-                 "tell the user in one line that it started. It cannot ask the user anything: put everything it needs in task, including the "
+            Tool("delegate", "Hand work to a background job and return at once; tell the user in one line that it started. Kind browser: "
+                 "anything done on a website (you do not click or type on websites yourself), research: reading many sources. The job cannot "
+                 "read this chat or your memory: put everything it needs in task, including the "
                  "user's own choices and saved preferences that apply (sizes, colors, options, address; from your memory files). Its report "
-                 "comes back by itself.",
+                 "comes back by itself. Only kind checkout can pay: for a purchase, booking or payment use it with url = the shop's home page "
+                 "and a self-contained task (items, variants, quantities, total, delivery, limits). Only kind phone drives "
+                 "the Android device (you have no phone tools): task = app, goal, choices made, limits, where to stop; one at a time.",
                  {"type": "object", "properties": {"task": {"type": "string"}, "kind": {"type": "string", "enum": list(KINDS)},
-                                                   "url": {"type": "string", "description": "where to start"},
+                                                   "url": {"type": "string", "description": "where to start: the site's home page, or the exact address the user gave (the job goes on by clicking)"},
                                                    "files": {"type": "array", "items": {"type": "string"}, "description": "your files to use"},
+                                                   "profile": {"type": "string", "description": "a browser_profiles id"},
                                                    "deadline_min": {"type": "integer"}}, "required": ["task"]}, delegate),
             Tool("workers_list", "List your background jobs with their status, when the user asks about them.",
                  {"type": "object", "properties": {}}, workers_list, read_only=True),
             Tool("worker_status", "One background job: its status, report and last steps.", {"type": "object", "properties": wid_prop, "required": ["id"]},
                  worker_status, read_only=True),
-            Tool("worker_message", "Tell a background job something (a correction, the user's answer); a stopped job goes on with it.",
-                 {"type": "object", "properties": {**wid_prop, "text": {"type": "string"}}, "required": ["id", "text"]}, worker_message),
+            Tool("worker_message", "Tell a background job something: an update or correction (send everything about the same work to the "
+                 "same job), or the answer to its question: pass the question's id as answer_to. A stopped job goes on with it.",
+                 {"type": "object", "properties": {**wid_prop, "text": {"type": "string"},
+                                                   "answer_to": {"type": "string", "description": "the id (q_...) of the job's open question this text answers; "
+                                                                 "leave out for an update"}}, "required": ["id", "text"]}, worker_message),
             Tool("worker_stop", "Stop a background job.",
                  {"type": "object", "properties": wid_prop, "required": ["id"]}, worker_stop),
             Tool("resume", "Let a stopped background job go on from where it stopped (same tab and history).",
@@ -1194,8 +1691,8 @@ def worker_routes(app: FastAPI, workers: Workers, auth: Callable[..., Any]) -> N
     @app.post("/api/workers/{wid}/message", dependencies=[Depends(auth)])
     async def message_worker(wid: str, body: WorkerMessageIn, request: Request) -> dict[str, Any]:
         check = getattr(request.app.state, "secret_check", None)   # a pasted key or password stops here (409), as in chat
-        text = check(body.text, body.secrets) if check is not None else body.text
-        ok, how = workers.message(wid, text)
+        text = await check(body.text, body.secrets) if check is not None else body.text
+        ok, how = workers.message(wid, text, owner_text=text)   # the owner typed it: their own words
         if not ok:
             raise HTTPException({"missing": 404, "running": 409, "limit": 429}.get(how, 409), how)
         return {"ok": True, "delivered": how, "worker": workers.get(wid)}

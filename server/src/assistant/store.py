@@ -21,7 +21,9 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from .keyguard import CARDS_INFO, VAULT_INFO, KeyGuard, Locked, is_system_key, load_server_key
 from .keyring_client import PLACEHOLDER
-from .vault import LOG_KEEP, Sealer, VaultError, aad_for, mask_username
+from .i18n import t
+from .calls import CALL_MARK
+from .vault import KEYCHAIN, LOG_KEEP, Sealer, VaultError, aad_for, mask_username
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS profile (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -66,6 +68,78 @@ CREATE TABLE IF NOT EXISTS learned_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT, rule TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '', date TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 0.5, status TEXT NOT NULL DEFAULT 'proposed', updated_at REAL NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS notices_read (id TEXT PRIMARY KEY, read_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS memory_claims (
+    claim_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, kind TEXT NOT NULL, salience TEXT NOT NULL,
+    text TEXT NOT NULL, quote TEXT NOT NULL, speaker TEXT NOT NULL, handle TEXT NOT NULL,
+    supersedes TEXT, status TEXT NOT NULL DEFAULT 'active', valid_until TEXT,
+    source_path TEXT NOT NULL, source_line INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL, updated_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS memory_claims_status ON memory_claims(status);
+CREATE INDEX IF NOT EXISTS memory_claims_handle ON memory_claims(handle);
+CREATE INDEX IF NOT EXISTS memory_claims_run ON memory_claims(run_id);
+CREATE TABLE IF NOT EXISTS memory_runs (
+    run_id TEXT PRIMARY KEY, started_at REAL NOT NULL, finished_at REAL,
+    trigger TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL DEFAULT '', stats TEXT NOT NULL DEFAULT '{}');
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_claims_fts USING fts5(
+    text, quote, content='memory_claims', content_rowid='rowid', tokenize='unicode61');
+CREATE TRIGGER IF NOT EXISTS memory_claims_ai AFTER INSERT ON memory_claims BEGIN
+    INSERT INTO memory_claims_fts(rowid, text, quote) VALUES (new.rowid, new.text, new.quote);
+END;
+CREATE TRIGGER IF NOT EXISTS memory_claims_ad AFTER DELETE ON memory_claims BEGIN
+    INSERT INTO memory_claims_fts(memory_claims_fts, rowid, text, quote) VALUES('delete', old.rowid, old.text, old.quote);
+END;
+CREATE TRIGGER IF NOT EXISTS memory_claims_au AFTER UPDATE ON memory_claims BEGIN
+    INSERT INTO memory_claims_fts(memory_claims_fts, rowid, text, quote) VALUES('delete', old.rowid, old.text, old.quote);
+    INSERT INTO memory_claims_fts(rowid, text, quote) VALUES (new.rowid, new.text, new.quote);
+END;
+CREATE TABLE IF NOT EXISTS trail_labels (
+    id TEXT PRIMARY KEY, run_id TEXT NOT NULL, kind TEXT NOT NULL, source_id TEXT NOT NULL, party TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '', private INTEGER NOT NULL DEFAULT 1, outside INTEGER NOT NULL DEFAULT 0, at REAL NOT NULL,
+    runs BLOB NOT NULL, tokens TEXT NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS trail_labels_run ON trail_labels(run_id);
+CREATE TABLE IF NOT EXISTS recipient_allows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, recipient TEXT NOT NULL, kind TEXT NOT NULL, created_at REAL NOT NULL, approval_id TEXT NOT NULL DEFAULT '',
+    UNIQUE(recipient, kind));
+CREATE TABLE IF NOT EXISTS order_terms (
+    id TEXT PRIMARY KEY, owner TEXT NOT NULL, task TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, merchant_origin TEXT NOT NULL,
+    merchant_name TEXT NOT NULL DEFAULT '', items TEXT NOT NULL, obligations TEXT NOT NULL, currency TEXT NOT NULL,
+    total_minor INTEGER NOT NULL, conditional_minor INTEGER NOT NULL DEFAULT 0, conditional_terms TEXT NOT NULL DEFAULT '',
+    payment_label TEXT NOT NULL DEFAULT '', terms_digest TEXT NOT NULL, checked_at REAL, created_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS order_terms_by_owner ON order_terms(owner, task);
+CREATE TABLE IF NOT EXISTS pay_approvals (
+    id TEXT PRIMARY KEY, terms_id TEXT NOT NULL, owner TEXT NOT NULL, task TEXT NOT NULL DEFAULT '', merchant_origin TEXT NOT NULL,
+    approved_total_minor INTEGER NOT NULL, approved_conditional_minor INTEGER NOT NULL DEFAULT 0, currency TEXT NOT NULL,
+    terms_digest TEXT NOT NULL, source TEXT NOT NULL, approval_id TEXT, signed INTEGER NOT NULL DEFAULT 0, expires_at REAL NOT NULL,
+    state TEXT NOT NULL, created_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS pay_approvals_by_owner ON pay_approvals(owner, task);
+CREATE TABLE IF NOT EXISTS pay_attempts (
+    id TEXT PRIMARY KEY, approval_id TEXT NOT NULL, terms_id TEXT NOT NULL, owner TEXT NOT NULL, task TEXT NOT NULL DEFAULT '',
+    merchant_origin TEXT NOT NULL, state TEXT NOT NULL, pressed_at REAL, evidence TEXT NOT NULL DEFAULT '',
+    receipt_digest TEXT NOT NULL DEFAULT '', receipt_text TEXT NOT NULL DEFAULT '', check_jobs TEXT NOT NULL DEFAULT '[]',
+    created_at REAL NOT NULL, updated_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS pay_attempts_by_owner ON pay_attempts(owner, task, state);
+CREATE TABLE IF NOT EXISTS forget_tombstones (
+    id TEXT PRIMARY KEY, label TEXT NOT NULL, terms TEXT NOT NULL DEFAULT '[]', created_at REAL NOT NULL, removed TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS forget_plans (
+    id TEXT PRIMARY KEY, label TEXT NOT NULL, terms TEXT NOT NULL DEFAULT '[]', items TEXT NOT NULL DEFAULT '[]', created_at REAL NOT NULL,
+    state TEXT NOT NULL DEFAULT 'open');
+CREATE TABLE IF NOT EXISTS order_preapprovals (
+    id TEXT PRIMARY KEY, owner_kind TEXT NOT NULL, owner_id TEXT NOT NULL, spec TEXT NOT NULL, max_total_minor INTEGER NOT NULL,
+    currency TEXT NOT NULL, expires_at REAL NOT NULL, state TEXT NOT NULL, approval_id TEXT NOT NULL DEFAULT '',
+    matched_digest TEXT NOT NULL DEFAULT '', matched_origin TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS order_preapprovals_by_owner ON order_preapprovals(owner_kind, owner_id, state);
+CREATE TABLE IF NOT EXISTS schedule_pay_allows (
+    id TEXT PRIMARY KEY, schedule_id INTEGER NOT NULL, merchant_origin TEXT NOT NULL, payment_label TEXT NOT NULL DEFAULT '',
+    currency TEXT NOT NULL, approval_id TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL,
+    UNIQUE(schedule_id, merchant_origin, payment_label, currency));
+CREATE TABLE IF NOT EXISTS browser_sign_ins (
+    profile TEXT NOT NULL DEFAULT '', site TEXT NOT NULL, how TEXT NOT NULL, signed_at REAL NOT NULL, last_used REAL,
+    PRIMARY KEY(profile, site));
+CREATE TABLE IF NOT EXISTS browser_profiles (
+    id TEXT PRIMARY KEY, label TEXT NOT NULL, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS browser_profile_units (
+    profile TEXT NOT NULL, site TEXT NOT NULL, unit TEXT NOT NULL, updated_at REAL NOT NULL,
+    PRIMARY KEY(profile, site));
 """
 
 PROFILE_KEYS = ("user_name", "agent_name", "provider", "model", "fallback_provider", "fallback_model", "effort", "timezone",
@@ -84,6 +158,25 @@ def _load_key(path: str | Path, secret: str | None) -> bytes:
     return load_server_key(None if str(path) == ":memory:" else Path(path).with_name("master.key"), secret)
 
 
+# Full-text search over the conversation (chat_search.py): an FTS5 index on messages.content with the trigram tokenizer, so Korean and
+# other substrings match. External content: the index holds no second copy of the words. Three triggers keep it in step with every
+# insert, edit and delete (the chat clear deletes the rows, so the words leave the index with them; secure_delete overwrites them).
+SEARCH_INDEX = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content='messages', content_rowid='id', tokenize='trigram');
+CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.id, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF content ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.id, old.content);
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
+"""
+SEARCH_BACKFILL_BATCH = 500
+
+
 def schema_fingerprint(db: sqlite3.Connection) -> str:
     """A short hash of every table, index and trigger definition. The schema is upgraded in place at start-up (CREATE ... IF NOT
     EXISTS plus ALTER TABLE ADD COLUMN when a column is missing, here and in the modules that own a table), so there is no version
@@ -92,6 +185,36 @@ def schema_fingerprint(db: sqlite3.Connection) -> str:
     rows = db.execute("SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master "
                       "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").fetchall()
     return hashlib.sha256("\n".join("\t".join(str(c) for c in r) for r in rows).encode()).hexdigest()[:16]
+
+
+CALL_IDS_META = "messages:call_id_v1"
+
+
+def backfill_call_ids(db: sqlite3.Connection) -> bool:
+    """Once per database (meta `messages:call_id_v1`): call messages stored before messages.call_id get one id per call, so the apps
+    show each call as one card. A call is a run of via="call" rows; its hidden start message (calls.CALL_MARK) starts a new call and any
+    other row ends it. The id is "legacy-<first row id>". Returns True when it ran."""
+    if db.execute("SELECT 1 FROM meta WHERE key = ?", (CALL_IDS_META,)).fetchone():
+        return False
+    first = db.execute("SELECT MIN(id) FROM messages WHERE via = 'call' AND call_id = ''").fetchone()[0]
+    updates: list[tuple[str, int]] = []
+    if first is not None:
+        current = ""
+        for rid, role, content, via, cid in db.execute(
+                "SELECT id, role, content, via, call_id FROM messages WHERE id >= ? ORDER BY id", (first,)).fetchall():
+            if via != "call":
+                current = ""
+                continue
+            if cid:
+                current = cid
+                continue
+            if not current or (role == "user" and str(content).startswith(CALL_MARK)):
+                current = f"legacy-{rid}"
+            updates.append((current, rid))
+    db.executemany("UPDATE messages SET call_id = ? WHERE id = ?", updates)
+    db.execute("INSERT INTO meta(key, value) VALUES(?, ?)", (CALL_IDS_META, "1"))
+    db.commit()
+    return True
 
 
 class Store:
@@ -107,6 +230,7 @@ class Store:
         self._lock = threading.RLock()
         with self._lock:
             self._db.execute("PRAGMA secure_delete = ON")   # a deleted card or login is overwritten in the file, not just unlinked
+            index_was_there = self._db.execute("SELECT 1 FROM sqlite_master WHERE name = 'messages_fts'").fetchone() is not None
             self._db.executescript(SCHEMA)
             have = {r[1] for r in self._db.execute("PRAGMA table_info(credentials)")}
             for col, ddl in (("kind", "TEXT NOT NULL DEFAULT 'api'"), ("auto_allow", "INTEGER NOT NULL DEFAULT 0"), ("last_used", "REAL"),
@@ -121,14 +245,23 @@ class Store:
                 self._db.execute("ALTER TABLE devices ADD COLUMN code_id INTEGER")
             if "e2e_only" not in {r[1] for r in self._db.execute("PRAGMA table_info(devices)")}:   # before KE2E
                 self._db.execute("ALTER TABLE devices ADD COLUMN e2e_only INTEGER NOT NULL DEFAULT 0")
+            if "approval_key" not in {r[1] for r in self._db.execute("PRAGMA table_info(devices)")}:   # before signed payment approvals
+                self._db.execute("ALTER TABLE devices ADD COLUMN approval_key TEXT NOT NULL DEFAULT ''")
             have = {r[1] for r in self._db.execute("PRAGMA table_info(messages)")}
-            for col in ("reaction", "reaction_hold", "reaction_next", "via"):   # reactions on the owner's messages (reactions.py); via = the messenger a message came from
+            for col in ("reaction", "reaction_hold", "reaction_next", "via", "author", "steps", "call_id"):   # reactions on the owner's messages (reactions.py); via = the messenger a message came from; author = owner/forwarded/tapped (owner_messages.py); steps = the tool steps of an assistant reply, for the model only (reply_text.py); call_id = the in-app call a message belongs to (calls.py), "" for everything else
                 if col not in have:
                     self._db.execute(f"ALTER TABLE messages ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
             have = {r[1] for r in self._db.execute("PRAGMA table_info(usage)")}
             for col in ("cache_read_tokens", "cache_write_tokens"):   # a database made before the cached share was counted: rows kept
                 if col not in have:
                     self._db.execute(f"ALTER TABLE usage ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+            self._db.executescript(SEARCH_INDEX)   # the triggers keep the index in step from now on
+            if not index_was_there:               # a database made before the search existed: index what is already there, once
+                self._backfill_search_index()
+            from .owner_messages import backfill_authors, retract_unowned_claims   # local: the markers' modules import the store
+            backfill_authors(self._db)            # a database made before messages.author: the owner's own rows, once (owner_messages.py)
+            retract_unowned_claims(self._db)      # claims that are not the owner's own words stop being active, once (rows kept)
+            backfill_call_ids(self._db)   # call messages stored before call_id: one id per call, once
             self._db.commit()
         self._usage_writes = 0
         self.credential_watchers: list[Callable[[str, bool], None]] = []
@@ -154,6 +287,18 @@ class Store:
     @property
     def data_sealer(self) -> Sealer:      # personal data kept for the agent (not under Keyguard: readable while locked)
         return self.keyguard.data_sealer()
+
+    def _backfill_search_index(self) -> None:
+        """Index every stored message, in batches (called once at start-up, inside __init__'s lock; the search is a substring index)."""
+        last = 0
+        while True:
+            rows = self._db.execute("SELECT id, content FROM messages WHERE id > ? ORDER BY id LIMIT ?",
+                                    (last, SEARCH_BACKFILL_BATCH)).fetchall()
+            if not rows:
+                break
+            self._db.executemany("INSERT INTO messages_fts(rowid, content) VALUES (?, ?)", [(r[0], r[1]) for r in rows])
+            last = rows[-1][0]
+            self._db.commit()
 
     def _run(self, sql: str, args: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
@@ -187,27 +332,55 @@ class Store:
         return self.profile()
 
     # ---- conversation (one continuous chat)
-    def add_message(self, role: str, content: str, via: str = "") -> int:
-        """`via`: the messenger the message came through ("telegram"); "" for the app."""
-        return self._run("INSERT INTO messages(role, content, created_at, via) VALUES(?,?,?,?)",
-                         (role, content, time.time(), via)).lastrowid or 0
+    def add_message(self, role: str, content: str, via: str = "", author: str = "", steps: str = "", call_id: str = "") -> int:
+        """`via`: the messenger the message came through ("telegram"); "" for the app. `author`: owner, forwarded or tapped for the
+        owner's own user messages (owner_messages.py); "" for everything else, hidden handoff rows included. `steps`: the reply's
+        tool steps in one line (reply_text.py), read by the model only; the apps never get it. `call_id`: the in-app call these words
+        belong to (the call id the app sent, calls.py); "" otherwise."""
+        return self._run("INSERT INTO messages(role, content, created_at, via, author, steps, call_id) VALUES(?,?,?,?,?,?,?)",
+                         (role, content, time.time(), via, author, steps, call_id)).lastrowid or 0
+
+    def message_count(self) -> int:
+        """How many messages the conversation holds (the owner's and the assistant's)."""
+        return int(self._all("SELECT COUNT(*) AS n FROM messages")[0]["n"])
 
     def messages(self, *, limit: int = 100, before_id: int | None = None) -> list[dict[str, Any]]:
         """Newest `limit` messages (before `before_id` if given), oldest first."""
         rows = self._all(
-            "SELECT id, role, content, created_at, reaction, via FROM messages WHERE (? IS NULL OR id < ?) "
+            "SELECT id, role, content, created_at, reaction, via, author, call_id FROM messages WHERE (? IS NULL OR id < ?) "
             "ORDER BY id DESC LIMIT ?", (before_id, before_id, limit))
         return rows[::-1]
 
     def messages_after(self, after_id: int, *, before_id: int | None = None, limit: int = 2000) -> list[dict[str, Any]]:
         """The newest `limit` messages with after_id < id (< before_id if given), oldest first."""
-        rows = self._all("SELECT id, role, content, created_at, via FROM messages WHERE id > ? AND (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?",
+        rows = self._all("SELECT id, role, content, created_at, via, steps FROM messages WHERE id > ? AND (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?",
                          (after_id, before_id, before_id, limit))
         return rows[::-1]
 
+    def drop_unanswered_call_words(self, call_id: str) -> bool:
+        """Deletes the newest message when it is the owner's words of call `call_id` that nothing answered yet (no row after it): the
+        owner went on talking and the app sends those words again with the rest (POST /api/turns "amend", calls.py). True when one went."""
+        with self._lock:
+            row = self._db.execute("SELECT id, role, content, via, call_id FROM messages ORDER BY id DESC LIMIT 1").fetchone()
+            if (row is None or row["role"] != "user" or row["via"] != "call" or row["call_id"] != call_id
+                    or str(row["content"]).startswith(CALL_MARK)):
+                return False
+            self._db.execute("DELETE FROM messages WHERE id = ?", (row["id"],))
+            self._db.commit()
+            return True
+
+    def condensed_messages(self, *, before_id: int, after_id: int = 0, query: str = "", limit: int = 10) -> tuple[list[dict[str, Any]], bool]:
+        """(the newest `limit` user/assistant messages with after_id < id < before_id whose text contains `query` (case-insensitive
+        LIKE; all when empty), oldest first; whether older ones match too). The chat's messages only: no tool results, nothing else."""
+        like = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        rows = self._all("SELECT id, role, content, created_at FROM messages WHERE id > ? AND id < ? AND role IN ('user', 'assistant') "
+                         "AND (? = '' OR content LIKE ? ESCAPE '\\') ORDER BY id DESC LIMIT ?",
+                         (after_id, before_id, query, like, limit + 1))
+        return rows[:limit][::-1], len(rows) > limit
+
     def first_messages(self, n: int, *, before_id: int | None = None, after_id: int = 0) -> list[dict[str, Any]]:
         """The first `n` messages of the conversation (since it was last cleared, or after `after_id`), oldest first."""
-        return self._all("SELECT id, role, content, created_at FROM messages WHERE id > ? AND (? IS NULL OR id < ?) ORDER BY id LIMIT ?",
+        return self._all("SELECT id, role, content, created_at, steps FROM messages WHERE id > ? AND (? IS NULL OR id < ?) ORDER BY id LIMIT ?",
                          (after_id, before_id, before_id, n))
 
     # ---- /new: the model's conversation starts again after this message id (the messages stay, the app still shows them)
@@ -350,7 +523,102 @@ class Store:
                 out["username_hint"] = mask_username(json.loads(self._open(r) or "{}").get("u", ""))
             except (ValueError, Locked):   # locked (Keyguard): the list still shows, without the hint
                 out["username_hint"] = ""
+        elif r["kind"] == "login":
+            out["username_hint"] = self._asked_username(r["name"])   # no value yet: the account the assistant asked with (non-secret prefill), "" when none
         return out
+
+    def _asked_username(self, name: str) -> str:
+        """The `username` request_login was asked with for the newest open fill-in card of login `name`; "" when there is none."""
+        try:
+            rows = self._all("SELECT username_hint FROM secret_requests WHERE kind = 'login' AND name = ? AND state = 'open' "
+                             "ORDER BY created_at DESC LIMIT 1", (name,))
+        except sqlite3.Error:   # the table is made by SecretRequests; a store without it has no requests
+            return ""
+        return (rows[0]["username_hint"] if rows else "") or ""
+
+    # Kelo's browser sign-ins: which sites a browser profile is signed in to. Sites only, never a cookie or a value (brief B1).
+    def note_browser_sign_in(self, site: str, how: str, profile: str = "") -> None:
+        """`how` is "login" (a saved login of the vault succeeded) or "owner" (the owner signed in by hand during a take-over)."""
+        now = time.time()
+        self._run("INSERT INTO browser_sign_ins(profile, site, how, signed_at, last_used) VALUES (?, ?, ?, ?, ?) "
+                  "ON CONFLICT(profile, site) DO UPDATE SET how = excluded.how, signed_at = excluded.signed_at, "
+                  "last_used = excluded.last_used", (profile, site, how, now, now))
+
+    def touch_browser_site(self, site: str, profile: str = "") -> None:
+        self._run("UPDATE browser_sign_ins SET last_used = ? WHERE profile = ? AND site = ?", (time.time(), profile, site))
+
+    def browser_sign_ins(self, profile: str | None = None) -> list[dict[str, Any]]:
+        """All rows (profile None), or the rows of one profile ("" = the default profile); each row carries its profile."""
+        if profile is None:
+            rows = self._all("SELECT * FROM browser_sign_ins ORDER BY profile, site")
+        else:
+            rows = self._all("SELECT * FROM browser_sign_ins WHERE profile = ? ORDER BY site", (profile,))
+        return [{"profile": r["profile"], "site": r["site"], "how": r["how"], "signed_at": r["signed_at"], "last_used": r["last_used"]}
+                for r in rows]
+
+    def forget_browser_sign_in(self, site: str, profile: str = "") -> bool:
+        return self._run("DELETE FROM browser_sign_ins WHERE profile = ? AND site = ?", (profile, site)).rowcount > 0
+
+    # Named browser profiles: another account on the same site. A profile is a set of site units, each sealed with the vault's sealer
+    # (the cookies and local storage of one site); the default profile is the owner's own browser and has no row here (brief C2a).
+    def _unit_aad(self, profile: str, site: str) -> str:
+        return f"browser-unit:{profile}:{site}"
+
+    def _unit_unlocked(self) -> None:
+        if self.vault_locked():
+            raise VaultError(f"The user has locked the keychain, so a browser profile cannot be opened right now. Tell them they can unlock it in {t(KEYCHAIN)}.")
+
+    def create_browser_profile(self, label: str) -> dict[str, Any]:
+        label = (label or "").strip()
+        if not 1 <= len(label) <= 40:
+            raise ValueError("a profile name is 1 to 40 characters")
+        if any(p["label"].lower() == label.lower() for p in self.browser_profiles()):
+            raise ValueError("a profile with this name exists")
+        row = {"id": "p_" + secrets.token_hex(4), "label": label, "created_at": time.time()}
+        self._run("INSERT INTO browser_profiles(id, label, created_at) VALUES (?, ?, ?)", (row["id"], label, row["created_at"]))
+        return row
+
+    def browser_profiles(self) -> list[dict[str, Any]]:
+        out = []
+        for r in self._all("SELECT * FROM browser_profiles ORDER BY created_at, id"):
+            sites = [{k: v[k] for k in ("site", "how", "signed_at", "last_used")} for v in self.browser_sign_ins(r["id"])]
+            out.append({"id": r["id"], "label": r["label"], "created_at": r["created_at"], "sites": sites})
+        return out
+
+    def delete_browser_profile(self, profile_id: str) -> bool:
+        self._run("DELETE FROM browser_profile_units WHERE profile = ?", (profile_id,))
+        self._run("DELETE FROM browser_sign_ins WHERE profile = ?", (profile_id,))
+        return self._run("DELETE FROM browser_profiles WHERE id = ?", (profile_id,)).rowcount > 0
+
+    def check_browser_profile(self, profile: str) -> None:
+        """A named profile can be opened: the keychain is not locked and the profile exists (VaultError says why not)."""
+        self._unit_unlocked()
+        if not self._all("SELECT 1 FROM browser_profiles WHERE id = ?", (profile,)):
+            raise VaultError("There is no browser profile with this id: list them with browser_profiles.")
+
+    def browser_unit(self, profile: str, site: str) -> dict[str, Any]:
+        """The cookies and local storage this profile holds for a site; empty when none (or when the sealed row does not open)."""
+        self._unit_unlocked()
+        rows = self._all("SELECT unit FROM browser_profile_units WHERE profile = ? AND site = ?", (profile, site))
+        plain = self._sealer.open(rows[0]["unit"], self._unit_aad(profile, site)) if rows else None
+        if plain is None:
+            return {"cookies": [], "storage": {}}
+        try:
+            unit = json.loads(plain)
+        except ValueError:
+            return {"cookies": [], "storage": {}}
+        return {"cookies": list(unit.get("cookies") or []), "storage": dict(unit.get("storage") or {})}
+
+    def save_browser_unit(self, profile: str, site: str, unit: dict[str, Any]) -> None:
+        self._unit_unlocked()
+        sealed = self._sealer.seal(json.dumps(unit, separators=(",", ":"), ensure_ascii=False), self._unit_aad(profile, site))
+        self._run("INSERT INTO browser_profile_units(profile, site, unit, updated_at) VALUES (?, ?, ?, ?) "
+                  "ON CONFLICT(profile, site) DO UPDATE SET unit = excluded.unit, updated_at = excluded.updated_at",
+                  (profile, site, sealed, time.time()))
+
+    def forget_browser_unit(self, profile: str, site: str) -> bool:
+        self._run("DELETE FROM browser_sign_ins WHERE profile = ? AND site = ?", (profile, site))
+        return self._run("DELETE FROM browser_profile_units WHERE profile = ? AND site = ?", (profile, site)).rowcount > 0
 
     def credentials(self) -> list[dict[str, Any]]:
         """Every item in the vault as the app may show it: what it is for and whether a value is stored, never the value."""
@@ -544,9 +812,19 @@ class Store:
 
     def devices(self) -> list[dict[str, Any]]:
         """Every signed-in device; "code": the label of the access code it joined with ("" for a one-time code)."""
-        rows = self._all("SELECT d.id, d.name, d.created_at, d.last_seen, d.e2e_only, COALESCE(c.label, '') AS code "
-                         "FROM devices d LEFT JOIN access_codes c ON c.id = d.code_id ORDER BY d.id")
-        return [{**{k: v for k, v in r.items() if k != "e2e_only"}, "e2e": bool(r["e2e_only"])} for r in rows]
+        rows = self._all("SELECT d.id, d.name, d.created_at, d.last_seen, d.e2e_only, d.approval_key != '' AS approval_key, "
+                         "COALESCE(c.label, '') AS code FROM devices d LEFT JOIN access_codes c ON c.id = d.code_id ORDER BY d.id")
+        return [{**{k: v for k, v in r.items() if k not in ("e2e_only", "approval_key")}, "e2e": bool(r["e2e_only"]),
+                 "approval_key": bool(r["approval_key"])} for r in rows]
+
+    # ---- approval keys (approval_sign.py): one ES256 public key per device, held by the phone's keystore. Removing the device removes it.
+    def approval_key(self, device_id: int) -> str:
+        """The device's approval public key (base64 SubjectPublicKeyInfo DER), "" when it has none."""
+        rows = self._all("SELECT approval_key FROM devices WHERE id = ?", (device_id,))
+        return rows[0]["approval_key"] if rows else ""
+
+    def set_approval_key(self, device_id: int, public_key: str) -> bool:
+        return self._run("UPDATE devices SET approval_key = ? WHERE id = ?", (public_key, device_id)).rowcount > 0
 
     def set_device_e2e_only(self, device_id: int) -> bool:
         """KE2E: after a device's first end-to-end call its token is refused on plaintext /api/* (e2e-and-phone-key.md 1.3).

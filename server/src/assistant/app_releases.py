@@ -51,9 +51,10 @@ class Release:
     version: str
     channel: str
     date: str
+    min_server: str = ""   # the oldest server this app works with (the app's compiled-in min_server); "" = not recorded: any server
 
     @classmethod
-    def make(cls, version: Any, build: Any, channel: Any, date: Any) -> Release:
+    def make(cls, version: Any, build: Any, channel: Any, date: Any, min_server: Any = None) -> Release:
         """Checks every field. Raises RecordError."""
         try:
             key = release_version.parse(version)
@@ -69,14 +70,32 @@ class Release:
             day = None
         if day is None:
             raise RecordError(f"the date must be YYYY-MM-DD, not {date!r}")
-        return cls(key, build, version.strip(), channel, day.isoformat())
+        if min_server in (None, ""):
+            min_server = ""
+        else:
+            try:
+                release_version.parse(min_server)
+            except ValueError:
+                raise RecordError(f"min_server must be a release version (MAJOR.MINOR.PATCH), not {min_server!r}") from None
+            min_server = min_server.strip()
+        return cls(key, build, version.strip(), channel, day.isoformat(), min_server)
 
     def to_json(self) -> dict[str, Any]:
-        return {"version": self.version, "build": self.build, "channel": self.channel, "date": self.date}
+        out: dict[str, Any] = {"version": self.version, "build": self.build, "channel": self.channel, "date": self.date}
+        if self.min_server:
+            out["min_server"] = self.min_server
+        return out
 
     @property
     def label(self) -> str:
         return f"{self.version} (build {self.build})"
+
+    def store_row(self) -> dict[str, Any]:
+        """The row latest.json's "store" carries (and release_sign.store_statement signs): what the store row of this release says."""
+        out: dict[str, Any] = {"channel": self.channel, "version": self.version, "build": self.build, "date": self.date}
+        if self.min_server:
+            out["min_server"] = self.min_server
+        return out
 
 
 @dataclass(frozen=True)
@@ -132,9 +151,9 @@ class AppReleases:
             seen: set[tuple[str, int]] = set()
             out = []
             for row in rows:
-                if not isinstance(row, dict) or set(row) - {"version", "build", "channel", "date"}:
-                    raise RecordError(f"{platform}: an entry is not {{version, build, channel, date}}")
-                rel = Release.make(row.get("version"), row.get("build"), row.get("channel"), row.get("date"))
+                if not isinstance(row, dict) or set(row) - {"version", "build", "channel", "date", "min_server"}:
+                    raise RecordError(f"{platform}: an entry is not {{version, build, channel, date[, min_server]}}")
+                rel = Release.make(row.get("version"), row.get("build"), row.get("channel"), row.get("date"), row.get("min_server"))
                 if (rel.version, rel.build) in seen:
                     raise RecordError(f"{platform}: {rel.label} is listed twice")
                 seen.add((rel.version, rel.build))
@@ -173,6 +192,13 @@ class AppReleases:
         """The newest released app of a platform, by version, then build."""
         rows = self.entries.get(platform) or []
         return max(rows) if rows else None
+
+    def newest_store(self, platform: str) -> Release | None:
+        """The newest release of a platform in its store channel (by build, then version): the one the store installs."""
+        from .release_sign import STORE_CHANNELS
+
+        rows = [r for r in self.entries.get(platform) or [] if r.channel == STORE_CHANNELS.get(platform)]
+        return max(rows, key=lambda r: (r.build, r.version_key)) if rows else None
 
     def newest_build(self, platform: str) -> Release | None:
         """The released app with the highest build number (builds rise with versions, but the check does not rely on it)."""
@@ -232,7 +258,7 @@ class AppReleases:
         return Enforcement(kept, skip, tuple(sorted(bad | skip)), tuple(by_version + by_build))
 
     # ------------------------------------------------------------------------------------------------------------- writing
-    def add(self, platform: str, version: Any, build: Any, channel: Any, date: Any = None) -> bool:
+    def add(self, platform: str, version: Any, build: Any, channel: Any, date: Any = None, min_server: Any = None) -> bool:
         """Adds a release that is live now. Returns False when exactly this one is already recorded; a different channel for the
         same version and build is the same release and is not added twice either. Raises RecordError for anything invalid."""
         if platform not in PLATFORMS:
@@ -241,7 +267,7 @@ class AppReleases:
             if not build.isdigit():
                 raise RecordError(f"the build must be a whole number, not {build!r}")
             build = int(build)
-        rel = Release.make(version, build, channel, date or _date.today().isoformat())
+        rel = Release.make(version, build, channel, date or _date.today().isoformat(), min_server)
         if any(r.version == rel.version and r.build == rel.build for r in self.entries[platform]):
             return False
         self.entries[platform] = sorted([*self.entries[platform], rel])
@@ -298,22 +324,39 @@ def run_record(args: Any, out: Any = print, path: Path | None = None) -> int:
         return 1
     try:
         record = AppReleases.read(target)
-        added = record.add(args.platform, args.version, args.build, args.channel, getattr(args, "date", None))
+        added = record.add(args.platform, args.version, args.build, args.channel, getattr(args, "date", None),
+                          getattr(args, "min_server", None))
     except RecordError as e:
         out(f"error: {e}")
         return 1
     if not added:
         out(f"{args.platform} {args.version} (build {args.build}) is already recorded in {target}; nothing changed.")
-        return 0
+        return _publish_store_row(args, record, out)     # a store release is still published: a re-run after a failed publish works
     record.save(target)
     out(f"Recorded {args.platform} {args.version} (build {args.build}, {args.channel}) in {target}. Commit it: from now on a minimum app "
         "version may be as high as this release.")
+    return _publish_store_row(args, record, out)
+
+
+def _publish_store_row(args: Any, record: AppReleases, out: Any) -> int:
+    """A store channel's release is also published (signed) to kelo.chat, so every server learns that the store has it. A failure
+    keeps the record: the operator then runs `assistant publish-store` (or passes --no-publish to skip this step)."""
+    from .release_sign import STORE_CHANNELS
+
+    if args.channel not in STORE_CHANNELS.values() or getattr(args, "no_publish", False):
+        return 0
+    from .downloads import run_publish_store
+
+    if run_publish_store(args, Path.cwd(), out=out, record=record) != 0:
+        out("Recorded, but not published to kelo.chat (see above). Run `assistant publish-store` on the operator's computer.")
+        return 1
     return 0
 
 
 def _valid(args: Any) -> bool:
     try:
-        AppReleases().add(args.platform, args.version, args.build, args.channel, getattr(args, "date", None))
+        AppReleases().add(args.platform, args.version, args.build, args.channel, getattr(args, "date", None),
+                          getattr(args, "min_server", None))
         return True
     except RecordError:
         return False

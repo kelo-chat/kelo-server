@@ -11,6 +11,10 @@ manifest.json: {"platforms": {"android": {"file": "kelo-0.9.0-402500.apk", "vers
 "version" is the name people see (and what older apps compare); "version_code" (when known) is the build number newer apps compare,
 so 0.9.0 with a higher build is offered as an update (Android: versionCode; given as `--version 0.9.0+402500` or read from the APK).
 
+STORE ROWS: latest.json's "store" object holds the newest live store release of each app ({"android": {"play": row}, "ios":
+{"appstore": row}, "desktop": {"msstore": row}}), each row signed with the release key over release_sign.store_statement. The
+publisher writes them (`assistant release-record` for a store channel, `assistant publish-store`) and every writer keeps the section.
+
 SIGNED ROWS: a row may also carry "sig", "key" (key id) and "commit" (the public source commit): the Ed25519 signature the apps check
 (release_sign.py, release_keys.py). latest.json passes the three through; the apps offer nothing whose signature does not check.
 
@@ -38,9 +42,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from . import release_sign
+from . import release, release_sign
 from .hosting import paths
-from .app_releases import AppReleases
+from .app_releases import AppReleases, RecordError
+from .release_sign import STORE_CHANNELS
 
 MANIFEST = "manifest.json"
 # platform -> (file extension, media type, what the site calls it)
@@ -48,8 +53,12 @@ PLATFORMS: dict[str, tuple[str, str, str]] = {
     "android": (".apk", "application/vnd.android.package-archive", "Android"),
     "windows": (".exe", "application/vnd.microsoft.portable-executable", "Windows"),
     "windows-msi": (".msi", "application/x-msi", "Windows (MSI)"),
+    "windows-server-msi": (".msi", "application/x-msi", "Kelo server for Windows (MSI)"),   # not on the public download page: latest.json + the direct link only
     "mac": (".dmg", "application/x-apple-diskimage", "macOS"),
+    "mac-server-bundle": (".zip", "application/zip", "Kelo server for Mac (bundle)"),        # the same rules as windows-server-msi
 }
+# the Kelo server's installers: never the desktop app's rows, never on the public page, never in apps.json
+SERVER_PLATFORMS = frozenset({"windows-server-msi", "mac-server-bundle"})
 FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
 VERSION = re.compile(r"^[0-9][0-9A-Za-z.-]{0,39}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -80,6 +89,39 @@ def operator_flag(value: str | None) -> bool | None:
 
 
 # ---------------------------------------------------------------------------------------------------------------- reading
+def _store_entry(platform: str, raw: Any) -> dict[str, Any] | None:
+    """One store row of latest.json, checked for shape (the signature is checked by the readers): None when anything is off.
+    Kept: channel, version, build, date, min_server and, both together, sig and key."""
+    if platform not in STORE_CHANNELS or not isinstance(raw, dict):
+        return None
+    try:
+        release_sign.store_statement(platform, raw)
+    except ValueError:
+        return None
+    out = {k: raw[k] for k in ("channel", "version", "build", "date")}
+    if raw.get("min_server") not in (None, ""):
+        out["min_server"] = raw["min_server"]
+    if "sig" in raw or "key" in raw:
+        sig, key = raw.get("sig"), raw.get("key")
+        if not (isinstance(sig, str) and SIGNATURE.fullmatch(sig) and isinstance(key, str) and KEY_ID.fullmatch(key)):
+            return None
+        out["sig"], out["key"] = sig, key
+    return out
+
+
+def _store_rows(raw: Any) -> dict[str, dict[str, dict[str, Any]]]:
+    """platform -> {channel: row} from a manifest's or latest.json's "store" object; anything malformed is left out."""
+    out: dict[str, dict[str, dict[str, Any]]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for platform, channels in raw.items():
+        channel = STORE_CHANNELS.get(platform)
+        row = _store_entry(platform, channels.get(channel)) if channel and isinstance(channels, dict) else None
+        if row:
+            out[platform] = {channel: row}
+    return out
+
+
 def _entry(platform: str, raw: Any) -> dict[str, Any] | None:
     """One manifest row, checked; None when anything about it is off."""
     if platform not in PLATFORMS or not isinstance(raw, dict):
@@ -111,7 +153,9 @@ class Downloads:
     def __init__(self, folder: str | Path | None):
         self.folder = Path(folder) if folder else None
         self._last: tuple[tuple[int, int], dict[str, dict[str, Any]]] | None = None
-        self._server: dict[str, Any] | None = None   # the checked server release of the last good manifest
+        self._server: dict[str, Any] | None = None   # the checked server release of the last good manifest, as to_json()
+        self._server_rel: release.Release | None = None
+        self._store: dict[str, dict[str, dict[str, Any]]] = {}
 
     def manifest(self) -> dict[str, dict[str, Any]]:
         """platform -> checked row. A manifest being rewritten (unreadable for a moment) keeps the last good one."""
@@ -132,7 +176,9 @@ class Downloads:
             return self._last[1] if self._last else {}
         rows = raw.get("platforms") if isinstance(raw, dict) else None
         out = {p: e for p, r in (rows.items() if isinstance(rows, dict) else ()) if (e := _entry(p, r))}
-        self._server = server_entry(raw.get("server") if isinstance(raw, dict) else None)
+        self._server_rel = server_release(raw.get("server") if isinstance(raw, dict) else None)
+        self._server = self._server_rel.to_json() if self._server_rel else None
+        self._store = _store_rows(raw.get("store") if isinstance(raw, dict) else None)
         self._last = (key, out)
         return out
 
@@ -140,6 +186,16 @@ class Downloads:
         """The server release (release.py manifest), checked; None when there is none or it does not pass."""
         self.manifest()
         return self._server
+
+    def store(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """The checked store rows: platform -> {channel: row} (empty when there are none)."""
+        self.manifest()
+        return {p: dict(c) for p, c in self._store.items()}
+
+    def server_release(self) -> release.Release | None:
+        """The same server release as checked by release.parse, or None."""
+        self.manifest()
+        return self._server_rel
 
     def file(self, platform: str, name: str | None = None) -> tuple[Path, dict[str, Any]] | None:
         """(path, row) of the file the manifest names for `platform` (and, when given, only if it is that `name`), or None."""
@@ -178,24 +234,33 @@ class Downloads:
                 out[p] = {"version": row["version"], "size": row["size"], "sha256": row["sha256"], "date": row["date"],
                           "file": row["file"], "url": f"{base}/download/{p}",
                           **{k: row[k] for k in ("version_code", "sig", "key", "commit") if k in row}}
-        server = self.server()
+        server = self.server_release()
         if server:
-            out["server"] = server
+            out["server"] = server.to_public_json()
+        store = self.store()
+        if store:
+            out["store"] = store
         return out
 
 
-def server_entry(raw: Any) -> dict[str, Any] | None:
-    """A server release manifest as latest.json shows it, or None when it does not pass release.parse (against its own registry:
-    each server still checks it against the registry it is configured for)."""
+def server_release(raw: Any) -> release.Release | None:
+    """A server release manifest, checked by release.parse against its own registry (each server still checks it against the
+    registry it is configured for), or None when it does not pass."""
     from .release import DEFAULT_REGISTRY, ReleaseError, parse
 
     if not isinstance(raw, dict):
         return None
     try:
         reg = raw.get("registry") if isinstance(raw.get("registry"), str) else DEFAULT_REGISTRY
-        return parse(raw, reg).to_json()
+        return parse(raw, reg)
     except ReleaseError:
         return None
+
+
+def server_entry(raw: Any) -> dict[str, Any] | None:
+    """A server release manifest as manifest.json keeps it (release.Release.to_json), or None when it does not pass."""
+    got = server_release(raw)
+    return got.to_json() if got else None
 
 
 def human_size(n: int) -> str:
@@ -253,9 +318,9 @@ def platform_for(platform: str, file: Path) -> str:
     if platform == "windows" and file.suffix.lower() == ".msi":
         platform = "windows-msi"
     if platform not in PLATFORMS:
-        raise PublishError(f"unknown platform {platform!r}: android, windows or mac")
+        raise PublishError(f"unknown platform {platform!r}: android, windows, windows-msi, windows-server-msi, mac or mac-server-bundle")
     if file.suffix.lower() != PLATFORMS[platform][0]:
-        want = ".exe or .msi" if platform.startswith("windows") else PLATFORMS[platform][0]
+        want = ".exe or .msi" if platform == "windows" else PLATFORMS[platform][0]
         raise PublishError(f"{file.name}: a {PLATFORMS[platform][2]} download must be a {want} file")
     return platform
 
@@ -289,6 +354,28 @@ def versions_for(platform: str, file: Path, given: str | None, run: Callable[...
     return version, code
 
 
+OPERATOR_INSTANCE_ENV = "KELO_OPERATOR_INSTANCE"
+
+
+def operator_instance() -> str | None:
+    """The extra copy (`assistant instance`) that is the operator, from KELO_OPERATOR_INSTANCE; None = the main copy (the default).
+
+    A bad name stops the command instead of falling back to main: publishing to the wrong copy is worse than not publishing."""
+    from .instances import MAIN, NAME
+
+    name = (os.environ.get(OPERATOR_INSTANCE_ENV) or "").strip()
+    if not name or name == MAIN:
+        return None
+    if not NAME.match(name):
+        raise PublishError(f"{OPERATOR_INSTANCE_ENV}={name!r} is not a copy name")
+    return name
+
+
+def operator_env_file(root: Path, instance: str | None) -> Path:
+    """The settings file of the operator: the repo's .env (main) or instances/<name>/env."""
+    return root / "instances" / instance / "env" if instance else root / ".env"
+
+
 class Publisher:
     """Copies a build into the downloads folder of the main copy's server container and updates the manifest there.
 
@@ -300,13 +387,22 @@ class Publisher:
                  folder: str = f"{paths.STATE_DIR_IN_DOCKER}/downloads"):
         self.root, self.run, self.out, self.folder = root, run, out, folder.rstrip("/")
         self.server_release: dict[str, Any] | None = None
+        self.store_rows: dict[str, dict[str, dict[str, Any]]] = {}   # kept when apps or the server are published
+
+    def _body(self, rows: dict[str, Any], server: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The manifest as written: the platform rows, the server release and the store rows (every writer keeps all three)."""
+        server = server if server is not None else self.server_release
+        return {"platforms": rows, **({"server": server} if server else {}), **({"store": self.store_rows} if self.store_rows else {})}
 
     def container(self) -> str:
-        r = self.run(["docker", "compose", "-f", str(self.root / "compose.yml"), "ps", "-a", "-q", "server"],
-                     cwd=self.root, capture_output=True, text=True)
+        inst = operator_instance()
+        cmd = ["docker", "compose", "-f", str(self.root / "compose.yml")]
+        if inst:   # a separate operator copy: its own compose project and settings, exactly as Instances.compose builds them
+            cmd += ["-p", f"assistant-u-{inst}", "--env-file", str(operator_env_file(self.root, inst))]
+        r = self.run([*cmd, "ps", "-a", "-q", "server"], cwd=self.root, capture_output=True, text=True)
         cid = (r.stdout or "").strip().splitlines()[0].strip() if r.returncode == 0 and (r.stdout or "").strip() else ""
         if not cid:
-            raise PublishError("the main copy's server container was not found here: run this in the folder that holds compose.yml "
+            raise PublishError(f"the {inst + ' copy' if inst else 'main copy'}'s server container was not found here: run this in the folder that holds compose.yml "
                                "after `docker compose up -d`")
         return cid
 
@@ -324,6 +420,7 @@ class Publisher:
             return {}
         rows = raw.get("platforms") if isinstance(raw, dict) else None
         self.server_release = server_entry(raw.get("server")) if isinstance(raw, dict) else None   # kept when apps are published
+        self.store_rows = _store_rows(raw.get("store")) if isinstance(raw, dict) else {}           # kept by every writer
         return {p: e for p, r2 in (rows.items() if isinstance(rows, dict) else ()) if (e := _entry(p, r2))}
 
     def _copy_in(self, cid: str, staged: Path) -> None:
@@ -355,7 +452,8 @@ class Publisher:
         commit = (commit or "").strip().lower() or None
         if commit is not None and not COMMIT.fullmatch(commit):
             raise PublishError("--commit must be the full 40-character hex hash of the public source commit")
-        name = f"kelo-{version}{f'-{code}' if code is not None else ''}{PLATFORMS[platform][0]}"
+        prefix = "kelo-server-" if platform in SERVER_PLATFORMS else "kelo-"   # the server installers never share a file name with the desktop app
+        name = f"{prefix}{version}{f'-{code}' if code is not None else ''}{PLATFORMS[platform][0]}"
         size, sha = file.stat().st_size, sha256_of(file)
         cid = self.container()
         with tempfile.TemporaryDirectory(prefix="kelo-publish-") as tmp:
@@ -379,7 +477,7 @@ class Publisher:
             meta = scratch / "meta"
             meta.mkdir(mode=0o755)
             meta.chmod(0o755)
-            body = {"platforms": rows, **({"server": self.server_release} if self.server_release else {})}
+            body = self._body(rows)
             (meta / MANIFEST).write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             (meta / MANIFEST).chmod(0o644)
             self._copy_in(cid, meta)
@@ -395,7 +493,7 @@ class Publisher:
         written again. The row's size and sha256 are kept, and the file's real sha256 is re-checked first (it is copied out of the
         container with `docker cp`, which works whether or not the container runs)."""
         if platform not in PLATFORMS:
-            raise PublishError(f"unknown platform {platform!r}: android, windows, windows-msi or mac")
+            raise PublishError(f"unknown platform {platform!r}: android, windows, windows-msi, windows-server-msi, mac or mac-server-bundle")
         commit = (commit or "").strip().lower() or None
         if commit is not None and not COMMIT.fullmatch(commit):
             raise PublishError("--commit must be the full 40-character hex hash of the public source commit")
@@ -420,7 +518,7 @@ class Publisher:
             meta = scratch / "meta"
             meta.mkdir(mode=0o755)
             meta.chmod(0o755)
-            body = {"platforms": rows, **({"server": self.server_release} if self.server_release else {})}
+            body = self._body(rows)
             (meta / MANIFEST).write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             (meta / MANIFEST).chmod(0o644)
             self._copy_in(cid, meta)
@@ -456,12 +554,69 @@ class ServerPublisher(Publisher):
             meta = scratch / "meta"
             meta.mkdir(mode=0o755)
             meta.chmod(0o755)
-            body = {"platforms": rows, "server": release.to_json()}
+            body = self._body(rows, release.to_json())
             (meta / MANIFEST).write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             (meta / MANIFEST).chmod(0o644)
             self._copy_in(cid, meta)
         self.out(f"Published server release {release.version} ({release.channel}, {len(release.images)} images from {release.registry}).")
         return release.to_json()
+
+
+class StorePublisher(Publisher):
+    """Publishes the newest store release of each app (releases/apps.json) as a signed row of latest.json's "store" object."""
+
+    def publish_store(self, record: AppReleases, key_path: Path | None, *, base_url: str = "https://kelo.chat") -> dict[str, dict[str, dict[str, Any]]]:
+        if key_path is None:
+            raise PublishError("no signing key: make one with `assistant release-key new` (an unsigned store row is ignored by every "
+                               "server, so nothing is published)")
+        wanted: dict[str, dict[str, dict[str, Any]]] = {}
+        for platform, channel in release_sign.STORE_CHANNELS.items():
+            rel = record.newest_store(platform)
+            if rel is None:
+                continue
+            try:
+                signed = release_sign.sign_store_row(platform, rel.store_row(), key_path, self.root)
+            except (release_sign.SigningKeyError, ValueError) as e:
+                raise PublishError(str(e)) from None
+            if not release_sign.verify_store_row(platform, signed):
+                raise PublishError("this key is not one the servers know: add its public key to release_keys.py and ReleaseKeys.kt first")
+            entry = _store_entry(platform, signed)
+            if entry is None:
+                raise PublishError(f"the {platform} store row does not pass the checks: not published")
+            wanted[platform] = {channel: entry}
+        cid = self.container()
+        with tempfile.TemporaryDirectory(prefix="kelo-store-") as tmp:
+            scratch = Path(tmp)
+            rows = self.current(cid, scratch)
+            self.store_rows = wanted                       # platforms without a store release are left out
+            meta = scratch / "meta"
+            meta.mkdir(mode=0o755)
+            meta.chmod(0o755)
+            (meta / MANIFEST).write_text(json.dumps(self._body(rows), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            (meta / MANIFEST).chmod(0o644)
+            self._copy_in(cid, meta)
+        shown = ", ".join(f"{p} {c[STORE_CHANNELS[p]]['version']} ({STORE_CHANNELS[p]})" for p, c in wanted.items()) or "none"
+        self.out(f"Published store releases: {shown}: {base_url.rstrip('/')}/download/latest.json")
+        return wanted
+
+
+def run_publish_store(args: Any, root: Path | None = None, *, run: Callable[..., Any] = subprocess.run,
+                      out: Callable[[str], None] = print, record: AppReleases | None = None) -> int:
+    """`assistant publish-store`: re-publishes the newest store release of each app from releases/apps.json (signed), on the
+    operator's server only. Also run by release-record for a store channel."""
+    root = (root or Path.cwd()).resolve()
+    public = _operator_public(root, out)
+    if public is None:
+        return 1
+    try:
+        if record is None:
+            record = AppReleases.read(root / "releases" / "apps.json")
+        StorePublisher(root, run=run, out=out).publish_store(record, _key_path(getattr(args, "sign_key", None)),
+                                                            base_url=public or "https://kelo.chat")
+    except (PublishError, RecordError) as e:
+        out(f"error: {e}")
+        return 1
+    return 0
 
 
 def run_publish_server(args: Any, root: Path | None = None, *, run: Callable[..., Any] = subprocess.run,
@@ -470,9 +625,14 @@ def run_publish_server(args: Any, root: Path | None = None, *, run: Callable[...
     from .cli import read_env
 
     root = (root or Path.cwd()).resolve()
-    env = root / ".env"
+    try:
+        env = operator_env_file(root, operator_instance())
+    except PublishError as e:
+        out(f"error: {e}")
+        return 1
     if not env.is_file() or not (root / "compose.yml").is_file():
-        out("error: run this in the folder that holds compose.yml and .env (the main copy)")
+        out("error: run this in the folder that holds compose.yml and .env (the main copy; the operator copy's settings when "
+            f"{OPERATOR_INSTANCE_ENV} is set)")
         return 1
     get = lambda k: read_env(env, k)  # noqa: E731
     flag = operator_flag(get("ASSISTANT_OPERATOR"))
@@ -504,7 +664,8 @@ def run_publish(args: Any, root: Path | None = None, *, run: Callable[..., Any] 
     except PublishError as e:
         out(f"error: {e}")
         return 1
-    record_published(root, row, out)
+    if args.platform not in SERVER_PLATFORMS:          # the server's installer is not an app release: nothing to record in apps.json
+        record_published(root, row, out)
     return 0
 
 
@@ -512,9 +673,14 @@ def _operator_public(root: Path, out: Callable[[str], None]) -> str | None:
     """The public address from .env when this folder is the operator's main copy; None (after saying why) when it is not."""
     from .cli import read_env
 
-    env = root / ".env"
+    try:
+        env = operator_env_file(root, operator_instance())
+    except PublishError as e:
+        out(f"error: {e}")
+        return None
     if not env.is_file() or not (root / "compose.yml").is_file():
-        out("error: run this in the folder that holds compose.yml and .env (the main copy)")
+        out("error: run this in the folder that holds compose.yml and .env (the main copy; the operator copy's settings when "
+            f"{OPERATOR_INSTANCE_ENV} is set)")
         return None
     get = lambda k: read_env(env, k)  # noqa: E731
     flag = operator_flag(get("ASSISTANT_OPERATOR"))

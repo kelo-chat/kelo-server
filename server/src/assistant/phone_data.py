@@ -47,12 +47,28 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from .agent import Tool
+from .code_shelf import SHELF
+from .data_trail import USES_PARAM, note_item
 from .i18n import t
 from .phone_calendar import _parse, _zone, ago
+from .tools.connect_tools import owner_request
 from .store import Store
 
 SNAPSHOT_KINDS = ("contacts", "messages", "call_log", "health", "dialer")
 KINDS = (*SNAPSHOT_KINDS, "notifications")
+
+# What the hourly look reads of each phone item the owner shares (situation_reads.declared): data, one declaration per kind. An item
+# with no state of its own (contacts, the dialer) has none. "lines": the tool's list lines start with "- "; the freshness line does not,
+# so "last sync" text stays out of the fingerprint. Labels are translated when the pack is built.
+SITUATION: dict[str, dict[str, Any]] = {
+    "messages": {"tool": "phone_messages", "arguments": {"days": 1, "limit": 30}, "mode": "changes", "lines": "^- ", "max_rows": 30,
+                 "label": "Text messages"},
+    "call_log": {"tool": "phone_call_log", "arguments": {"days": 1, "limit": 20}, "mode": "changes", "lines": "^- ", "max_rows": 20,
+                 "label": "Calls"},
+    "notifications": {"tool": "phone_notifications", "arguments": {"hours": 3, "limit": 40}, "mode": "changes", "lines": "^- ",
+                      "max_rows": 40, "label": "Notifications"},
+    "health": {"tool": "phone_health", "arguments": {}, "mode": "state", "lines": "^- ", "max_rows": 20, "wakes": False, "label": "Health"},
+}
 PATHS = {"contacts": "contacts", "messages": "messages", "call-log": "call_log", "health": "health", "dialer": "dialer",
          "notifications": "notifications"}
 LIMITS = {"contacts": 10_000, "messages": 6000, "call_log": 5000, "health": 400}
@@ -358,6 +374,10 @@ class PhoneData:
         return {"kinds": {k: {"shared": k in rows, "uploaded_at": rows[k]["uploaded_at"] if k in rows else None,
                               "count": rows[k]["count"] if k in rows else 0} for k in KINDS}}
 
+    def shared_kinds(self) -> set[str]:
+        """The kinds any phone shares now (the owner's switches): situation_reads reads only these."""
+        return {r["kind"] for r in self.store._all("SELECT DISTINCT kind FROM phone_data")}
+
     # ---- tasks for the phone (after an approval)
     def sender(self) -> dict[str, Any] | None:
         """The phone that sends texts: the newest one that shares messages and may send them."""
@@ -482,12 +502,11 @@ def phone_tools(data: PhoneData, timezone_name: Callable[[], str | None]) -> lis
         found = exact or found
         if not found:
             return "", "", f"no contact called {to!r} with a phone number" + ("" if data.snapshots("contacts") else " (contacts are not shared)")
-        if len(found) > 1 or len(found[0]["phones"]) > 1 and not any("mobile" in p["label"].lower() or "휴대" in p["label"] for p in found[0]["phones"]):
+        if len(found) > 1 or len(found[0]["phones"]) > 1:   # which number is the mobile one is not guessed from its label: ask
             options = "; ".join(f"{c['name']}: " + ", ".join(p["number"] for p in c["phones"]) for c in found[:6])
             return "", "", f"{to!r} matches more than one number — ask which one, then give the number: {options}"
         c = found[0]
-        p = next((p for p in c["phones"] if "mobile" in p["label"].lower() or "휴대" in p["label"]), c["phones"][0])
-        return p["number"], c["name"], ""
+        return c["phones"][0]["number"], c["name"], ""
 
     # ---- contacts
     async def phone_contacts(args: dict[str, Any]) -> str:
@@ -514,6 +533,7 @@ def phone_tools(data: PhoneData, timezone_name: Callable[[], str | None]) -> lis
             parts += [work] if work else []
             parts += [f"birthday {c['birthday'].lstrip('-')}"] if c["birthday"] else []
             lines.append(f"- {c['name'] or '(no name)'}: " + " · ".join(parts))
+            note_item(f"contact:{c['name'] or parts[0] if parts else ''}", title=c["name"] or "", text=lines[-1])
         return "\n".join(lines)
 
     # ---- messages
@@ -550,10 +570,12 @@ def phone_tools(data: PhoneData, timezone_name: Callable[[], str | None]) -> lis
             return "\n".join(lines)
         lines.append(f"Messages ({getattr(tz(), 'key', 'UTC')}), newest first, {len(hits)}"
                      f"{' (first ' + str(limit) + ' shown)' if len(hits) > limit else ''}:")
-        for m in hits[:limit]:
+        shown_all = await SHELF.mask_many([(str(m["body"] or ""), str(m["address"] or ""), "") for m in hits[:limit]], channel="text")   # code_shelf.py
+        for m, shown in zip(hits[:limit], shown_all):
             who = _who(m["name"] or name_for(m["address"]), m["address"])
             arrow = f"to {who}" if m["box"] == "sent" else f"from {who}"
-            lines.append(f"- {fmt(m['at'])} {arrow}{' (MMS)' if m['kind'] == 'mms' else ''}: {m['body'] or '(no text)'}")
+            lines.append(f"- {fmt(m['at'])} {arrow}{' (MMS)' if m['kind'] == 'mms' else ''}: {shown or '(no text)'}")
+            note_item(f"message:{m['at']}:{m['address']}", party=str(m["address"] or ""), title=str(who), text=str(m["body"] or ""))
         return "\n".join(lines)
 
     def check_send(args: dict[str, Any]) -> str | None:
@@ -690,8 +712,12 @@ def phone_tools(data: PhoneData, timezone_name: Callable[[], str | None]) -> lis
             lines.append(f"No notifications in the last {hours} hours match." if (app or q) else f"No notifications in the last {hours} hours.")
             return "\n".join(lines)
         lines.append(f"Notifications ({getattr(tz(), 'key', 'UTC')}), newest first, {len(hits)}{' (first ' + str(limit) + ' shown)' if len(hits) > limit else ''}:")
-        for n in hits[:limit]:
-            lines.append(f"- {fmt(n['at'])} [{n['app'] or n['package']}] {n['title']}{': ' + n['text'] if n['text'] else ''}")
+        part = hits[:limit]
+        both = await SHELF.mask_many([*((str(n["text"] or ""), str(n["app"] or n["package"]), str(n["title"])) for n in part),
+                                      *((str(n["title"]), str(n["app"] or n["package"]), "") for n in part)], channel="text")   # one judge request
+        shown, titles = both[:len(part)], both[len(part):]
+        for n, title, text in zip(hits[:limit], titles, shown):
+            lines.append(f"- {fmt(n['at'])} [{n['app'] or n['package']}] {title}{': ' + text if n['text'] else ''}")
         return "\n".join(lines)
 
     # ---- health
@@ -744,16 +770,18 @@ def phone_tools(data: PhoneData, timezone_name: Callable[[], str | None]) -> lis
         Tool("phone_contacts", "Search the contacts on the user's phone.",
              {"type": "object", "properties": {"query": {"type": "string", "description": "part of a name, number, email or company; empty: all"},
                                                "limit": {"type": "integer"}}},
-             phone_contacts, read_only=True, untrusted=True, source="phone"),
-        Tool("phone_messages", "Read text messages on the user's phone, newest first (default: the last 30 days).",
+             phone_contacts, read_only=True, untrusted=True, source="phone", trail="contacts"),
+        Tool("phone_messages", "Read text messages on the user's phone, newest first (default: the last 30 days). One-time codes appear as "
+             "'[verification code #N]': you never see the code; a browser sign-in uses it with find_login_code code_ref N.",
              {"type": "object", "properties": {"query": {"type": "string"},
                                                "with": {"type": "string", "description": "only the conversation with this number or contact"},
                                                "days": {"type": "integer"},
                                                "box": {"type": "string", "enum": ["inbox", "sent"]}, "limit": {"type": "integer"}}},
-             phone_messages, read_only=True, untrusted=True, source="phone"),
+             phone_messages, read_only=True, untrusted=True, source="phone", trail="messages"),
         Tool("phone_send_text", "Send a text message from the user's phone; the user approves the recipient and the whole text first.",
              {"type": "object", "properties": {"to": {"type": "string", "description": who_desc},
-                                               "text": {"type": "string", "description": "the complete message, in the user's voice"}},
+                                               "text": {"type": "string", "description": "the complete message, in the user's voice"},
+                                               "uses": USES_PARAM},
               "required": ["to", "text"]},
              phone_send_text, requires_approval=True, describe=describe_send, validate=check_send, approval_extra=send_lines,
              declined="The user declined to send this text. Do not send it or retry; ask what they would like instead."),
@@ -766,16 +794,16 @@ def phone_tools(data: PhoneData, timezone_name: Callable[[], str | None]) -> lis
         Tool("phone_call_log", "Read the call history on the user's phone, newest first (default: the last 7 days, up to 30).",
              {"type": "object", "properties": {"days": {"type": "integer"}, "query": {"type": "string"},
                                                "type": {"type": "string", "enum": list(CALL_TYPES)}, "limit": {"type": "integer"}}},
-             phone_call_log, read_only=True, untrusted=True, source="phone"),
+             phone_call_log, read_only=True, untrusted=True, source="phone", trail="device"),
         Tool("phone_notifications", "Search the notifications the user's phone received, newest first (default: the last 24 hours, up to 7 "
              "days).",
              {"type": "object", "properties": {"hours": {"type": "integer"}, "app": {"type": "string"}, "query": {"type": "string"},
                                                "limit": {"type": "integer"}}},
-             phone_notifications, read_only=True, untrusted=True, source="phone"),
+             phone_notifications, read_only=True, untrusted=True, source="phone", trail="device"),
         Tool("phone_health", "Read daily health summaries the user chose to share from their phone (default: the last 7 days).",
              {"type": "object", "properties": {"start": {"type": "string", "description": when}, "end": {"type": "string", "description": when},
                                                "metrics": {"type": "array", "items": {"type": "string", "enum": list(HEALTH_TYPES)}}}},
-             phone_health, read_only=True, untrusted=True, source="phone"),
+             phone_health, read_only=True, untrusted=True, source="phone", trail="device"),
     ]
 
 
@@ -957,14 +985,34 @@ def phone_calendar_write_tools(data: PhoneData, cals: Any, timezone_name: Callab
     fields = {"title": {"type": "string"}, "start": {"type": "string", "description": when}, "end": {"type": "string", "description": when},
               "all_day": {"type": "boolean"}, "location": {"type": "string"}}
     return [
-        Tool("phone_calendar_add", "Add an event to the calendar on the user's phone; the user approves it. Without end it lasts an hour "
-             "(all-day: a day).",
+        Tool("phone_calendar_add", "Add an event to the calendar on the user's phone. When the user asked for it in the chat it runs at once; "
+             "otherwise the user approves it on a card. Without end it lasts an hour (all-day: a day). For several changes of one request, call "
+             "them together in one step: the user then sees one card.",
              {"type": "object", "properties": {**fields, "notes": {"type": "string"}}, "required": ["title", "start"]},
-             phone_calendar_add, requires_approval=True, describe=describe_add, validate=check_add, approval_extra=add_lines),
-        Tool("phone_calendar_update", "Change an event in the phone calendar, giving only what changes; the user approves it.",
+             phone_calendar_add, requires_approval=True, describe=describe_add, validate=check_add, approval_extra=add_lines,
+             auto_approve=lambda a: owner_request(), shares_card=True),
+        Tool("phone_calendar_update", "Change an event in the phone calendar, giving only what changes. When the user asked for it in the chat it "
+             "runs at once; otherwise the user approves it on a card. For several changes of one request, call them together in one step.",
              {"type": "object", "properties": {"event_id": {"type": "integer", "description": "from phone_calendar_events"}, **fields}, "required": ["event_id"]},
-             phone_calendar_update, requires_approval=True, describe=describe_change, validate=check_change, approval_extra=change_lines),
-        Tool("phone_calendar_delete", "Delete an event from the phone calendar; the user approves it.",
+             phone_calendar_update, requires_approval=True, describe=describe_change, validate=check_change, approval_extra=change_lines,
+             auto_approve=lambda a: owner_request(), shares_card=True),
+        Tool("phone_calendar_delete", "Delete an event from the phone calendar. When the user asked for it in the chat it runs at once; otherwise "
+             "the user approves it on a card. For several deletions of one request, call them together in one step.",
              {"type": "object", "properties": {"event_id": {"type": "integer", "description": "from phone_calendar_events"}}, "required": ["event_id"]},
-             phone_calendar_delete, requires_approval=True, describe=describe_delete, validate=check_delete, approval_extra=delete_lines),
+             phone_calendar_delete, requires_approval=True, describe=describe_delete, validate=check_delete, approval_extra=delete_lines,
+             auto_approve=lambda a: owner_request(), shares_card=True),
     ]
+
+
+def declared_items(kinds_on: Any) -> list[Any]:
+    """The phone items the owner shares, as situation_reads.Declared (sid "phone/<kind>"), in kind order."""
+    from .situation_reads import Declared, read_of   # lazy: situation_reads reads the connectors' definitions
+    out = []
+    for kind in sorted(SITUATION):
+        if kind not in set(kinds_on):
+            continue
+        raw = SITUATION[kind]
+        read = read_of(raw, where=f"phone/{kind}")
+        if read is not None:
+            out.append(Declared(sid=f"phone/{kind}", name_key="phone", label=read.label, item="", read=read, kind="phone"))
+    return out

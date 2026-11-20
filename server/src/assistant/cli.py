@@ -229,6 +229,8 @@ def add_limit_options(p: argparse.ArgumentParser) -> None:
     g.add_argument("--cli-cpus", metavar="N", help="CPUs for each Claude/agy container (main copy only)")
     g.add_argument("--workroom-memory", metavar="SIZE", help="RAM for the work room, where the agent runs code (default 2g; `none` lifts the cap)")
     g.add_argument("--workroom-cpus", metavar="N", help="CPUs for the work room")
+    g.add_argument("--voice-memory", metavar="SIZE", help="RAM for the speech-to-text container (default 2g; `none` lifts the cap)")
+    g.add_argument("--voice-cpus", metavar="N", help="CPUs for the speech-to-text container")
     g.add_argument("--workroom-disk", metavar="SIZE", help="scratch space one work room job may fill, and the cap for installed packages (default 2g)")
 
 
@@ -251,7 +253,7 @@ def main(argv: list[str] | None = None, out: Callable[[str], None] = print) -> i
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("setup", help="first-run configuration")
     p.add_argument("--browser", choices=BROWSERS, help="skip the question")
-    p.add_argument("--env-file", type=Path, default=Path(".env"))
+    p.add_argument("--env-file", type=Path, default=None, help="the settings file (default: .env here)")
     p.add_argument("--cli", action="append", choices=CLIS, dest="clis",
                    help="subscription CLI to run in a container (repeatable); skips the question")
     p.add_argument("--profile", choices=("recommended", "minimum", "unlimited"),
@@ -263,15 +265,19 @@ def main(argv: list[str] | None = None, out: Callable[[str], None] = print) -> i
     p.add_argument("--from-release", action="store_true",
                    help="guided screen only: pull the signed release images instead of building them here; the Claude/agy "
                         "containers are still built here")
+    p.add_argument("--release-version", metavar="X.Y.Z",
+                   help="with --from-release: pull the images of exactly this release instead of the newest (the installer's --version)")
     p.add_argument("--web", action="store_true",
                    help="ask the same questions in a page in the browser (127.0.0.1 only) instead of the terminal")
     p.add_argument("--no-open", action="store_true", help="with --web: print the page's link only, do not open the browser")
+    p.add_argument("--web-port", type=int, default=0, metavar="N",
+                   help="with --web: listen on this port (127.0.0.1 only); default: a random port. The Mac server's VM forwards a fixed port")
     p.add_argument("--page-file", action="store_true",
                    help="with --web: print the path of a page file that opens the link (the link itself is not printed)")
     u = sub.add_parser("update", help="update a copy safely: back up its data, rebuild, restart, check it, and roll back by itself if it fails")
     u.add_argument("name", nargs="?", help="which extra copy (default: the main one; `instance update` does every extra copy)")
     u.add_argument("--cli", action="append", choices=CLIS, dest="clis",
-                   help="only rebuild this Claude/agy container with the newest CLI (repeatable)")
+                   help="only rebuild this Claude/agy container, from scratch with the newest CLI (repeatable); a normal update reuses Docker's cache for it")
     u.add_argument("--no-build", action="store_true", help="use the images already on this computer (built or pulled by hand)")
     src = u.add_mutually_exclusive_group()
     src.add_argument("--from-release", dest="source", action="store_const", const="release",
@@ -280,8 +286,9 @@ def main(argv: list[str] | None = None, out: Callable[[str], None] = print) -> i
                      help="build the images here from these source files (the default otherwise)")
     u.add_argument("--timeout", type=float, default=180, help="seconds the restarted copy has to pass the health check (default 180)")
     u.add_argument("--env-file", type=Path, default=Path(".env"))
-    rb = sub.add_parser("rollback", help="go back to the images (and, if the database changed, the data) from before the last update")
+    rb = sub.add_parser("rollback", help="go back to the images (and, if the database changed, the data) from before the last update, or an earlier one with --to")
     rb.add_argument("name", nargs="?", help="which extra copy (default: the main one)")
+    rb.add_argument("--to", metavar="POINT", help="an earlier rollback point instead of the newest (its id, as `assistant backups` shows it)")
     rb.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     rb.add_argument("--keep-data", action="store_true", help="keep the current data even if the database changed (at your own risk)")
     rb.add_argument("--timeout", type=float, default=180, help="seconds it has to pass the health check (default 180)")
@@ -290,7 +297,7 @@ def main(argv: list[str] | None = None, out: Callable[[str], None] = print) -> i
     bk.add_argument("name", nargs="?", help="which extra copy (default: the main one)")
     bk.add_argument("--env-file", type=Path, default=Path(".env"))
     inst = sub.add_parser("instance", help="more copies of the assistant on this computer, each with its own data, keys and phones")
-    isub = inst.add_subparsers(dest="icmd", required=True, metavar="{create,start,stop,delete,token,list,update,routes}")
+    isub = inst.add_subparsers(dest="icmd", required=True, metavar="{create,start,stop,delete,token,list,update,routes,site-only}")
     c = isub.add_parser("create", help="make a new copy (own port, token, data and API keys) and start it")
     c.add_argument("name")
     c.add_argument("--no-browser", action="store_true", help="skip the browser container (it is the heavy part of a copy)")
@@ -309,7 +316,18 @@ def main(argv: list[str] | None = None, out: Callable[[str], None] = print) -> i
     old.add_argument("name", nargs="?")
     old.add_argument("--delete-data", action="store_true", help=argparse.SUPPRESS)
     old.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
+    so = isub.add_parser("site-only", help="on: the copy only serves kelo.chat and the operator's services (no assistant); off: back to a whole copy")
+    so.add_argument("name")
+    so.add_argument("state", choices=["on", "off"])
     isub.add_parser("list", help="every copy, its address and whether it runs")
+    op = sub.add_parser("operator", help="link the main copy to a site copy (kelo.chat) that holds the operator's lists and sends them on")
+    osub = op.add_subparsers(dest="ocmd", required=True, metavar="{link,unlink,status}")
+    ol = osub.add_parser("link", help="make the link key (never shown): the site copy keeps its hash, this server keeps the key")
+    ol.add_argument("name", help="the site copy (its settings name the address)")
+    ol.add_argument("--url", help="the site's https address (default: the copy's ASSISTANT_PUBLIC_URL)")
+    ou = osub.add_parser("unlink", help="remove the link from both sides (the lists are then the local ones again)")
+    ou.add_argument("name", help="the site copy")
+    osub.add_parser("status", help="ask the site copy whether this server's link key is accepted (the key is not shown)")
     con = sub.add_parser("connect", help="open a copy to your phone from anywhere (Kelo address, Tailscale, or your own domain)")
     csub = con.add_subparsers(dest="mode", required=True)
     for mode, text in (("kelo", "easiest: a <name>.kelo.chat address, offered for now (through Cloudflare)"),
@@ -400,13 +418,14 @@ def main(argv: list[str] | None = None, out: Callable[[str], None] = print) -> i
     us.add_argument("--no-start", action="store_true", help="save the settings only")
     us.add_argument("--pull-release", action="store_true",
                     help="first install: pull and check the newest signed release images instead of building them here")
+    us.add_argument("--release-version", metavar="X.Y.Z", help="with --pull-release: the release to pull instead of the newest")
     us.add_argument("--env-file", type=Path, default=Path(".env"))
     for verb, text in (("status", "what it runs, the newest release, and the last update"), ("off", "stop and remove the updater container")):
         uv = usub.add_parser(verb, help=text)
         uv.add_argument("--env-file", type=Path, default=Path(".env"))
     pub = sub.add_parser("publish-app", help="operator's server only: offer an app build for download at <address>/download/<platform>")
-    pub.add_argument("platform", choices=("android", "windows", "windows-msi", "mac"),
-                     help="android (.apk), windows (.exe, or .msi), mac (.dmg)")
+    pub.add_argument("platform", choices=("android", "windows", "windows-msi", "windows-server-msi", "mac", "mac-server-bundle"),
+                     help="android (.apk), windows (.exe, or .msi), windows-msi (the desktop app's .msi), windows-server-msi (the Kelo server's .msi, not on the download page), mac (.dmg), mac-server-bundle (the Kelo server's .zip for Mac, not on the download page)")
     pub.add_argument("file", help="the build to publish")
     pub.add_argument("--version", help="the version shown on the site, optionally with the build number: 0.9.0+402500 (default: from "
                      "the APK, or from the file name)")
@@ -414,7 +433,7 @@ def main(argv: list[str] | None = None, out: Callable[[str], None] = print) -> i
     pub.add_argument("--sign-key", metavar="PATH", help="the signing key (default ~/.kelo-release/signing.key; make it with `assistant release-key new`)")
     pub.add_argument("--unsigned", action="store_true", help="publish without a signature (apps that check signatures will not offer the build)")
     sgn = sub.add_parser("sign-app", help="operator's server only: sign the build that is already published for a platform")
-    sgn.add_argument("platform", choices=("android", "windows", "windows-msi", "mac"))
+    sgn.add_argument("platform", choices=("android", "windows", "windows-msi", "windows-server-msi", "mac", "mac-server-bundle"))
     sgn.add_argument("--commit", metavar="HEX", help="the full hash of the public source commit the build was made from")
     sgn.add_argument("--sign-key", metavar="PATH", help="the signing key (default ~/.kelo-release/signing.key)")
     rk = sub.add_parser("release-key", help="the key that signs app releases")
@@ -431,7 +450,15 @@ def main(argv: list[str] | None = None, out: Callable[[str], None] = print) -> i
     rec.add_argument("build", help="the platform's own build number (Android versionCode, iOS CFBundleVersion, desktop major*100000000+minor*100000+patch)")
     rec.add_argument("channel", help="download (kelo.chat/download), play (Google Play), appstore (App Store) or msstore (Microsoft Store)")
     rec.add_argument("--date", help="the day it went live, YYYY-MM-DD (default: today)")
+    rec.add_argument("--min-server", help="the oldest server release this app works with (its compiled-in min_server); apps are only offered "
+                                          "to servers at or above it")
     rec.add_argument("--file", help="the record to change (default: releases/apps.json of this checkout)")
+    rec.add_argument("--no-publish", action="store_true", help="record only; a store channel's signed row is then published later with "
+                                                               "`assistant publish-store`")
+    rec.add_argument("--sign-key", metavar="PATH", help="the signing key of the store row (default ~/.kelo-release/signing.key)")
+    pubst = sub.add_parser("publish-store", help="operator's server only: publish the newest store release of each app (releases/apps.json) "
+                                                 "signed, in /download/latest.json (also run by release-record)")
+    pubst.add_argument("--sign-key", metavar="PATH", help="the signing key (default ~/.kelo-release/signing.key)")
     ver = sub.add_parser("version", help="this Kelo's release version and build (version.json)")
     ver.add_argument("--json", action="store_true", help="print it as JSON")
     ntc = sub.add_parser("notice", help="operator's server only: manage the operator notices feed (notices.json)")
@@ -486,6 +513,9 @@ def main(argv: list[str] | None = None, out: Callable[[str], None] = print) -> i
     if args.cmd == "publish-server":
         from .downloads import run_publish_server
         return run_publish_server(args)
+    if args.cmd == "publish-store":
+        from .downloads import run_publish_store
+        return run_publish_store(args)
     if args.cmd == "notice":
         from .notices import run_notice
         return run_notice(args, out=out)
@@ -495,21 +525,31 @@ def main(argv: list[str] | None = None, out: Callable[[str], None] = print) -> i
     if args.cmd in ("update", "rollback", "backups") or (args.cmd == "instance" and args.icmd == "update"):
         from .updates import run_command as run_update
         return run_update(args)
-    if args.cmd in ("instance", "connect", "phone", "e2e", "keyguard", "limits", "enable", "disable", "status"):
+    if args.cmd in ("instance", "connect", "phone", "e2e", "keyguard", "limits", "enable", "disable", "status", "operator"):
         from .manage import run_command
         return run_command(args, ui=_create_ui(args))
 
     interactive = not args.yes and sys.stdin.isatty()
     if args.cmd == "setup":
+        if args.release_version:
+            import os
+
+            from .updater_setup import VERSION_ENV
+            os.environ[VERSION_ENV] = args.release_version.strip()    # read by updater_setup.pull_release
+        args.env_file = args.env_file or Path(".env")
         if args.browser == "chrome" and not args.yes:
             print(CHROME_NOTICE)
             if input("Use Google Chrome anyway? [y/N]: ").strip().lower() not in ("y", "yes"):
                 print("Staying with Chromium.")
                 args.browser = "chromium"
+        if args.web_port and not args.web:
+            p.error("--web-port needs --web")
+        if not 0 <= args.web_port <= 65535:
+            p.error("--web-port must be 0 to 65535")
         if args.web:
             from .setup_web import run_web
             return run_web(args.env_file, start=not args.no_start, browser=args.browser, clis=args.clis, profile=args.profile,
-                           release=args.from_release, open_browser=not args.no_open, page_file=args.page_file)
+                           release=args.from_release, open_browser=not args.no_open, page_file=args.page_file, port=args.web_port)
         if interactive and not args.plain:
             from . import wizard
             return wizard.run(args.env_file, start=not args.no_start, browser=args.browser, clis=args.clis, profile=args.profile,

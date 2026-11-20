@@ -10,7 +10,7 @@ Safety:
   ordering, booking, subscribing, sending or posting, deleting or cancelling, signing up or changing account settings, sending a
   form with personal details, typing personal details or a message. The element is read from the page just before the step to
   judge this (commits.py); the owner can still have every click and typing step ask (ASSISTANT_APPROVE_BROWSER_ACTIONS=1).
-- After the user allowed a purchase (confirm_purchase), the few committing steps that finish it on that same site are covered by
+- After the user allowed a purchase (checkout_review), the few committing steps that finish it on that same site are covered by
   that approval for a short while (`PURCHASE_WINDOW_SECONDS`, `PURCHASE_WINDOW_ACTIONS`).
 
 Card fields: `fill_card` types a wallet card (number, expiry, CVC, holder, postal code) straight from the server into the checkout form of
@@ -33,36 +33,45 @@ import asyncio
 import base64
 import io
 import ipaddress
+import math
 import json
 import logging
-import random
 import re
 import socket
 import time
-import weakref
 from contextvars import ContextVar
 from dataclasses import dataclass
 from collections.abc import Awaitable, Callable
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 from ..agent import Tool, emit_ui, handover
+from ..browser_devices import accept_language
+from ..browser_identity import identity_for as _chrome_override
+from .child_targets import FRAME_TYPE, ChildTargets
 from ..agent.loop import ToolStopped, ToolTimeout
 from ..agent.fence import data
+from ..data_trail import USES_PARAM
 from ..i18n import N_, t
 from ..signin_state import CLEAN_READINGS, still_signing_in
 from .challenge import (CHECK_TRIES, PROBE_JS, Challenge, blocked, blocked_again_note, blocked_note, check_boxes, detect, handover_note,
-                        note_for, try_note)
+                        note_for, signed_out_note, try_note)
 from . import humanize as human
-from .commits import (TARGET_JS, asks_to_keep_signed_in, cancel_words, continue_only, judge_click, judge_type, keep_signed_in, label_of,
-                      money_page, pressable)
+from .checkout import REFUSAL, guarded
+from .holds import HANDS_WAIT_SECONDS
+from .commits import TARGET_JS, click_route, judge_type, kind_of_verdict, label_of, pressable
 from .downloads import DownloadArea
 from .pacing import SitePacer
 from .sites import registrable, same_site
-from .verification import SIGN_IN_SECONDS, Verification, options_note, verification_note, verification_step, waiting_note
-from .page_notes import (OVERLAY_JS, OVERLAY_ROUNDS, click_js, closed_note, masked_note, masked_values, not_found_note, open_note,
-                         overlays, signature)
+from .work_browser import DOWN_NOTE, SEED_FAILED_NOTE, WorkBrowser, WorkBrowserDown, WorkTab, COOKIE_KEYS, collect_changes, seed_tab, work_tab, seed_signed_out_note
+from .task_window import TaskWindow
+from .verification import SIGN_IN_SECONDS, Verification, options_note, unconfirmed, verification_note, verification_step, waiting_note
+from .page_notes import (LAYER_CHOICES_JS, LAYERS_JS, OVERLAY_JS, OVERLAY_ROUNDS, closed_note, masked_note, masked_values, not_found_note,
+                         open_note, overlays, signature)
+from .browser_locale import tab_locale
+from .page_paths import NO_ELEMENT, PATH_OF_JS, with_path
 from .page_tree import controls_only, for_reading, frame_hosts, frame_of, interactive_refs, ref_boxes, ref_name, ref_of, ref_selector, ref_words
+from .page_dialogs import DIALOG_ONLY_NOTE, TabDialogs, answer_for, dialog_note, live_view
 
 log = logging.getLogger("assistant.browser")
 
@@ -95,7 +104,7 @@ CANCEL_WINDOW_ACTIONS = 4         # a free cancel of a wrong charge (purchase_re
 CARD_MIN_INTERVAL = 2.0           # seconds between two browser cards of one tab
 CARD_MAX_BYTES = 120_000          # the JPEG in a browser card is never bigger than this (else the card goes without a picture)
 CARD_MAX_WIDTH = 720              # pixels; screenshots are scaled down to this width
-CONTROL_WAIT_SECONDS = 300.0      # an agent step waits this long for the user to hand a tab back, then reports that it could not act
+CONTROL_WAIT_SECONDS = HANDS_WAIT_SECONDS   # an agent step waits this long for the user to hand a tab back, then reports that it could not act (tools/holds.py)
 UPLOAD_MAX_BYTES = 50 * 1024**2   # files set into one file input, all together (what the driver can carry into the page)
 PDF_MAX_BYTES = 50 * 1024**2      # a page printed to PDF
 SITE_STATE_SECONDS = 12 * 3600.0  # a saved site sign-in state (cookies + storage) is kept this long, in memory only
@@ -106,21 +115,33 @@ CHECK_SHOT_BYTES = 400_000
 SETTLE_MS = 6_000                 # after the HTML arrived, how long a page may take to finish loading (pages drawn by scripts) before it is read
 OVERLAY_CLICK_MS = 3_000          # how long the click on a covering window's own close button may take
 OVERLAY_PAUSE = 0.4               # seconds a closed window gets to go away before the page is looked at again
-# The phone view (BrowserSession.set_view): a current Android phone's screen in CSS px, its pixel ratio, mobile and touch
-VIEWS = ("desktop", "mobile")
-PHONE = {"width": 412, "height": 915, "deviceScaleFactor": 2.625, "mobile": True, "screenWidth": 412, "screenHeight": 915}
-SITE_VIEWS_KEPT = 300             # sites whose working view is remembered (memory only)
-VIEW_NOTE = "[Now showing this tab in the {view} view (same sign-ins and cookies); the page was loaded again in it.]"
-VIEW_SAME_NOTE = "[This tab already shows the {view} view; the page was loaded again.]"
-VIEW_REMEMBERED_NOTE = "[Opened in the {view} view: it is the one that worked on this site before.]"
-# A window the page opened (window.open, a target=_blank link) becomes the tab's page: the agent goes on in it, with the tab's view.
+# browser_open on a tab that already shows that address: nothing is loaded again (the model opened coupang 4 times in 6 minutes and then
+# told the owner the page was closed); it gets the page as it is.
+SAME_PAGE_NOTE = "This tab is open and already shows {url} ({title}). It was not loaded again; this is the page as it is now."
+# A window the page opened (window.open, a target=_blank link) becomes the tab's page: the agent goes on in it.
 POPUP_WAIT_SECONDS = 0.4          # after a click: how long a new window may take to show up before the click is taken as staying put
-POPUP_NOTE = "[The click opened a new window ({url}); you are in it now (same sign-ins, same view). When it closes you are back on the page that opened it.]"
-POPUP_BACK_NOTE = "[The window you were in closed; you are back on the page that opened it.]"
+POPUP_NOTE = "[The click opened a new window ({url}); you are in it now (same sign-ins). When it closes you are back on the page that opened it.]"
+TIMEOUT_NOTE = ("[The owner's control of this tab timed out (their screen went away), so it came back to you; they may not have finished "
+                "what they were doing.]")
+TAB_CLOSED_NOTE = "[The tab you were in closed; you are now in tab {id}: {title}. browser_tabs lists this task's tabs.]"
+# a browser that restarted (or crashed) under a job: its tab is a new blank page; the first acting step waits until the page is read (job_cuts.py)
+BROWSER_LOST_NOTE = ("[The browser restarted and this tab's page was lost; this is a new blank tab. Your last page was {url}. Sign-ins are "
+                     "kept. Open that site's home page (browser_open) and get back to the page through the site's own links, then read it "
+                     "before you act; a form you were filling may be empty again.]")
+LOST_ACT_NOTE = ("[Not done: the browser restarted and this tab is a new blank page. Open the site's home page again (browser_open), get back "
+                 "to the page you need through the site's own links, and read it before you click or type.]")
 NO_CHANGE_NOTE = ("[The click went through, but nothing changed: same address, same page content and form values, no new window, no "
                   "pop-up. Do not click the same element again. Look at the page below for what holds it (a message, an unticked box, "
-                  "a choice still to make, a frame or window it belongs to), try another way (another element; the other desktop / phone view: load browser_view with find_tools), or tell "
+                  "a choice still to make, a frame or window it belongs to), try another way (another element), or tell "
                   "the user what you see.]")
+# A click that brought up a window on the same page (page_notes.LAYERS_JS): it may confirm what was done, or ask for a choice or another
+# step first. Our own lines: done_once.py reads their first words, never the page's.
+OPENED_NOTE = ("[The click opened a pop-up on this page. Read it: it may confirm what was done, or ask for a choice or another step first. "
+               "A step it asks for that your task forbids or does not mention is the user's choice: do not take it, and do not cancel it "
+               "to look for a way around; report needs_input naming that step and what it does.]")
+# A click inside the window an earlier click opened, that took none of the committing steps the window offered and closed it
+DECLINED_NOTE = ("[The click closed the pop-up without taking the step it offered; nothing was done through that pop-up. Read the page "
+                 "before your next step.]")
 # After a click or typing on the same page, only what changed is returned (the whole page again is mostly repeated words): the changed
 # lines with CHANGE_CONTEXT lines around them, and what left the page. A change bigger than CHANGE_MAX_SHARE of the page: all of it.
 CHANGE_CONTEXT = 2
@@ -136,8 +157,8 @@ FINGERPRINT_JS = """() => { const b = document.body; if (!b) return location.hre
   let s = location.href + '#' + t.length + ':' + h;
   for (const e of document.querySelectorAll('input,select,textarea')) s += '|' + (e.checked ? 1 : 0) + String(e.value || '').slice(0, 40);
   return s; }"""
-# the element's centre (scrolled into view) is under something that is not the element, a part of it or what holds it
-COVERED_JS = """(e) => { e.scrollIntoView({block: 'center', inline: 'center'}); const r = e.getBoundingClientRect();
+# the element's centre (the element is brought into view first, by a person's scroll: _bring_into_view) is under something that is not the element, a part of it or what holds it
+COVERED_JS = """(e) => { const r = e.getBoundingClientRect();
   if (r.width <= 0 || r.height <= 0) return false;
   const h = e.ownerDocument.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
   return !!h && h !== e && !e.contains(h) && !h.contains(e); }"""
@@ -145,11 +166,9 @@ FRAME_TEXT_JS = """() => document.body ? [innerWidth * innerHeight, document.bod
 
 
 # browser_look's labels: ONE host element with a closed shadow root over the whole viewport (never takes a click), a 2px outline and
-# the ref for each box. Removed right after the picture (LOOK_CLEAR_JS).
+# the ref for each box. Removed right after the picture (the handle it returns is removed; no attribute marks the page, addendum 9).
 LOOK_OVERLAY_JS = r"""(boxes) => {
-  document.querySelectorAll('[data-kelo-look]').forEach((e) => e.remove());
   const host = document.createElement('div');
-  host.setAttribute('data-kelo-look', '');
   host.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647;margin:0;padding:0;border:0;background:none';
   const root = host.attachShadow({mode: 'closed'});
   const colors = ['#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4', '#008080', '#9a6324', '#800000'];
@@ -165,28 +184,18 @@ LOOK_OVERLAY_JS = r"""(boxes) => {
     root.append(box, tag);
   });
   (document.body || document.documentElement).appendChild(host);
-  return boxes.length;
+  return host;
 }"""
-LOOK_CLEAR_JS = "() => document.querySelectorAll('[data-kelo-look]').forEach((e) => e.remove())"
 # where a frame's own viewport starts inside the frame that holds its iframe element (border and padding included)
 FRAME_ORIGIN_JS = """(e) => { const r = e.getBoundingClientRect(), s = getComputedStyle(e);
   return [r.left + e.clientLeft + (parseFloat(s.paddingLeft) || 0), r.top + e.clientTop + (parseFloat(s.paddingTop) || 0)]; }"""
 
 
-def mobile_identity(full_version: str) -> dict[str, Any]:
-    """Emulation.setUserAgentOverride parameters for Chrome of this version on an Android phone: the reduced User-Agent Chrome sends
-    there and its client hints (the same brands and versions as the desktop identity, platform Android, mobile, form factor Mobile)."""
-    from ..browser_identity import brand_lists
-    major = int(full_version.split(".")[0])
-    brands, full_list = brand_lists(full_version)
-    return {
-        "userAgent": f"Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Mobile Safari/537.36",
-        "userAgentMetadata": {
-            "brands": brands, "fullVersionList": full_list, "fullVersion": full_version,
-            "platform": "Android", "platformVersion": "", "architecture": "", "model": "", "mobile": True,
-            "bitness": "", "wow64": False, "formFactors": ["Mobile"],
-        },
-    }
+def _devtools_version(ip: str, port: int) -> str:
+    """The DevTools version document of the browser (its WebSocket address names 127.0.0.1 inside the container)."""
+    import urllib.request
+    with urllib.request.urlopen(f"http://{ip}:{port}/json/version", timeout=3) as r:
+        return r.read().decode()
 
 
 def _site_of(url: str) -> str:
@@ -199,11 +208,22 @@ TARGET_READ_MS = 1_500            # how long reading a click or typing target ma
 LISTENER_READ_MS = 1_200          # how long reading the target's click listeners (DevTools) may take before only its inline code is judged
 # listeners that run on a click (read to tell a click that only opens a window or a page from one that sends something)
 _CLICK_EVENTS = frozenset({"click", "mousedown", "mouseup", "pointerdown", "pointerup", "touchstart", "touchend", "auxclick"})
-
-# Words of a button that spends money or commits the user, read from a selector alone (the server keeps "allow on this site" rules away
-# from such clicks). Only a hint for when to insist on a card: never a permission. The finer judgement on the element is commits.py.
-_FINAL_WORDS = ("pay", "buy", "purchase", "checkout", "check out", "place order", "place-order", "order now", "confirm", "submit order",
-                "book now", "reserve", "subscribe", "donate", "결제", "구매", "주문", "예약", "신청", "확인", "충전", "송금", "이체", "후원")
+# the listeners of the element at a path (%s) of a click-like type (%s), as the source of each handler; run by DevTools (a Runtime.evaluate
+# with the command-line API, getEventListeners), so no page global is set
+_LISTENERS_JS = """(() => {
+  const hit = document.querySelectorAll(%s);
+  if (hit.length !== 1) return [];
+  const types = %s, out = [];
+  let all = {};
+  try { all = getEventListeners(hit[0]); } catch (e) { return []; }
+  for (const type of Object.keys(all)) {
+    if (!types.includes(type)) continue;
+    for (const l of (all[type] || []).slice(0, 20)) {
+      try { out.push(Function.prototype.toString.call(l.listener).slice(0, 4000)); } catch (e) {}
+    }
+  }
+  return out.slice(0, 20);
+})()"""
 
 # Which phone is asking. Set per request, so each device keeps its own tab and two phones never click in each other's page.
 browser_owner: ContextVar[str] = ContextVar("browser_owner", default="owner")
@@ -259,6 +279,23 @@ def site_tab_key(url: str) -> str:
     return SITE_TAB_PREFIX + (_site_of(url) or "site")
 
 
+def same_address(a: str, b: str) -> bool:
+    """Whether two addresses are the same page: same scheme, host (a leading "www." ignored), port, path (a trailing slash ignored) and
+    query; the #fragment is ignored. False for anything that is not http(s)."""
+    def parts(url: str) -> tuple[str, str, int | None, str, str] | None:
+        p = urlsplit((url or "").strip())
+        if p.scheme.lower() not in ("http", "https") or not p.hostname:
+            return None
+        try:
+            port = p.port
+        except ValueError:
+            return None
+        return (p.scheme.lower(), p.hostname.lower().removeprefix("www."), None if port in (None, 80, 443) else port,
+                p.path.rstrip("/") or "", p.query)
+    one, two = parts(a), parts(b)
+    return one is not None and one == two
+
+
 def _origin_of(url: str) -> str:
     p = urlsplit(url or "")
     return f"{p.scheme.lower()}://{(p.hostname or '').lower()}" + (f":{p.port}" if p.port and p.port not in (80, 443) else "")
@@ -281,26 +318,47 @@ class BrowserPolicyError(Exception):
     pass
 
 
+class NoSignInForm(BrowserPolicyError):
+    """fill_login found no sign-in field on the open page; browser_login then reaches the form by a click (card p-signin-gaps)."""
+
+
+class LoginOptions(BrowserPolicyError):
+    """The sign-in form has unticked boxes or switches and the agent has not chosen yet: nothing was typed (card p-signin-gaps)."""
+
+    def __init__(self, options: list[tuple[str, str]]):
+        super().__init__("the sign-in form has unticked options; nothing was typed")
+        self.options = options
+
+
 class BrowserControlled(Exception):
     """The user holds this tab (they took control on their phone); the agent may not act on it now."""
 
 
+# a chat reply's step on a tab the owner holds is told at once (the reply says so; the step goes on only after the owner hands the tab back)
+CHAT_CONTROL_WAIT_SECONDS = 5.0
+hold_patience: ContextVar[float | None] = ContextVar("hold_patience", default=None)   # set by turn_engine for a chat reply
+CONTROLLED_CHAT_NOTE = ("[Not done: the user has taken over this browser tab and not handed it back. Do not use browser tools until they do. "
+                        "In your reply, say you are waiting for them to hand the browser back and will carry on then (or ask what they did). "
+                        "Stop here.]")
 CONTROLLED_NOTE = ("[Not done: the user is controlling the browser right now (they took over this tab on their phone) and has not handed "
                    "it back for {minutes} minutes. Do not use browser tools until they do: tell the user you will carry on when they "
                    "hand the browser back (or ask what they did), and stop here.]")
 
 
-TOOK_OVER_NOTE = "[The user took over the browser; this step was stopped. Wait for them to hand it back.]"
+TOOK_OVER_NOTE = ("[The owner took over this tab, so this step was stopped before it finished. Your browser steps on this tab wait until "
+                  "the owner presses hand back; that can take long. Then read the page again before you act: they may have changed it.]")
+MOVED_NOTE = ("[Not done: the owner changed this tab by hand before handing it back. Read it again (browser_read or browser_look) and "
+              "decide the next step from what it shows now.]")
 STEP_TIMEOUT_NOTE = ("[The browser step did not finish in {seconds} s: the page at {host} did not answer (a navigation that never "
                      "completed, or a page that stopped responding). I stopped it and left the page as it is. If this step pressed a button "
                      "that pays, orders, books or sends, it may have gone through: never press it again; browser_read and check the "
-                     "account's orders first. Otherwise try browser_read, then the other view, or tell the user the site does not respond.]")
+                     "account's orders first. Otherwise try browser_read, or tell the user the site does not respond.]")
 PACE_NOTE = ("[Not submitted: this site blocks quick repeated searches and the last one on {host} was only seconds ago. Wait about "
              "{seconds} s (use the time for something else), then submit again.]")
 PACE_MARGIN_SECONDS = 10.0        # a paced wait must leave this much of the step's time to do the step itself
 STILL_LOADING_NOTE = "[The page is still loading after {seconds} s; stopped. What is shown is the page as it is now.]"
 COVERED_NOTE = ("[The element is covered by {layer}; I could not close it. Ask the user to close it with \"take over the browser\", "
-                "or try the other view.]")
+                "or try another element.]")
 
 
 async def cdp_send(cdp: Any, method: str, params: dict[str, Any] | None = None, timeout: float | None = None) -> Any:
@@ -350,67 +408,78 @@ class SignIn:
     step: str = ""    # code_needed: the verification step the page asks for, "approve" | "code" (verification.py)
 
 
-_FAILED = ("incorrect", "invalid", "wrong password", "wrong username", "not recognized", "not recognised", "doesn't match", "does not match",
-           "do not match", "didn't match", "try again", "unable to log in", "unable to sign in", "bad credentials", "authentication failed",
-           "login failed", "log in failed", "sign in failed", "sign-in failed", "no account", "access denied", "is not correct", "isn't correct",
-           "잘못", "일치하지", "올바르지", "로그인 실패", "다시 시도", "맞지 않", "틀렸", "존재하지 않", "확인해 주세요", "확인해주세요")
-_CODE = ("verification code", "verify it's you", "verify your identity", "two-factor", "two factor", "2-step", "two-step", "2fa", "one-time code",
-         "one-time password", "authenticator app", "security code", "enter the code", "sent a code", "sent you a code",
-         "인증 코드", "인증코드", "인증번호", "인증 번호", "2단계", "보안 코드", "일회용")
-_SIGNED_IN = ("log out", "logout", "sign out", "signout", "log off", "로그아웃")
-
-
-def classify_sign_in(*, before_url: str, after_url: str, password_visible: bool, text: str, challenge: str = "") -> tuple[str, str]:
-    """Read a page after a sign-in was submitted. A reading, not a proof: when nothing is clear it says unknown, and what is stored is never
-    thrown away because of a reading (a 'failed' only stops the assistant from trying again until the user says so).
-    `challenge`: the name of a bot check found on the page by structure (challenge.detect), or ""; words on the page alone never count."""
-    t = (text or "").lower()
+def classify_sign_in(*, before_url: str, after_url: str, password_visible: bool, text: str = "", challenge: str = "", otp_boxes: int = 0,
+                     invalid_marked: bool = False) -> tuple[str, str]:
+    """Read a page after a sign-in was submitted, by structure only (docs/no-word-lists.md phase C): a bot check found by structure, a
+    one-time-code input (autocomplete=one-time-code), the sign-in form still shown and the page marking a field invalid or raising an
+    alert (aria-invalid, role=alert), the password field gone (the caller then checks the page is past every sign-in step). A reading, not a proof: when nothing is clear it says
+    unknown, and what is stored is never thrown away because of a reading (a 'failed' only stops the assistant from trying again until
+    the user says so). `text` is not read. A sign-in to approve on a phone has no input to see: verification.verification_step reads it
+    after this, and `signin_state` demands positive evidence before a hand-over counts as signed in."""
     if challenge:
         return "blocked", f"the site shows a human check ({challenge})"
-    if any(w in t for w in _CODE) and not password_visible:
+    if otp_boxes > 0 and not password_visible:
         return "code_needed", "the site accepted the password and asks for a verification code"
-    if password_visible and any(w in t for w in _FAILED):
-        return "failed", "the page still shows the sign-in form and says the user name or password is wrong"
-    if not password_visible and any(w in t for w in _SIGNED_IN):
-        return "success", "signed in"
-    if not password_visible and after_url.split("#")[0] != before_url.split("#")[0] and not any(w in t for w in _FAILED):
-        return "success", "the sign-in page was left"
+    if password_visible and invalid_marked:
+        return "failed", "the page still shows the sign-in form and marks a field as wrong"
+    if not password_visible:
+        return "success", ("the sign-in page was left" if after_url.split("#")[0] != before_url.split("#")[0]
+                           else "the password field is gone")   # the caller still demands positive evidence (signin_state.still_signing_in)
     return "unknown", "could not tell whether the site accepted the login"
 
 
 _PAGE_STATE = """() => {
   const shown = (e) => { const r = e.getBoundingClientRect(), c = getComputedStyle(e); return r.width > 0 && r.height > 0 && c.visibility !== 'hidden' && c.display !== 'none'; };
-  return { pw: [...document.querySelectorAll('input[type=password]')].some(shown), text: (document.body ? document.body.innerText : '').slice(0, 20000) };
+  return { pw: [...document.querySelectorAll('input[type=password]')].some(shown), text: (document.body ? document.body.innerText : '').slice(0, 20000),
+           otp: [...document.querySelectorAll('input[autocomplete~="one-time-code"]')].filter(shown).length,
+           invalid: [...document.querySelectorAll('[aria-invalid="true"], [role="alert"]')].some(shown) };
 }"""
 
 # Marks the visible username and password inputs of the page (nothing else is read), so they can be filled by the server.
-_TAG_LOGIN_FIELDS = """() => {
+_TAG_LOGIN_FIELDS = with_path("""() => {
   const shown = (e) => { const r = e.getBoundingClientRect(), c = getComputedStyle(e);
     return r.width > 0 && r.height > 0 && c.visibility !== 'hidden' && c.display !== 'none' && !e.disabled && !e.readOnly; };
   const kind = (e) => (e.getAttribute('type') || '').toLowerCase();
   const inputs = [...document.querySelectorAll('input')].filter(shown);
-  document.querySelectorAll('[data-vault-u],[data-vault-p]').forEach((e) => { e.removeAttribute('data-vault-u'); e.removeAttribute('data-vault-p'); });
   const textish = (e) => ['', 'text', 'email', 'tel', 'search'].includes(kind(e));
   const p = inputs.findIndex((e) => kind(e) === 'password');
   let u = -1;
   if (p >= 0) { for (let k = p - 1; k >= 0; k--) { if (textish(inputs[k])) { u = k; break; } } }
-  else { u = inputs.findIndex(textish); }
-  if (u >= 0) inputs[u].setAttribute('data-vault-u', '1');
-  if (p >= 0) inputs[p].setAttribute('data-vault-p', '1');
-  return { u: u >= 0, p: p >= 0 };
-}"""
+  else {
+    // no password field: only a field that says it takes the account name (a username-first sign-in step), never a search box or
+    // any other text field of the page (2026-11-19: a saved login's name was typed into a shop's search field and sent)
+    const ac = (e) => (e.getAttribute('autocomplete') || '').toLowerCase().split(/\\s+/);
+    const searchy = (e) => kind(e) === 'search' || e.getAttribute('role') === 'searchbox' || !!e.closest('[role=search], search');
+    u = inputs.findIndex((e) => textish(e) && !searchy(e) && (kind(e) === 'email' || ac(e).includes('username') || ac(e).includes('email')));
+  }
+  return { u: u >= 0, p: p >= 0, p_count: inputs.filter((e) => kind(e) === 'password').length,
+           u_path: u >= 0 ? keloPath(inputs[u]) : '', p_path: p >= 0 ? keloPath(inputs[p]) : '' };
+}""")
+# What the tagged password input is right now (the checks at the moment of typing): how many are tagged, whether it is an input of
+# type password that is still the type it had when it was tagged, whether it is rendered masked, and the LENGTH of its value (never the value).
+_LOGIN_STATE = with_path("""(path) => {
+  const els = [...document.querySelectorAll(path)];
+  const e = els[0];
+  if (!e) return { n: 0 };
+  const c = getComputedStyle(e);
+  const sec = c.webkitTextSecurity || c.textSecurity || '';
+  return { n: els.length, input: e.tagName === 'INPUT', type: (e.type || '').toLowerCase(),
+           masked: sec !== 'none', length: String(e.value || '').length };
+}""")
+
 # Marks the card fields of a checkout form in one frame (nothing is read from them but their kind, size and, for an expiry <select>, its
-# options). Recognised by autocomplete (cc-number, cc-exp, cc-exp-month, cc-exp-year, cc-csc, cc-name, postal-code), else by the words of
-# the field (name, id, placeholder, aria-label, its <label>). A card number split over several boxes is marked number-0, number-1, ...
-_TAG_CARD_FIELDS = r"""() => {
+# options). Recognised by their autocomplete tokens (cc-number, cc-exp, cc-exp-month, cc-exp-year, cc-csc, cc-name, postal-code; WHATWG) and, for
+# a field that says nothing, by `given`: {ref: kind} that the page judge (page_judge.py) named after reading the field's label (never a word
+# list here). `open` lists the fields left open: {ref, tag, type, inputmode, maxlength, placeholder, label, options}. A card number split over
+# several boxes is marked number-0, number-1, ...
+_TAG_CARD_FIELDS = with_path(r"""(given) => {
+  given = given || {};
   const shown = (e) => { const r = e.getBoundingClientRect(), c = getComputedStyle(e);
     return r.width > 0 && r.height > 0 && c.visibility !== 'hidden' && c.display !== 'none' && !e.disabled && !e.readOnly; };
-  document.querySelectorAll('[data-kelo-cc]').forEach((e) => e.removeAttribute('data-kelo-cc'));
   const skip = ['hidden', 'checkbox', 'radio', 'submit', 'button', 'image', 'file', 'reset', 'range', 'color', 'date', 'email', 'search', 'url'];
   const els = [...document.querySelectorAll('input, select')].filter((e) => shown(e) && !skip.includes((e.getAttribute('type') || '').toLowerCase()));
-  const words = (e) => {
-    const parts = [e.name, e.id, e.getAttribute('placeholder'), e.getAttribute('aria-label'), e.getAttribute('title'), e.getAttribute('data-testid'),
-                   e.getAttribute('data-elements-stable-field-name')];
+  const label = (e) => {
+    const parts = [e.getAttribute('placeholder'), e.getAttribute('aria-label'), e.getAttribute('title'), e.name, e.id];
     if (e.labels) for (const l of e.labels) parts.push(l.innerText);
     const by = e.getAttribute('aria-labelledby');
     if (by) by.split(/\s+/).forEach((id) => { const x = document.getElementById(id); if (x) parts.push(x.innerText); });
@@ -418,25 +487,26 @@ _TAG_CARD_FIELDS = r"""() => {
       const near = (e.parentElement.innerText || '').trim();   // a caption written next to the box, without a <label>
       if (near.length <= 40) parts.push(near);
     }
-    return parts.filter(Boolean).join(' ').toLowerCase();
+    return parts.filter(Boolean).join(' ').slice(0, 80);
   };
   const ac = (e) => (e.getAttribute('autocomplete') || '').toLowerCase();
-  const kindOf = (e) => {
-    const a = ac(e), w = words(e);
-    if (/cc-number/.test(a) || /card.?num|cardnum|cc.?num|credit.?card|card[\s_\-]*no(\d|\b)|\bpan\b|카드\s*번호/.test(w)) return 'number';
-    if (/cc-csc/.test(a) || /\bcvc|\bcvv|\bcsc\b|security.?code|card.?code|cvc2|보안\s*코드|cvc|cvv/.test(w)) return 'cvc';
-    if (/cc-exp-month/.test(a) || /exp\w*[\s_\-]*(month|mm)\b|\b(month|mm)[\s_\-]*exp|(유효|만료).*월/.test(w)) return 'exp_month';
-    if (/cc-exp-year/.test(a) || /exp\w*[\s_\-]*(year|yy)|\b(year|yy)[\s_\-]*exp|(유효|만료).*(년|연도)/.test(w)) return 'exp_year';
-    if (/cc-exp/.test(a) || /expir|exp.?date|\bexp\b|mm\s*\/\s*yy|유효\s*기간|만료/.test(w)) return 'exp';
-    if (/cc-name/.test(a) || /name.?on.?card|card.?holder|holder.?name|cardholder|카드\s*소유자|명의/.test(w)) return 'name';
-    if (/postal-code/.test(a) || /postal|\bzip|post.?code|우편\s*번호/.test(w)) return 'postal';
-    return '';
+  const kindOf = (e, i) => {
+    const a = ac(e);
+    if (/cc-number/.test(a)) return 'number';
+    if (/cc-csc/.test(a)) return 'cvc';
+    if (/cc-exp-month/.test(a)) return 'exp_month';
+    if (/cc-exp-year/.test(a)) return 'exp_year';
+    if (/cc-exp/.test(a)) return 'exp';
+    if (/cc-name/.test(a)) return 'name';
+    if (/postal-code/.test(a)) return 'postal';
+    const g = String(given['f' + i] || '').replace(/-\d$/, '');
+    return ['number', 'cvc', 'exp', 'exp_month', 'exp_year', 'name', 'postal'].includes(g) ? g : '';
   };
-  const found = els.map((e) => [e, kindOf(e)]);
+  const found = els.map((e, i) => [e, kindOf(e, i)]);
   const card = found.some(([e, k]) => ['number', 'cvc', 'exp', 'exp_month', 'exp_year'].includes(k) && (k === 'number' || k === 'cvc' || /cc-/.test(ac(e))));
   const max = (e) => (e.maxLength && e.maxLength > 0 ? e.maxLength : 0);
   // a number split over boxes: several 'number' fields, or one short one followed by unlabeled short boxes
-  let numbers = found.filter(([, k]) => k === 'number').map(([e]) => e);
+  let numbers = found.filter(([e, k]) => k === 'number' && e.tagName !== 'SELECT').map(([e]) => e);
   if (numbers.length === 1 && max(numbers[0]) && max(numbers[0]) <= 6) {
     const at = els.indexOf(numbers[0]);
     for (let i = at + 1; i < els.length && numbers.length < 4; i++) {
@@ -445,93 +515,92 @@ _TAG_CARD_FIELDS = r"""() => {
     }
   }
   if (numbers.length > 1 && !numbers.every((e) => max(e) && max(e) <= 7)) numbers = numbers.slice(0, 1);   // two whole-number fields: use the first
-  const out = { any: false, card, number: [], exp: null, exp_month: null, exp_year: null, cvc: false, name: false, postal: false };
-  numbers.forEach((e, i) => { e.setAttribute('data-kelo-cc', 'number-' + i); out.number.push(max(e)); });
-  const first = (k) => { const hit = found.find(([e, kk]) => kk === k && !e.hasAttribute('data-kelo-cc')); return hit ? hit[0] : null; };
-  if (card) {   // unlabeled expiry boxes next to a card form: month / year by their own words
-    for (const [e, k] of found) {
-      if (k || e.hasAttribute('data-kelo-cc')) continue;
-      const w = words(e);
-      if (!first('exp_month') && /\bmm\b|month|월/.test(w)) { found[found.findIndex(([x]) => x === e)][1] = 'exp_month'; continue; }
-      if (!first('exp_year') && /\byy(yy)?\b|year|년/.test(w)) { found[found.findIndex(([x]) => x === e)][1] = 'exp_year'; }
-    }
-  }
+  if (numbers.length === 1 && max(numbers[0]) && max(numbers[0]) >= 8 && max(numbers[0]) < 13) numbers = [];   // no card number is this short
+  const out = { any: false, card, number: [], exp: null, exp_month: null, exp_year: null, cvc: false, name: false, postal: false, open: [], paths: {} };
+  const marked = new Set();
+  const mark = (e, tag) => { marked.add(e); out.paths[tag] = keloPath(e); };
+  numbers.forEach((e, i) => { mark(e, 'number-' + i); out.number.push(max(e)); });
+  const first = (k) => { const hit = found.find(([e, kk]) => kk === k && !marked.has(e)); return hit ? hit[0] : null; };
   const opts = (e) => (e.tagName === 'SELECT' ? [...e.options].map((o) => [o.value, (o.text || '').trim()]).slice(0, 60) : null);
   for (const k of ['exp', 'exp_month', 'exp_year']) {
     const e = first(k);
     if (!e) continue;
-    e.setAttribute('data-kelo-cc', k);
+    mark(e, k);
     out[k] = { max: max(e), placeholder: (e.getAttribute('placeholder') || '').toLowerCase(), options: opts(e) };
   }
   const cvc = first('cvc');
-  if (cvc) { cvc.setAttribute('data-kelo-cc', 'cvc'); out.cvc = true; }
-  const extra = (e) => e && !e.value && (card || /cc-|billing/.test(ac(e)) || /billing|card/.test(words(e)));
+  if (cvc && cvc.tagName !== 'SELECT') { mark(cvc, 'cvc'); out.cvc = true; }
+  const extra = (e) => e && !e.value && (card || /cc-|billing/.test(ac(e)));
   const name = first('name'), postal = first('postal');
-  if (extra(name)) { name.setAttribute('data-kelo-cc', 'name'); out.name = true; }
-  if (extra(postal)) { postal.setAttribute('data-kelo-cc', 'postal'); out.postal = true; }
+  if (extra(name)) { mark(name, 'name'); out.name = true; }
+  if (extra(postal)) { mark(postal, 'postal'); out.postal = true; }
   out.any = out.number.length > 0 || !!out.exp || !!out.exp_month || !!out.exp_year || out.cvc;
-  if (!out.any) { out.name = out.postal = false; document.querySelectorAll('[data-kelo-cc]').forEach((e) => e.removeAttribute('data-kelo-cc')); }
+  if (!out.any) { out.name = out.postal = false; out.paths = {}; marked.clear(); }
+  // the fields still open (no autocomplete token, not named by `given`): what the page judge reads, in a frame that has a field the
+  // shape of a card number or a code and no card fields recognised yet
+  if (els.length >= 3 && !(out.number.length && (out.exp || out.exp_month) && out.cvc)) {
+    els.forEach((e, i) => { if (!marked.has(e) && !found[i][1] && !/\S/.test(ac(e).replace(/off/, ''))) {
+      out.open.push({ ref: 'f' + i, tag: e.tagName.toLowerCase(), type: (e.getAttribute('type') || '').toLowerCase(), inputmode: e.getAttribute('inputmode') || '', maxlength: max(e),
+                      placeholder: (e.getAttribute('placeholder') || '').slice(0, 40), label: label(e),
+                      options: opts(e) ? opts(e).slice(0, 4).map((o) => o[1]).concat([String(opts(e).length) + ' options']) : [] });
+    } });
+    out.open = out.open.slice(0, 24);
+  }
   return out;
-}"""
-_UNTAG_CARD_FIELDS = "() => document.querySelectorAll('[data-kelo-cc]').forEach((e) => e.removeAttribute('data-kelo-cc'))"
+}""")
 
-# The shipping fields of a checkout (browser_fill_shipping): by their autocomplete tokens first, else by their words (label, name, id,
-# placeholder) in common languages. Billing-only, login, e-mail, card, coupon and search fields are never taken.
-_TAG_ADDRESS_FIELDS = r"""() => {
+# The shipping fields of a checkout (browser_fill_shipping): by their autocomplete tokens (WHATWG) and by their type (a telephone box), else by
+# `given`: {ref: kind} that the page judge (page_judge.py) named after reading the field's label, name and placeholder. No word list of any
+# language is read here. Billing-only, login, e-mail, card, coupon and search fields are never taken: the autocomplete tokens and input types
+# say so, and the judge names only the fields it is sure about. `open` lists the fields left open (ref, tag, type, inputmode, maxlength,
+# placeholder, label, options) for the judge.
+_TAG_ADDRESS_FIELDS = with_path(r"""(given) => {
+  given = given || {};
   const vis = (e) => { const r = e.getBoundingClientRect(); const st = getComputedStyle(e);
                        return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none'; };
-  const words = (e) => [e.labels && e.labels.length ? Array.from(e.labels).map((l) => l.innerText).join(' ') : '', e.getAttribute('aria-label'),
-                        e.getAttribute('placeholder'), e.getAttribute('name'), e.id, e.getAttribute('title')].filter(Boolean).join(' ');
+  const label = (e) => [e.labels && e.labels.length ? Array.from(e.labels).map((l) => l.innerText).join(' ') : '', e.getAttribute('aria-label'),
+                        e.getAttribute('placeholder'), e.getAttribute('name'), e.id, e.getAttribute('title')].filter(Boolean).join(' ').slice(0, 80);
   const AC = {'name': 'name', 'given-name': 'given', 'family-name': 'family', 'tel': 'tel', 'tel-national': 'tel', 'tel-local': 'tel',
               'tel-country-code': 'tel_country', 'postal-code': 'postal', 'address-line1': 'line1', 'address-line2': 'line2',
               'address-line3': 'line2', 'street-address': 'street', 'address-level1': 'level1', 'address-level2': 'level2',
               'address-level3': 'level3', 'country': 'country', 'country-name': 'country'};
-  const NOT = /coupon|promo|search|query|\bqty\b|quantity|수량|쿠폰|검색|password|e-?mail|이메일|메일|card|카드|cvc|cvv|user.?name|login|아이디|birth|생년/i;
-  const R = [
-    ['note', /memo|\bnote|request|instruction|배송\s*메모|요청\s*사항|요청사항|備考|配達.*(指定|メモ)|备注|lieferhinweis|hinweis/i],
-    ['tel_country', /country.?code|calling.?code|국가\s*번호|dial.?code/i],
-    ['tel', /phone|mobile|\btel|cell|휴대폰|핸드폰|전화|연락처|電話|携帯|电话|手机|telefon|téléphone|teléfono/i],
-    ['postal', /zip|postal|post.?code|우편|郵便|〒|邮编|郵遞|\bplz\b|code postal|código postal|\bcap\b/i],
-    ['line2', /address.?2|addr.?2|line.?2|상세|detail|\bapt|suite|\bunit\b|building|建物|地址.?2|zusatz|complément|complemento/i],
-    ['level1', /\bstate\b|province|region|prefecture|county|시\s*\/?\s*도|都道府県|bundesland|provincia|région/i],
-    ['level2', /\bcity\b|\btown\b|locality|시\s*\/?\s*군\s*\/?\s*구|市区町村|城市|\bort\b|\bstadt\b|\bville\b|ciudad|città|cidade|город/i],
-    ['country', /\bcountry\b|국가|^国$|país|\bpays\b|\bland\b/i],
-    ['family', /last.?name|family.?name|surname|nachname|nom de famille|(^|\s)(姓|セイ)(\s|$)/i],
-    ['given', /first.?name|given.?name|vorname|prénom|(^|\s)(名|メイ)(\s|$)/i],
-    ['name', /full.?name|\bname\b|recipient|receiver|받는\s*(분|사람)|수령인|수취인|성명|이름|氏名|お名前|姓名|收件人|收貨人|empfänger|destinatario/i],
-    ['line1', /address.?1|addr.?1|line.?1|street|address|주소|도로명|住所|番地|地址|straße|strasse|\brue\b|calle|indirizzo|endereço|адрес/i],
-  ];
+  const KINDS = ['name', 'given', 'family', 'tel', 'tel_country', 'postal', 'line1', 'line2', 'street', 'level1', 'level2', 'level3', 'country', 'note'];
+  const OTHER_AC = /(^|\s)(username|email|new-password|current-password|one-time-code|cc-[a-z-]+|bday[a-z-]*|organization[a-z-]*|url|photo|impp)(\s|$)/;
+  const open = [];
   const found = {};
+  const paths = {};
   let n = 0;
+  let i = -1;
   for (const e of document.querySelectorAll('input, select, textarea')) {
+    i++;
     const type = (e.getAttribute('type') || '').toLowerCase();
     if (['hidden', 'password', 'email', 'search', 'checkbox', 'radio', 'submit', 'button', 'image', 'file', 'reset'].includes(type)) continue;
     if (e.disabled || !vis(e)) continue;
-    const ac = (e.getAttribute('autocomplete') || '').toLowerCase().split(/\s+/).filter((x) => x && !x.startsWith('section-'));
-    if (ac.includes('billing') || ac.some((x) => x.startsWith('cc-'))) continue;
-    let kind = AC[ac.filter((x) => x !== 'shipping').pop() || ''];
-    const w = words(e);
+    const acs = (e.getAttribute('autocomplete') || '').toLowerCase().split(/\s+/).filter((x) => x && !x.startsWith('section-'));
+    if (acs.includes('billing') || acs.some((x) => x.startsWith('cc-')) || OTHER_AC.test(acs.join(' '))) continue;
+    let kind = AC[acs.filter((x) => x !== 'shipping').pop() || ''];
+    if (!kind && type === 'tel') kind = 'tel';
     if (!kind) {
-      if (NOT.test(w)) continue;
-      const hit = R.find(([, re]) => re.test(w));
-      kind = hit ? hit[0] : '';
-      if (!kind && e.tagName === 'TEXTAREA' && /address|주소|住所|地址/i.test(w)) kind = 'street';
+      const g = String(given['f' + i] || '').replace(/-\d$/, '');
+      kind = KINDS.includes(g) ? g : '';
+      if (!kind && !String(given['f' + i] || '')) open.push({ ref: 'f' + i, tag: e.tagName.toLowerCase(), type, inputmode: e.getAttribute('inputmode') || '', maxlength: e.maxLength > 0 ? e.maxLength : 0,
+        placeholder: (e.getAttribute('placeholder') || '').slice(0, 40), label: label(e),
+        options: e.tagName === 'SELECT' ? Array.from(e.options).slice(0, 4).map((o) => (o.text || '').trim()).concat([String(e.options.length) + ' options']) : [] });
     }
     if (!kind) continue;
     const list = found[kind] = found[kind] || [];
     const tag = `${kind}-${list.length}`;
-    e.setAttribute('data-kelo-addr', tag);
-    list.push({tag, el: e.tagName.toLowerCase(), max: e.maxLength > 0 ? e.maxLength : 0, ph: e.getAttribute('placeholder') || '',
+    paths[tag] = keloPath(e);
+    list.push({tag, path: paths[tag], el: e.tagName.toLowerCase(), max: e.maxLength > 0 ? e.maxLength : 0, ph: e.getAttribute('placeholder') || '',
                ro: !!(e.readOnly), opts: e.tagName === 'SELECT' ? Array.from(e.options).map((o) => [o.value, (o.text || '').trim()]) : []});
     n++;
   }
-  return {n, found};
-}"""
-_SET_READONLY = r"""([tag, value]) => { const e = document.querySelector(`[data-kelo-addr="${tag}"]`); if (!e) return false;
+  return {n, found, open: open.slice(0, 30), paths};
+}""")
+_SET_READONLY = r"""([path, value]) => { const e = document.querySelector(path); if (!e) return false;
   const proto = e.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
   Object.getOwnPropertyDescriptor(proto, 'value').set.call(e, value);
   e.dispatchEvent(new Event('input', {bubbles: true})); e.dispatchEvent(new Event('change', {bubbles: true})); return true; }"""
-_UNTAG_ADDRESS_FIELDS = "() => document.querySelectorAll('[data-kelo-addr]').forEach((e) => e.removeAttribute('data-kelo-addr'))"
 
 
 def split_by(value: str, sizes: list[int]) -> list[str]:
@@ -568,62 +637,63 @@ def pick_select(options: list[list[str]], wants: list[str]) -> str | None:
     return None
 
 
-# Words of a page that asks the payer to prove it is them (the card's own app, 3-D Secure, ISP, a one-time code). Then the user must act
-# on their phone: the assistant says so and waits, instead of clicking around.
-_EXTRA_AUTH = ("3-d secure", "3d secure", "verified by visa", "visa secure", "securecode", "identity check", "safekey", "protectbuy",
-               "one-time password", "one time password", "authenticate this payment", "authenticate your payment", "approve the payment in",
-               "confirm in your bank", "bank app", "verify your card", "안심클릭", "앱카드", "카드사 앱", "카드사앱", "간편인증", "본인인증",
-               "공동인증", "인증서", "결제 비밀번호", "결제비밀번호", "인증번호", "ars 인증", "isp 인증", "isp결제", "페이북", "휴대폰 인증")
+# Whether a payment page asks the payer to prove it is them (the card's own app, 3-D Secure, a bank's code), by STRUCTURE (docs/no-word-lists.md,
+# hc-pagefields): a visible one-time-code input in the page or one of its frames, or the tab left the shop's site while a purchase was allowed
+# (the card network's or the bank's own page). No scheme name or word of a language is read. Then the user must act on their phone: the
+# assistant says so and waits (payment_step_wait reads the page with the page judge), instead of clicking around.
+_EXTRA_AUTH_JS = r"""() => [...document.querySelectorAll('input')].some((e) => {
+  const r = e.getBoundingClientRect(), c = getComputedStyle(e);
+  if (!(r.width > 0 && r.height > 0 && c.visibility !== 'hidden' && c.display !== 'none') || e.disabled) return false;
+  const ac = (e.getAttribute('autocomplete') || '').toLowerCase();
+  if (ac.split(/\s+/).includes('one-time-code')) return true;
+  return ['', 'text', 'tel', 'number'].includes((e.getAttribute('type') || '').toLowerCase()) && /numeric|decimal/.test(e.getAttribute('inputmode') || '')
+    && e.maxLength >= 5 && e.maxLength <= 8 && !/(^|\s)(cc-[a-z-]+|tel[a-z-]*|postal-code)(\s|$)/.test(ac);
+})"""
 
 
-def extra_auth(text: str) -> str:
-    """The words that show the page asks for extra authentication of the payment, or ""."""
-    t = (text or "").lower()
-    hit = next((w for w in _EXTRA_AUTH if w in t), "")
-    if not hit and (m := re.search(r"\b(isp|otp|3ds)\b", t)):
-        hit = m.group(1).upper()
-    return hit
-
-
-EXTRA_AUTH_NOTE = ("[The page asks for extra authentication of the payment ({words}). If this payment was approved with confirm_purchase, "
+EXTRA_AUTH_NOTE = ("[The page asks for extra authentication of the payment ({words}). If this payment was approved with checkout_review, "
                    "call payment_step_wait now: it shows the user one card with the code, QR code and time left and WAITs for their answer. "
                    "Otherwise tell the user to complete it on their phone (the card company's app, bank app or code) and WAIT for them to "
                    "say it is done. Do not click, retry or fill anything meanwhile; afterwards read the page once with browser_read and report.]")
 
-_UNTAG_LOGIN_FIELDS = "() => document.querySelectorAll('[data-vault-u],[data-vault-p]').forEach((e) => { e.removeAttribute('data-vault-u'); e.removeAttribute('data-vault-p'); })"
 
 # Marks the box(es) of a one-time code on the page: one box (autocomplete=one-time-code, or a code / OTP / verification-number field), or a row of
 # one-character boxes (4-8 of them). `sel` (optional): a selector the agent named instead. Nothing is read from the boxes.
-_TAG_CODE_FIELDS = r"""(sel) => {
+_TAG_CODE_FIELDS = with_path(r"""(sel) => {
   const shown = (e) => { const r = e.getBoundingClientRect(), c = getComputedStyle(e);
     return r.width > 0 && r.height > 0 && c.visibility !== 'hidden' && c.display !== 'none' && !e.disabled && !e.readOnly; };
-  document.querySelectorAll('[data-kelo-otp]').forEach((e) => e.removeAttribute('data-kelo-otp'));
   const okType = (e) => ['', 'text', 'tel', 'number', 'password'].includes((e.getAttribute('type') || '').toLowerCase());
   const inputs = [...document.querySelectorAll('input')].filter((e) => shown(e) && okType(e));
   if (sel) {
     let picked = [];
     try { picked = [...document.querySelectorAll(sel)].filter((e) => e.tagName === 'INPUT' && shown(e)); } catch (err) { picked = []; }
-    picked.slice(0, 8).forEach((e, i) => e.setAttribute('data-kelo-otp', String(i)));
-    return { boxes: picked.length > 8 ? 8 : picked.length };
+    const got = picked.slice(0, 8);
+    return { boxes: got.length, paths: got.map((e) => keloPath(e)) };
   }
-  const words = (e) => [e.name, e.id, e.getAttribute('placeholder'), e.getAttribute('aria-label'), e.getAttribute('autocomplete')]
-    .concat(e.labels ? [...e.labels].map((l) => l.innerText) : []).filter(Boolean).join(' ').toLowerCase();
-  const one = inputs.find((e) => (e.getAttribute('autocomplete') || '').toLowerCase() === 'one-time-code')
-    || inputs.find((e) => (e.getAttribute('type') || '').toLowerCase() !== 'password' && /otp|one.?time|verif|2fa|mfa|totp|auth.?code|security.?code|\bcode\b|pin\b|token|인증|코드|확인\s*번호|보안\s*번호/.test(words(e)) && !/coupon|promo|zip|postal|우편|쿠폰|card|카드/.test(words(e)));
+  // a code box by STRUCTURE only: autocomplete one-time-code, else the one visible box shaped like a code (numeric input mode or a short
+  // maxlength of 4-8, no autocomplete token that names something else). Two or more such boxes that are not a one-character row: not guessed.
+  const named = /(^|\s)(username|email|tel[a-z-]*|cc-[a-z-]+|postal-code|street-address|address-[a-z0-9-]+|name|given-name|family-name|current-password|new-password|bday[a-z-]*|country[a-z-]*|organization[a-z-]*)(\s|$)/;
+  const shaped = inputs.filter((e) => (e.getAttribute('type') || '').toLowerCase() !== 'password' && !named.test((e.getAttribute('autocomplete') || '').toLowerCase())
+    && ((/numeric|decimal/.test(e.getAttribute('inputmode') || '') && e.maxLength !== 1) || (e.maxLength >= 4 && e.maxLength <= 8)));
+  const one = inputs.find((e) => (e.getAttribute('autocomplete') || '').toLowerCase() === 'one-time-code') || (shaped.length === 1 ? shaped[0] : null);
   const singles = inputs.filter((e) => e.maxLength === 1);
   if (singles.length >= 4 && singles.length <= 8 && (!one || one.maxLength === 1)) {
-    singles.forEach((e, i) => e.setAttribute('data-kelo-otp', String(i)));
-    return { boxes: singles.length };
+    return { boxes: singles.length, paths: singles.map((e) => keloPath(e)) };
   }
-  if (one) { one.setAttribute('data-kelo-otp', '0'); return { boxes: 1 }; }
-  return { boxes: 0 };
-}"""
-_UNTAG_CODE_FIELDS = "() => document.querySelectorAll('[data-kelo-otp]').forEach((e) => e.removeAttribute('data-kelo-otp'))"
+  if (one) return { boxes: 1, paths: [keloPath(one)] };
+  return { boxes: 0, paths: [] };
+}""")
 
 
 _CHECK_HEADERS = {"server", "cf-mitigated", "cf-ray", "x-amzn-waf-action", "x-datadome", "x-dd-b", "x-datadome-cid", "x-amz-cf-id", "x-cache"}
 BLOCK_LIMIT = 2                   # access-denied answers from one host in one task, then it is not tried again...
 BLOCK_SECONDS = 600.0             # ...for this long (a new message of the user starts a new task, and with it a clean slate)
+SIGN_IN_PASS_SECONDS = 15 * 60.0   # after a refusal of a browser not signed in to the site: a sign-in pass (brief B2)
+KEEP_CHOICE_SECONDS = 120.0        # browser_login's second call (the stay-signed-in choice) is part of the approved sign-in this long
+TOUCH_SECONDS = 10 * 60.0   # a site's sign-in row is marked used at most this often (brief B1)
+REFUSAL_PAUSE_SECONDS = 6 * 3600.0   # a site that refused the browser is not loaded again for this long (per registrable site, the whole server)
+REFUSAL_PAUSE_NOTE = ("[{site} refused Kelo's browser a short while ago. Kelo's browser will not load {site} again for about {minutes} minutes, "
+                      "and it does not retry on its own. Use another source only if the task allows it; otherwise say plainly that {site} refused Kelo's browser and that the user can take over the browser to sign in or get past it.]")
 OTP_NOTE = ("[The page asks for a one-time code. The user's mailbox is connected: find_login_code(site=...) looks for a code that site "
             "mailed. During a sign-in you started on that site it may type it by itself (the user's setting); otherwise it asks the user "
             "before typing it. If there is none, ask the user.]")
@@ -777,12 +847,6 @@ def _luhn(n: str) -> bool:
     return len(n) >= 12 and total % 10 == 0
 
 
-def looks_final(selector: str) -> bool:
-    """Whether a click target reads like the button that pays, orders, books or otherwise commits (a hint, never a permission)."""
-    t = re.sub(r"\s+", " ", (selector or "").lower())
-    return any(w in t for w in _FINAL_WORDS)
-
-
 def _country_names(cc: str) -> list[dict[str, str]]:
     from .. import address   # the country's English name, for a country list on the page
     return [c for c in address.countries() if c["code"] == (cc or "").upper()]
@@ -866,6 +930,7 @@ class BrowserSession:
         self._browser: Any = None
         self._pages: dict[str, Any] = {}       # device -> its tab
         self._used: dict[str, float] = {}      # device -> when it last used the tab (self.clock), or its last turn ended
+        self._refused_until: dict[str, float] = {}    # registrable site -> self.clock() time until which it is not loaded (a refusal)
         self.clock = clock
         self.remote_dns: Callable[[], bool] = lambda: False   # the VPN connector is on: names are resolved by the VPN, not here (vpn.py)
         self.vpn_note: Callable[[], Awaitable[str]] | None = None   # -> the text saying the VPN is down, or "" (server.py wires vpn.down_note)
@@ -874,48 +939,81 @@ class BrowserSession:
         self._cancel: dict[str, tuple[str, float, int, str]] = {}   # device -> (host, until, clicks left, order no) to cancel a wrong charge
         self.on_cancel_click: Callable[[str, str, str], None] | None = None   # (host, the click's words, order no): logged by the server
         self._last_card: dict[str, float] = {}                   # device -> when its last browser card went out
-        self._dialogs: dict[str, list[str]] = {}                 # device -> pop-up messages since the last page reading
+        self._dialogs: dict[str, TabDialogs] = {}                # tab -> its page's own pop-ups (page_dialogs.py)
         self._status: dict[str, tuple[str, float]] = {}          # device -> (last status line of its card, wall time)
         self._seen_at: dict[str, float] = {}                     # device -> wall time its tab was last used
         self._control: dict[str, str] = {}                       # tab -> the device that took control of it (absent = the agent's)
         self._handed_back: dict[str, asyncio.Event] = {}         # tab -> set whenever the agent may act on it
         self.control_listeners: list[Callable[[str, str | None], Any]] = []   # (tab, device or None) on every change
+        self.handback_listeners: list[Callable[[str, str, str, str], Any]] = []   # (tab, what the owner did, reason, "browser") on every hand-back
+        self.close_listeners: list[Callable[[str], Awaitable[Any]]] = []   # (tab) after close_tab closed it (the live view's X screen lets go)
         self.control_wait = CONTROL_WAIT_SECONDS
+        self.work: WorkBrowser | None = None                     # the work browser (work_browser.py), set by server.py when it is configured
+        self._work_gen: dict[str, int] = {}                      # work tab -> the WorkBrowser.generation its page was made in
+        self._seed_cdp: dict[str, Any] = {}                      # work tab -> its DevTools session that pauses document requests (A3)
+        self.signed_out_tab: Callable[[str], bool] = lambda key: False   # research jobs browse signed out (A6, set by server.py)
+        self.on_owner_sign_in: Callable[[str], Any] = lambda site: None   # a sign-in the owner typed by hand (store: B1, set by server.py)
+        self.on_site_used: Callable[[str], Any] = lambda site: None       # a site the browser went to (store: last used, B1)
+        self.on_site_forgotten: Callable[[str], Any] = lambda site: None  # the owner signed the browser out of a site (B1)
+        self._touched: dict[str, float] = {}
+        # named browser profiles (brief C2, set by server.py): the units are sealed in the store
+        self.profile_unit: Callable[[str, str], dict[str, Any]] = lambda profile, site: {"cookies": [], "storage": {}}
+        self.profile_save: Callable[[str, str, dict[str, Any]], Any] = lambda profile, site, unit: None
+        self.profile_check: Callable[[str], Any] = lambda profile: None      # raises VaultError when the keychain is locked or the id is unknown
+        self._listened: set[int] = set()                       # contexts that already have the owner-page listener (C1d)
+        self._profile_tabs: dict[str, WorkTab] = {}            # chat tab key -> the seed/write-back record of its own profile context (C2b)
+        self.signed_in_site: Callable[[str], bool] = lambda site: True   # a sign-in row exists for the site (server.py, B1)
+        self.login_for: Callable[[str], str] = lambda site: ""           # the name of a saved login for the site ("" = none) (server.py)
+        self._sign_in_pass: dict[str, float] = {}      # registrable site -> clock() time until which the site may load for a sign-in
+        self._sign_in_pass_used: set[str] = set()      # the sites that had their pass in this pause (one pass per pause)
+        self._pass_opened: set[str] = set()            # a pass opened by the refusal being answered now (snapshot reads it once)
+        self._work_dl: Any = None                                # the work browser's browser-wide DevTools session (downloads)
         # ---- S6: what the pages are, and what the browser is set up with (see the notes at each method)
         self._doc: dict[str, tuple[int, dict[str, str]]] = {}   # tab -> (status, headers) of its main document's last response
         self._notes: dict[str, list[str]] = {}                   # tab -> lines for its next page reading (e.g. what the user did by hand)
-        self._view_cdp: dict[str, Any] = {}                      # tab -> the DevTools session holding its phone view (absent = desktop)
         self._site_locks: dict[str, asyncio.Lock] = {}           # site tab -> one request at a time (site_fetch)
-        self._site_views: dict[str, str] = {}                    # site -> the view that last worked there ("desktop" | "mobile")
+        self._opened: dict[str, str] = {}   # tab -> the address last opened in it (kept apart from its target, see target_id)
         self._checks: dict[str, tuple[str, float]] = {}          # tab -> (bot check vendor, when it was announced)
         self.check_listeners: list[Callable[[str, Challenge, str], Any]] = []   # (tab, check, host) when a check is first seen
         self._private: dict[str, Any] = {}                       # tab -> its own private context (nothing kept after it closes)
         self._type_cdp: dict[str, tuple[Any, Any]] = {}          # tab -> (page, the DevTools session) that types Korean (_ime_sender)
         self._tab_cdp: dict[str, Any] = {}                       # tab -> the CDP session that keeps its time zone / locale override
         self._targets: dict[str, tuple[str, str]] = {}           # tab -> (target id = main frame id, browser context id)
+        self._children: ChildTargets | None = None              # the frames and workers of the tab's language (child_targets.py), one connection
+        self._work_children: ChildTargets | None = None         # the same for the work browser (its own connection, see work_connected)
+        self._child_locales: dict[str, str] = {}                # target id of a frame -> the locale of its tab ("" = the browser's)
+        self._tab_locales: dict[str, str] = {}                  # tab key -> the locale it was given (_prepare; "" = the browser's)
         self._site_states: dict[str, tuple[dict[str, Any], float]] = {}   # host -> (cookies + storage, saved at): memory only
         self._dl_cdp: Any = None                                 # the browser-wide CDP session that hears downloads
         self._dl_contexts: set[str] = set()                      # browser contexts whose downloads go to the download area
         self.downloads: DownloadArea | None = None               # set by the app when the download folder is shared with the server
         self.timezone: Callable[[], str] = lambda: ""            # the user's time zone (profile), applied to every tab
         self.locale = ""                                         # e.g. "ko-KR": the language the browser was started with
+        self.user_language: Callable[[], str] = lambda: ""         # the user's own app language code (ko, ja, en...); "" = not set
         self.prepare_pages = connect is None                     # set up time zone / downloads on new tabs (off for the plain test fakes)
         self.journal: Any = None                                 # takeover.TakeoverJournal: what the user does while holding a tab
         self.has_mailbox: Callable[[], bool] = lambda: False     # a mailbox is connected (a code prompt then points to find_login_code)
+        self._login_url: dict[str, str] = {}                     # tab -> the address the agent's last fill_login started from
+        self._login_at: dict[str, float] = {}                    # tab -> when fill_login last typed a saved login there (a sign-in the agent started)
         self.sign_ins: dict[str, dict[str, Any]] = {}            # tab -> the sign-in the agent started there: {"site", "at", "task"}
         self.auto_code: Callable[[str], Awaitable[str | None]] = _no_auto_code   # types a code from the site's own mail (browser_more)
         self._judged: dict[str, tuple[str, str, bool]] = {}      # device -> (selector, commit kind, password field) of its last judged step
         self._carried: dict[str, tuple[str, str, str, float]] = {}   # device -> a step judge_ahead judged for the next judge() of it
         self._judged_info: dict[str, dict[str, Any] | None] = {}  # device -> what was read of that step's element (commits.TARGET_JS)
+        self._judged_words: dict[str, tuple[str, str]] = {}  # device -> (selector, the words it was judged by) of its last judged step
+        self._verdict: dict[str, Any] = {}   # device -> the step judge's last verdict (its flags; use_cancel_action reads them)
         # device -> {(page, label): commit kind}: the first judgement of an element stays its judgement on that page (a retry with
         # another selector for the same button gets the same card words)
         self._kinds_seen: dict[str, dict[tuple[str, str], str]] = {}
         # device -> (page, label, monotonic deadline, tries left) of a step the user allowed whose click then failed: the same element
         # tried again with another selector does not ask again
         self._allowed_failed: dict[str, tuple[str, str, float, int]] = {}
+        self.page_judge: Any = None   # page_judge.PageJudge: what a page asks (a verification step, a payment approval) and which field is which when structure is silent (None = no model wired: the safer side)
+        self.step_judge: Any = None   # step_judge.StepJudge: what a submit control does when the page's structure cannot tell (None = no model wired)
         self.order_dialog: Callable[[str, str, str], bool] | None = None   # (tab, host, message): a pop-up an open order may accept
         self._wake: dict[str, asyncio.Event] = {}                # tab -> set when it is handed back (a waiting human check looks again)
-        self._options: dict[str, set[str]] = {}                  # tab -> option selectors marked on its page (data-kelo-opt)
+        self._options: dict[str, set[str]] = {}                  # tab -> option selectors (CSS paths) of its last reading
+        self._keep_choice: dict[str, float] = {}                 # login name -> when browser_login listed its form's options (S6)
         self._hand_end: dict[str, tuple[str, str, float]] = {}   # tab -> (site, step kind, when) of its last finished verification hand-over
         self._pending_hand: dict[str, tuple[Any, ...]] = {}      # tab -> a verification hand-over raised while the agent chooses options
         self._approving: dict[str, tuple[bool, float]] = {}      # site -> (an approve-step hand-over is open, when it opened / ended)
@@ -927,14 +1025,15 @@ class BrowserSession:
         self.check_tries = CHECK_TRIES                           # readings of one check the agent may try before it goes to the user
         self.check_poll = CHECK_POLL_SECONDS
         self._own_layers: dict[str, tuple[str, set[str]]] = {}   # tab -> (page address, windows the agent's own steps opened there)
-        # tab -> the pages under the one it shows now, each with its phone-view and tab DevTools sessions: a window a page opened
+        self._opened_layer: dict[str, tuple[str, str]] = {}      # tab -> (page address, label) of the window its last click opened (OPENED_NOTE)
+        # tab -> the pages under the one it shows now, each with its tab DevTools session: a window a page opened
         # (window.open, target=_blank) becomes the tab's page; when it closes, the tab goes back to the page that opened it
-        self._openers: dict[str, list[tuple[Any, Any, Any]]] = {}
-        self._first_phone = False                                # a new window's first request just went out as a phone
-        self._mobile_id: dict[str, dict[str, Any]] = {}          # tab -> the phone identity its view sends (for its new windows)
-        self._phone_ready: "weakref.WeakSet[Any]" = weakref.WeakSet()   # windows whose phone overrides are on
-        self._phone_asked: "weakref.WeakSet[Any]" = weakref.WeakSet()   # windows whose first requests went out as a phone
-        self._popup_setup: dict[str, asyncio.Future] = {}      # tab -> the setup of the window it just moved into (watch, view)
+        self._windows: dict[str, TaskWindow] = {}              # tab key -> its window: its own tabs, the active one is _pages[key] (brief C1)
+        self._tab_profile: dict[str, str] = {}                 # tab key -> the named profile its window is opened in (before the window exists)
+        self._profile_ctx: dict[str, Any] = {}                 # chat tab key -> its own context for a named profile (C2)
+        self._creating = 0                                     # pages Kelo is creating now: the context listener skips them (a count)
+        self.active_listeners: list[Callable[[str], Any]] = []  # told when a key's active tab changes (live view, VNC)
+        self._popup_setup: dict[str, asyncio.Future] = {}      # tab -> the setup of the window it just moved into (watch, language)
         self._unchanged: dict[str, bool] = {}                    # tab -> its last click changed nothing (NO_CHANGE_NOTE)
         self._last_text: dict[str, tuple[str, str]] = {}         # tab -> (page address, its text) of the last reading the agent got
         self._ref_words: dict[str, dict[str, str]] = {}          # tab -> {ref: 'role "name"'} of its last reading with refs (page_tree)
@@ -947,6 +1046,7 @@ class BrowserSession:
         self._blocked: dict[tuple[str, str], tuple[int, float]] = {}
         self._steps: dict[str, asyncio.Future] = {}              # tab -> the agent step running on it now (run_step)
         self._step_clock: dict[str, dict[str, float]] = {}       # tab -> {"spent", "limit"}: the running step's clock (run_step)
+        self.nav_block: Callable[[], str | None] | None = None   # set by the checkout tools: why this tab may not be reloaded or navigated now
         self.pacer = SitePacer(clock)                            # per-site gaps between submits and navigations (pacing.py)
         self.sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep   # waits of the pacer (tests: a fake clock's)
         self._typed: dict[str, bool] = {}                        # tab -> text was typed since its last submit or navigation
@@ -954,6 +1054,12 @@ class BrowserSession:
         self._paused: dict[str, int] = {}                        # tab -> hand-overs open now (the step clock stands still)
         self._rescues: dict[str, asyncio.Future] = {}            # tab -> the clean-up after the user took the tab over
         self._background: set[asyncio.Future] = set()            # clean-ups no step waits for (a route that does not come off)
+        self._owner_moved: set[str] = set()                      # tabs the owner changed by hand before handing them back (MOVED_NOTE)
+        self.book: Any = None                                    # tab_book.TabBook: the page of each tab key, kept across a server restart (server.py)
+        self._restart_tabs: dict[str, str] = {}                  # what adopt_after_restart found: key -> "kept" | "gone"
+        self._lost: dict[str, str] = {}                          # tab -> the last url of a page the browser lost (restart or crash)
+        self._lost_act: set[str] = set()                         # tabs whose next acting step waits until the page is read (LOST_ACT_NOTE)
+        self.on_lost: Callable[[str], Any] | None = None         # told of a tab the browser lost (workers: a job's card line)
 
     # ------------------------------------------------------------------ the user taking a tab over
     def controlled_by(self, key: str) -> str | None:
@@ -964,22 +1070,51 @@ class BrowserSession:
         """Every tab a device holds now: {tab: device}."""
         return dict(self._control)
 
-    def take_control(self, key: str, device: str) -> None:
+    def take_control(self, key: str, device: str) -> bool:
+        """The device takes the tab. True when a running agent step on it was stopped by this (see interrupt)."""
         if self._control.get(key) == device:
-            return
+            return False
         self._control[key] = device
         self._handed_back.setdefault(key, asyncio.Event()).clear()
-        self.interrupt(key)
+        cancelled = self.interrupt(key)
         if self.journal is not None and (page := self.raw_page(key)) is not None:
             try:
                 self.journal.start(key, page)      # what the user does by hand is written down for the agent (takeover.py)
             except Exception:  # noqa: BLE001 - the journal never stops the user from taking over
                 pass
         self._tell(key, device)
+        return cancelled
 
-    async def release_control(self, key: str) -> bool:
+    def move_control(self, key: str, device: str) -> None:
+        """The tab moves from one of the owner's devices to another (the first one has no live connection): the hold goes on, no step is
+        stopped and nothing is handed back."""
+        if self._control.get(key) is None or self._control.get(key) == device:
+            return
+        self._control[key] = device
+        self._tell(key, device)
+
+    def restore_control(self, key: str, device: str) -> None:
+        """A button hold saved before a restart: the tab is the owner's again (no step, no journal, not handed back)."""
+        self._control[key] = device
+        self._handed_back.setdefault(key, asyncio.Event()).clear()
+        self._tell(key, device)
+
+    def tab_cdp(self, key: str) -> Any:
+        """The DevTools session the tab was prepared with (None when it has none)."""
+        return self._tab_cdp.get(key)
+
+    def _note_opened(self, key: str, url: str) -> None:
+        """The address a tab was last opened at (kept apart from its DevTools target, see _targets)."""
+        self._opened[key] = url
+
+    def target_id(self, key: str) -> str:
+        """The DevTools target id of the tab's page ("" when it was not read)."""
+        return self._targets.get(key, ("", ""))[0]
+
+    async def release_control(self, key: str, reason: str = "owner", *, moved: bool = False) -> bool:
         """Hand the tab back to the agent. The purchase window of that tab is closed (the user's own clicks never count towards it),
-        and a page the agent would not be allowed to open is left for about:blank. False when nobody held it."""
+        and a page the agent would not be allowed to open is left for about:blank. `reason` "timeout": the owner's connection went away
+        and the tab came back on its own, which the agent is told (they may not have finished). False when nobody held it."""
         if self._control.pop(key, None) is None:
             return False
         self._purchase.pop(key, None)
@@ -993,14 +1128,24 @@ class BrowserSession:
                     await page.goto("about:blank")
         except Exception:  # noqa: BLE001 - a tab that went away meanwhile
             pass
+        summary = ""
         if self.journal is not None:
             try:
                 summary = self.journal.stop(key)
             except Exception:  # noqa: BLE001
                 summary = ""
-            if summary:
-                self.note(key, summary)            # the agent reads it with its next look at the page
+        if reason == "timeout":
+            summary = (TIMEOUT_NOTE + "\n" + summary) if summary else TIMEOUT_NOTE
+        if summary or moved:
+            self._owner_moved.add(key)         # the agent's next acting step on this tab reads the page first (hold_to_act)
+        if summary:
+            self.note(key, summary)            # the agent reads it with its next look at the page
         self._tell(key, None)   # first, so whoever listens hears it before a waiting agent step moves on
+        for fn in list(self.handback_listeners):   # the paused jobs of the tab go on; a chat turn that ended hears of it (workers.handed_back)
+            try:
+                fn(key, summary, reason, "browser")
+            except Exception:  # noqa: BLE001 - a listener never breaks handing back
+                pass
         self._handed_back.setdefault(key, asyncio.Event()).set()
         self._wake.setdefault(key, asyncio.Event()).set()   # a human check waiting on this tab looks again right away
         return True
@@ -1064,7 +1209,7 @@ class BrowserSession:
     def with_deadline(self, tools: list[Tool]) -> list[Tool]:
         """Give each browser step tool the step deadline (run_step), the clean-up (rescue) and the words for the model."""
         for tool in tools:
-            tool.deadline = OPEN_SECONDS if tool.name in ("browser_open", "browser_view") else STEP_SECONDS
+            tool.deadline = OPEN_SECONDS if tool.name == "browser_open" else STEP_SECONDS
             tool.limiter = self.run_step
             tool.on_timeout = lambda _args: self.rescue()
             tool.timeout_text = self.timeout_text
@@ -1073,17 +1218,20 @@ class BrowserSession:
     def step_running(self, key: str) -> bool:
         return key in self._steps and not self._steps[key].done()
 
-    def interrupt(self, key: str) -> None:
+    def interrupt(self, key: str) -> bool:
         """The user took this tab over: the agent's step on it is cancelled (ToolStopped, TOOK_OVER_NOTE), and what it left half
-        done in the page (a loading navigation, a finger still down) is cleaned up before the user's first input (`settled`)."""
+        done in the page (a loading navigation, a finger still down) is cleaned up before the user's first input (`settled`).
+        True when a running step was cancelled; the clean-up runs only then."""
         task = self._steps.get(key)
-        if task is not None and not task.done():
-            self._stopped.add(task)
-            task.cancel()
+        if task is None or task.done():
+            return False
+        self._stopped.add(task)
+        task.cancel()
         try:
             self._rescues[key] = asyncio.ensure_future(self.rescue(key))
         except RuntimeError:   # no running loop (a plain test): nothing to clean up
             pass
+        return True
 
     async def settled(self, key: str, timeout: float = RESCUE_SECONDS) -> None:
         """Wait (bounded) until the clean-up after taking the tab over is done: the user's first tap must not meet a half-finished touch."""
@@ -1099,7 +1247,7 @@ class BrowserSession:
         script of the page), lift a touch or mouse button the step left down. Every call is bounded (RESCUE_SECONDS) and none of them
         needs an answer from the page's main thread to be given up on."""
         key = key or browser_owner.get()
-        cdp = self._view_cdp.get(key) or self._tab_cdp.get(key)
+        cdp = self._tab_cdp.get(key)
         if cdp is None:
             page = self.raw_page(key)
             if page is None:
@@ -1137,11 +1285,32 @@ class BrowserSession:
             pass
         return key not in self._control
 
+    async def hold_for_navigation(self, args: dict[str, Any] | None = None) -> str | None:
+        """hold_for_user, then the order journal's block: while an order of this task may have gone through (pressed or unknown) the tab
+        is not reloaded or navigated (browser_open): the confirmation may be on it."""
+        held = await self.hold_for_user(args)
+        if held:
+            return held
+        return self.nav_block() if self.nav_block is not None else None
+
+    async def hold_to_act(self, args: dict[str, Any] | None = None) -> str | None:
+        """The `hold` of the acting steps: hold_for_user, then MOVED_NOTE when the owner changed this tab by hand before handing it back
+        and the page has not been read since (snapshot and look clear it)."""
+        held = await self.hold_for_user(args)
+        if held:
+            return held
+        if browser_owner.get() in self._lost_act:   # the browser was lost: the page is read first (snapshot and look clear it)
+            return LOST_ACT_NOTE
+        return MOVED_NOTE if browser_owner.get() in self._owner_moved else None
+
     async def hold_for_user(self, _args: dict[str, Any] | None = None) -> str | None:
         """A tool's `hold`: before an agent step on this device's tab, wait while the user controls it. None = go on; otherwise the
         words the agent gets instead of a result."""
-        if await self.wait_for_agent_turn(browser_owner.get()):
+        patience = hold_patience.get()
+        if await self.wait_for_agent_turn(browser_owner.get(), patience):
             return None
+        if patience is not None:   # a chat reply: told at once, the reply says it waits for the owner
+            return CONTROLLED_CHAT_NOTE
         return CONTROLLED_NOTE.format(minutes=max(1, round(self.control_wait / 60)))
 
     def raw_page(self, key: str) -> Any:
@@ -1177,10 +1346,12 @@ class BrowserSession:
             return None
         return await self._with_listeners(got, page, owner)
 
-    async def _listener_code(self, page: Any) -> str | None:
-        """The source of the click-like listeners added with addEventListener on the element TARGET_JS just read (it leaves it in
-        window.__keloJudgeTarget), read through DevTools (DOMDebugger.getEventListeners). None when they cannot be read.
+    async def _listener_code(self, page: Any, path: str) -> str | None:
+        """The source of the click-like listeners added with addEventListener on the element at `path` (the CSS path TARGET_JS gave;
+        DevTools' getEventListeners reads them, in an expression that leaves nothing in the page). None when they cannot be read.
         `page` may be a frame inside the page (one in another process has a DevTools session of its own)."""
+        if not path:
+            return None
         if hasattr(page, "main_frame"):
             cdp = await self.cdp_session(page)
         elif self._cdp is not None:
@@ -1188,29 +1359,13 @@ class BrowserSession:
         else:
             cdp = await page.page.context.new_cdp_session(page)
         try:
-            got = await cdp.send("Runtime.evaluate", {"expression": "window.__keloJudgeTarget", "objectGroup": "kelo-judge"})
-            obj = (got or {}).get("result", {}).get("objectId")
-            if not obj:
+            expression = _LISTENERS_JS % (json.dumps(path), json.dumps(sorted(_CLICK_EVENTS)))
+            got = await cdp.send("Runtime.evaluate", {"expression": expression, "includeCommandLineAPI": True, "returnByValue": True})
+            value = ((got or {}).get("result") or {}).get("value")
+            if not isinstance(value, list):
                 return None
-            ls = await cdp.send("DOMDebugger.getEventListeners", {"objectId": obj})
-            parts: list[str] = []
-            for li in (ls or {}).get("listeners", [])[:20]:
-                if li.get("type") not in _CLICK_EVENTS:
-                    continue
-                fn = (li.get("handler") or {}).get("objectId")
-                if not fn:
-                    continue
-                src = await cdp.send("Runtime.callFunctionOn", {
-                    "objectId": fn, "returnByValue": True,
-                    "functionDeclaration": "function(){try{return Function.prototype.toString.call(this).slice(0,4000)}catch(e){return ''}}"})
-                parts.append(str((src or {}).get("result", {}).get("value") or ""))
-            return "\n;\n".join(p for p in parts if p)
+            return "\n;\n".join(str(src) for src in value if src)
         finally:
-            try:
-                await cdp.send("Runtime.evaluate", {"expression": "delete window.__keloJudgeTarget"})
-                await cdp.send("Runtime.releaseObjectGroup", {"objectGroup": "kelo-judge"})
-            except Exception:  # noqa: BLE001
-                pass
             try:
                 await cdp.detach()
             except Exception:  # noqa: BLE001
@@ -1242,11 +1397,13 @@ class BrowserSession:
         if info is None and ref_of(selector) and words == selector:
             kind = "unknown"
         elif tool == "browser_type":
-            kind = judge_type(info, words, str(args.get("text", "")), bool(args.get("submit", False)))
+            kind = await self.type_kind(info, words, str(args.get("text", "")), bool(args.get("submit", False)))
         else:
-            kind = judge_click(info, words, url=self.current_url())
+            kind = await self.click_kind(info, words)
+        # a typed value is secret when its field is a password field, or when the field cannot be read at all (fail closed: the
+        # value is masked; no word of the label decides, hc-final-a)
         secret = (bool(info) and (str(info.get("type") or "") == "password" or "password" in str(info.get("autocomplete") or ""))) or (
-            info is None and bool(re.search(r"passw|\bpw\b|비밀번호", words, re.I)))
+            info is None and tool == "browser_type")
         target = self._target_key(info, selector)
         if kind and target[1]:
             seen = self._kinds_seen.setdefault(browser_owner.get(), {})
@@ -1255,7 +1412,84 @@ class BrowserSession:
                 seen.pop(next(iter(seen)))
         self._judged[browser_owner.get()] = (selector, kind, tool == "browser_type" and secret)
         self._judged_info[browser_owner.get()] = info
+        self._judged_words[browser_owner.get()] = (selector, words)
         return kind
+
+    @staticmethod
+    def is_submit_step(tool: str, info: dict[str, Any], args: dict[str, Any]) -> bool:
+        """A step that submits a form by the page's structure: a submit control inside a form, or Enter typed into a field of one."""
+        if tool == "browser_type":
+            return bool(args.get("submit")) and bool(info.get("in_form"))
+        return bool(info.get("submits"))
+
+    async def judged_kind(self, info: dict[str, Any]) -> str:
+        """The commit kind the step judge gives a control ("" = nothing to ask for; "unknown" = the judge could not answer, or there is
+        none wired: the owner is asked, never a pass)."""
+        if self.step_judge is None:
+            return "unknown"
+        verdict = await self.step_judge.web(info)
+        self._verdict[browser_owner.get()] = verdict
+        return kind_of_verdict(verdict, info)
+
+    async def click_kind(self, info: dict[str, Any] | None, words: str) -> str:
+        """The commit kind of a click (docs/click-judge.md): structure first (a link, a window opener, plain text, a page-state
+        control only looks), the step judge for a step that changes something or cannot be read."""
+        if click_route(info) == "":
+            return ""
+        if info is None:
+            info = {"text": words, "url": self.current_url()}   # unreadable: the judge sees its name only
+        return await self.judged_kind(info)
+
+    async def type_kind(self, info: dict[str, Any] | None, words: str, text: str, submit: bool) -> str:
+        """The commit kind of typing: a card number or a password field asks (judge_type); Enter into a form that is no search form is
+        a submit, judged like a click, and the judge's kind wins when it says one (no flag = no card)."""
+        own = judge_type(info, words, text, submit)
+        if info is None or not submit or not info.get("in_form") or info.get("search_form"):
+            return own
+        return await self.judged_kind(info) or own
+
+    async def submit_refusal(self, tool: str, args: dict[str, Any]) -> str | None:
+        """The safety net's refusal: a submit control on a page WITHOUT checkout structure that the step judge says spends money. The
+        way to pay is checkout_review / checkout_submit (tools/checkout.py REFUSAL). None for everything else (the judge being
+        unavailable asks the owner in judge())."""
+        if tool in POINT_TOOLS:
+            return await self._point_refusal(tool, args)
+        selector = str(args.get("selector") or "")
+        if self.step_judge is None or not selector or (tool == "browser_type" and not args.get("submit")):
+            return None
+        info = await self.read_target(selector)
+        if info is None or not self.is_submit_step(tool, info, args):
+            return None
+        verdict = await self.step_judge.web(info)
+        return REFUSAL if verdict is not None and verdict.spends_money else None
+
+    @staticmethod
+    def is_point_submit(info: dict[str, Any] | None) -> bool:
+        """What is at a point is a submit control, or a control inside a form (pressing it may submit the form)."""
+        return bool(info) and bool(info.get("submits") or info.get("in_form"))
+
+    async def _point_infos(self, tool: str, args: dict[str, Any]) -> list[dict[str, Any] | None]:
+        """What is at the places of a point step (a drag: where it starts and where it lets go), read like a click target."""
+        try:
+            pts = step_points(tool, args)
+            ends = [pts[0]] if len(pts) == 1 else [pts[0], pts[-1]]
+            return [await asyncio.wait_for(self.read_point(*self.page_point(*p)), TARGET_READ_MS / 1000 + LISTENER_READ_MS / 1000 + 1)
+                    for p in ends]
+        except Exception:  # noqa: BLE001 - nothing readable: judge() asks the owner for an unreadable point
+            return [None]
+
+    async def _point_refusal(self, tool: str, args: dict[str, Any]) -> str | None:
+        """The safety net for a point press (click at coordinates, drag) on a page without checkout structure: when the control at the
+        point is a submit control, or inside a form, the step judge says what it does (cached per page path + control); spends_money
+        is refused with the checkout tools message. A judge that cannot answer refuses nothing here (judge() turns it into a card)."""
+        if self.step_judge is None:
+            return None
+        for info in await self._point_infos(tool, args):
+            if self.is_point_submit(info):
+                verdict = await self.step_judge.web(info)
+                if verdict is not None and verdict.spends_money:
+                    return REFUSAL
+        return None
 
     async def _judge_point(self, tool: str, args: dict[str, Any]) -> str:
         """A point step is judged by the element at its point, as a click on it; a drag by the elements where it starts AND where it
@@ -1269,8 +1503,11 @@ class BrowserSession:
                      for p in ends]
         except Exception:  # noqa: BLE001
             infos = [None]
-        judged = [("unknown" if i is None else judge_click(i, "", url=self.current_url()), i) for i in infos]
+        judged = [("unknown" if i is None else await self.click_kind(i, ""), i) for i in infos]
         # the weightiest: "unknown" (always asks), then any commit kind, then "" (only looking)
+        for n, (k, i) in enumerate(judged):   # a submit control (or one inside a form) the older rules call ordinary: the step judge decides
+            if not k and self.is_point_submit(i):
+                judged[n] = (await self.judged_kind(i), i)
         kind, info = max(judged, key=lambda ki: 2 if ki[0] == "unknown" else 1 if ki[0] else 0)
         target = self._target_key(info, "")
         if kind not in ("", "unknown") and target[1]:
@@ -1320,10 +1557,11 @@ class BrowserSession:
         return await self._with_listeners(got, page, page)
 
     async def _with_listeners(self, got: dict[str, Any], page: Any, owner: Any) -> dict[str, Any]:
+        path = str(got.pop("judge_path", "") or "")   # the element's CSS path (commits.TARGET_JS); not kept in the reading
         if got.get("structure_read"):
             try:
                 # a frame of another process has its own DevTools target; one in the page's process cannot be read this way (None)
-                more = await asyncio.wait_for(self._listener_code(page if owner is page else owner), LISTENER_READ_MS / 1000)
+                more = await asyncio.wait_for(self._listener_code(page if owner is page else owner, path), LISTENER_READ_MS / 1000)
             except Exception:  # noqa: BLE001 - the inline handlers alone are judged
                 more = None
             if more is None:
@@ -1347,6 +1585,22 @@ class BrowserSession:
         first = next((x.strip() for x in str(line or "").splitlines() if x.strip()), "")
         return first.lstrip("- ").split(" [ref=")[0].rstrip(":").strip()
 
+    async def gone_ref(self, selector: str) -> str | None:
+        """STALE_REF when `selector` is a ref this tab's page no longer has, checked before any card (owner report 2026-11-19: the
+        owner was asked about an element that was gone, allowed it, and the click failed); None for a selector that is not a ref, a ref
+        that is there, no page yet, or a page that cannot be asked in time (then the step's own checks decide)."""
+        ref = ref_of(selector)
+        page = self._pages.get(browser_owner.get())
+        if ref is None or page is None:
+            return None
+        try:
+            if page.is_closed():
+                return None
+            n = await asyncio.wait_for(page.locator(ref_selector(selector)).count(), TARGET_READ_MS / 1000)
+        except Exception:  # noqa: BLE001 - not answered in time, or a page that cannot be asked this way
+            return None
+        return STALE_REF.format(ref=ref) if n == 0 else None
+
     def selector_words(self, selector: str) -> str:
         """What a selector names for judging and cards: for a ref of the last reading its words there (`button "Pay now"`), else the
         selector itself (also for a ref that reading did not have)."""
@@ -1360,8 +1614,12 @@ class BrowserSession:
         return dict(self._ref_words.get(key, {}))
 
     def ref_label(self, selector: str) -> str:
-        """The page's own name for a ref of the last reading ("" for a selector, or a ref without one): what a card shows."""
-        return ref_name(self.selector_words(selector)) if ref_of(selector) else ""
+        """The page's own name for a ref: from the last reading, else as the element itself gave it when its step was judged ("" for
+        a selector, or a ref without one): what a card shows."""
+        if not ref_of(selector):
+            return ""
+        got = self._judged_words.get(browser_owner.get())
+        return ref_name(self.selector_words(selector)) or (ref_name(got[1]) if got and got[0] == selector else "")
 
     def _target_key(self, info: dict[str, Any] | None, selector: str) -> tuple[str, str]:
         """Which element this is, for "the same button again": the page (without its #fragment) and the element's own words."""
@@ -1371,6 +1629,12 @@ class BrowserSession:
     def note_allowed(self, selector: str) -> tuple[str, str]:
         """A step is about to run (allowed by a card or by a rule): what it is, in case it fails and is tried again."""
         return self._target_key(self.judged_info(selector), selector)
+
+    def target_state(self, selector: str) -> tuple[str, str, str]:
+        """(role, state, scene) of the element last judged for this selector (commits.TARGET_JS): what it is, how it stands now and how
+        its part of the page stands; ("", "", "") when it was not read. done_once.py puts them in the step's fingerprint."""
+        info = self.judged_info(selector) or {}
+        return str(info.get("role") or info.get("tag") or ""), str(info.get("state") or ""), str(info.get("scene") or "")
 
     def allowed_failed(self, target: tuple[str, str]) -> None:
         if target[1]:
@@ -1452,15 +1716,16 @@ class BrowserSession:
         return left > 0 and time.monotonic() < until and bool(host) and (host == h or same_site(host, h))
 
     def use_cancel_action(self, selector: str) -> bool:
-        """One click that cancels an order (words like "cancel order" / "주문 취소", never "delete account") inside the open cancel window
-        on its site. False = ask the user as usual."""
+        """One click the step judge says deletes something, inside the open cancel window on its site (the window counts the clicks).
+        False = ask the user as usual."""
         if not self.cancel_active() or self.judged(selector) != "delete":
             return False
-        words = self.selector_words(selector)
-        if not cancel_words(words):
+        v = self._verdict.get(browser_owner.get())   # a deletion only: never closing the account or a membership, security, money or sending
+        if v is None or any(getattr(v, f, False) for f in ("opts_out", "account_security", "spends_money", "sends", "signs_up", "applies")):
             return False
         h, until, left, no = self._cancel[browser_owner.get()]
         self._cancel[browser_owner.get()] = (h, until, left - 1, no)
+        words = self.selector_words(selector)
         if self.on_cancel_click is not None:
             try:
                 self.on_cancel_click(self.current_host(), ref_name(words) if ref_of(selector) else words, no)
@@ -1480,89 +1745,615 @@ class BrowserSession:
         async with self._lock:
             self._used[key] = self.clock()   # idle tabs are closed by the server's sweeper (TAB_SWEEP_SECONDS), never here
             self._seen_at[key] = time.time()
+            if self.work is not None and work_tab(key) and key not in self._private:
+                if not self.work.connected():
+                    await self.work.ensure()   # a work browser that went away: the new connection forgets its old pages below
+                if key in self._work_gen and self._work_gen[key] != self.work.generation:
+                    self._forget_tab(key)
+                    self._work_dl = None
             page = self._pages.get(key)
             if page is not None and not page.is_closed():
                 return page
-            if (back := self._back_to_opener(key)) is not None:
-                return back
-            if self._connect:
+            if (alive := self._window_page(key)) is not None:
+                return alive
+            if profile := self.profile_of(key):   # a named profile: the keychain must be open and the profile must exist, or nothing opens
+                try:
+                    self.profile_check(profile)
+                except Exception as e:  # noqa: BLE001 - a VaultError carries a note that is safe to show
+                    raise BrowserPolicyError(str(e)) from None
+            if self.work is not None and work_tab(key) and key not in self._private:
+                page = await self._work_page(key)
+            elif profile and key not in self._private:
+                page = await self._profile_page(key)
+            elif self._connect:
                 page = await self._private[key].new_page() if key in self._private else await self._connect()
             else:
                 await self._ensure_browser()
                 if key in self._private:   # this tab browses privately: a fresh page in its own context
                     page = await self._private[key].new_page()
                 else:
-                    taken = {id(p) for p in self._pages.values()} | {id(o[0]) for st in self._openers.values() for o in st}
-                    free = next((p for p in self._ctx.pages if id(p) not in taken and not p.is_closed()), None)
-                    page = free or await self._ctx.new_page()
+                    self._creating += 1
+                    try:
+                        page = await self._new_window(self._ctx)   # a task's window of its own: never the start page or another task's
+                    finally:
+                        self._creating -= 1
             self._pages[key] = page
-            self._view_cdp.pop(key, None)   # a new page starts in the desktop view (open() applies a site's remembered one)
+            win = self._windows.setdefault(key, TaskWindow(key, profile=self._tab_profile.get(key, "")))
+            win.activate(win.add(page).id)
+            if key in self._lost:
+                lost_url = self._lost.pop(key)
+                self._notes.setdefault(key, []).insert(0, BROWSER_LOST_NOTE.format(url=lost_url[:300] or "the page"))
+                self._lost_act.add(key)
+                self._told_lost(key)
             self._watch(page, key)
             if self.prepare_pages:
                 await self._prepare(page, key)
             return page
 
-    def _back_to_opener(self, key: str) -> Any:
-        """The window this tab moved into closed: the tab shows the page that opened it again (with its own view), or None."""
-        stack = self._openers.get(key) or []
-        while stack:
-            opener, view_cdp, tab_cdp = stack.pop()
-            try:
-                alive = not opener.is_closed()
-            except Exception:  # noqa: BLE001
-                alive = False
-            if not alive:
+    async def _work_page(self, key: str) -> Any:
+        """A page of a scheduled or background tab: in its own context of the work browser, filled with a copy of the owner's cookies.
+        The main browser is never used for it; a work browser that does not answer fails the step with DOWN_NOTE."""
+        try:
+            ctx = await self.work.open_context(key, await self._main_cookies(), signed_out=self.signed_out_tab(key))
+        except WorkBrowserDown:
+            raise BrowserPolicyError(DOWN_NOTE) from None
+        self._work_gen[key] = self.work.generation
+        await self._guard_work_context(key, ctx)
+        self._listen_owner_pages(ctx)
+        self._creating += 1
+        try:
+            page = await ctx.new_page()
+        finally:
+            self._creating -= 1
+        await self._arm_seed(key, page)
+        if self.work.on_new_page is not None:
+            await self._quietly(lambda: self.work.on_new_page(key))
+        return page
+
+    async def _profile_page(self, key: str) -> Any:
+        """A chat tab in a named profile: a context of its own in the main browser (the owner's default context is not touched), seeded
+        per site from the profile's units like a work tab and written back to them at close."""
+        if self._connect is None:
+            await self._ensure_browser()
+        browser = getattr(self, "_browser", None)
+        if browser is None:
+            raise BrowserPolicyError("the browser is not running, so a profile window cannot be opened")
+        ctx = self._profile_ctx.get(key)
+        if ctx is None:
+            ctx = await browser.new_context(no_viewport=True, accept_downloads=True)
+            self._profile_ctx[key] = ctx
+            self._profile_tabs[key] = WorkTab(context=ctx)
+            await self._guard_work_context(key, ctx)
+        self._listen_owner_pages(ctx)
+        self._creating += 1
+        try:
+            page = await ctx.new_page()
+        finally:
+            self._creating -= 1
+        await self._arm_seed(key, page)
+        return page
+
+    def _listen_owner_pages(self, ctx: Any) -> None:
+        """A page the owner opens by hand in a work or profile context joins the window they hold (C1d), as in the main browser; once per context."""
+        if id(ctx) in self._listened or not hasattr(ctx, "on"):
+            return
+        self._listened.add(id(ctx))
+        try:
+            ctx.on("page", self._on_context_page)
+        except Exception:  # noqa: BLE001 - a context without events: the main browser's listener is the one that matters
+            pass
+
+    def _main_context(self) -> Any:
+        """The owner's browser context (the persistent profile); the context of an open main page in the test path."""
+        if self._connect is None:
+            return self._ctx
+        return next((p.context for k, p in list(self._pages.items())
+                     if not work_tab(k) and k not in self._profile_ctx and k not in self._private
+                     and not p.is_closed() and getattr(p, "context", None) is not None), None)
+
+    async def _main_cookies(self) -> list[dict[str, Any]]:
+        """Every cookie of the owner's browser (the sign-in copy). [] when there is none; never opens a page in the main browser."""
+        try:
+            if self._connect is None:
+                await self._ensure_browser()
+            ctx = self._main_context()
+            return list(await ctx.cookies()) if ctx is not None else []
+        except Exception:  # noqa: BLE001 - the job then signs in with the vault
+            return []
+
+    async def _work_storage_now(self, ctx: Any, site: str) -> dict[str, dict[str, str]]:
+        """The local storage of `site` in a work tab's context as it is now (through a page of that context that is still open), by origin.
+        {} when no page is open or on any error."""
+        try:
+            page = next((p for p in list(ctx.pages) if not p.is_closed()), None)
+            if page is None:
+                return {}
+            state = await self.export_site_state(site, page=page)
+        except Exception:  # noqa: BLE001
+            return {}
+        return {str(o["origin"]): {str(k): str(v) for k, v in o.get("localStorage") or []}
+                for o in state.get("origins") or [] if o.get("localStorage")}
+
+    async def _carry_back(self, key: str, cookies: list[dict[str, Any]], storage: list[dict[str, Any]], sites: set[str]) -> None:
+        """What a work tab changed on its sites goes back to the owner's browser, value by value (card A4): a changed or new cookie or
+        storage key is written only where the owner's browser still holds the value the job started from (new: nothing there). Deletions
+        are never written. Counts only in the log."""
+        written = left = swritten = sleft = 0
+        try:
+            ctx = self._main_context()
+            main = {(c["name"], c["domain"], c.get("path", "")): str(c.get("value", "")) for c in await self._main_cookies()}
+            keep = []
+            for ch in cookies:
+                c = ch["cookie"]
+                if main.get((c["name"], c["domain"], c.get("path", ""))) == ch["seeded"]:
+                    keep.append(c)
+                else:
+                    left += 1
+            if ctx is not None and keep:
+                await ctx.add_cookies(keep)
+                written = len(keep)
+            if storage:
+                page = next((p for p in list(ctx.pages if ctx is not None else []) if not p.is_closed()), None)
+                now: dict[str, dict[str, dict[str, str]]] = {}
+                for site in {ch["site"] for ch in storage}:
+                    now[site] = await self._main_storage(site)
+                cdp = await self.cdp_session(page) if page is not None else None
+                for ch in storage:
+                    if now.get(ch["site"], {}).get(ch["origin"], {}).get(ch["key"]) != ch["seeded"] or cdp is None:
+                        sleft += 1
+                        continue
+                    await cdp.send("DOMStorage.setDOMStorageItem", {"storageId": {"securityOrigin": ch["origin"], "isLocalStorage": True},
+                                                                  "key": ch["key"], "value": ch["value"]})
+                    swritten += 1
+        except Exception:  # noqa: BLE001 - carrying back never stops a tab from closing
+            pass
+        log.info("work browser: tab %s closed, %d cookies and %d storage keys written back, %d left (the owner changed them)",
+                 key, written, swritten, left + sleft)
+
+    def _write_back_unit(self, key: str, profile: str, cookies: list[dict[str, Any]], storage: list[dict[str, Any]], sites: set[str]) -> None:
+        """What a profile window changed goes back into the profile's units, value by value: a changed or new cookie or storage key is
+        written only where the unit still holds the value the window started from (new: nothing there). Deletions are never written.
+        Counts only in the log."""
+        written = left = 0
+        for site in sorted(sites):
+            mine = [c for c in cookies if registrable(str(c["cookie"].get("domain") or "").lstrip(".").lower()) == site]
+            smine = [c for c in storage if c["site"] == site]
+            if not mine and not smine:
                 continue
-            self._pages[key] = opener
-            self._view_cdp.pop(key, None)
-            if view_cdp is not None:
-                self._view_cdp[key] = view_cdp
-            if tab_cdp is not None:
-                self._tab_cdp[key] = tab_cdp
-            self._notes.setdefault(key, []).append(POPUP_BACK_NOTE)
-            return opener
-        self._openers.pop(key, None)
-        return None
+            try:
+                unit = self.profile_unit(profile, site)
+                have = {(c["name"], c["domain"], c.get("path", "")): c for c in unit.get("cookies") or []}
+                changed = False
+                for ch in mine:
+                    c = ch["cookie"]
+                    now = have.get((c["name"], c["domain"], c.get("path", "")))
+                    if (str(now.get("value", "")) if now is not None else None) == ch["seeded"]:
+                        have[(c["name"], c["domain"], c.get("path", ""))] = c
+                        written += 1
+                        changed = True
+                    else:
+                        left += 1
+                st = {o: dict(items) for o, items in (unit.get("storage") or {}).items()}
+                for ch in smine:
+                    if st.get(ch["origin"], {}).get(ch["key"]) == ch["seeded"]:
+                        st.setdefault(ch["origin"], {})[ch["key"]] = ch["value"]
+                        written += 1
+                        changed = True
+                    else:
+                        left += 1
+                if changed:
+                    self.profile_save(profile, site, {"cookies": list(have.values()), "storage": st})
+            except Exception:  # noqa: BLE001 - a locked keychain: nothing is written, and the window still closes
+                log.info("browser profile: a site's changes could not be written back")
+        log.info("browser profile: tab %s closed, %d values written back to its profile, %d left (changed meanwhile)", key, written, left)
+
+    def owner_handed_back(self, key: str, summary: str, reason: str, kind: str) -> None:
+        """A hand-back listener (server.py): the owner did something on a work tab, so that site counts as signed in by the job and its
+        cookies go back to the owner's browser when the tab closes. A sign-in the owner typed by hand is recorded for the Keychain
+        (brief B1), on any tab."""
+        page = self._pages.get(key)
+        host = (urlsplit(str(getattr(page, "url", "") or "")).hostname or "").lower() if page is not None else ""
+        if self.journal is not None and key in self.journal.signed_in:
+            self.journal.signed_in.discard(key)
+            if registrable(host):
+                self._hook(self.on_owner_sign_in, registrable(host), self.profile_of(key))
+                self.clear_pause(registrable(host))   # the owner signed in: a pause for that site ends (brief B2)
+        if self.work is None or not work_tab(key) or not summary:
+            return
+        if host:
+            self.work.note_signed(key, host)
+
+    def _hook(self, fn: Callable[..., Any], site: str, profile: str = "") -> None:
+        """Calls one of the store hooks (server.py); a hook that fails never breaks the browser. A named profile's id is passed on."""
+        try:
+            fn(site, profile) if profile else fn(site)
+        except Exception:  # noqa: BLE001
+            log.info("browser hook failed for one site")
+
+    def bind_profile(self, key: str, profile: str) -> None:
+        """The task window of `key` is opened in this named profile (before its first page). A buy tab never takes one."""
+        if profile and not key.startswith("buy:"):
+            self._tab_profile[key] = profile
+        else:
+            self._tab_profile.pop(key, None)
+
+    def try_bind_profile(self, key: str, profile: str) -> str:
+        """browser_open(profile=...): only for a window that is not open yet. "" when bound; else the error to tell the model."""
+        if key.startswith("buy:") or key in self._private:
+            return "error: this tab does not use profiles"
+        win = self._windows.get(key)
+        if win is not None and getattr(win, "profile", "") != profile:
+            return "error: this task's window uses another profile; close it first (browser_close) or keep using it"
+        if win is not None:
+            return ""
+        try:
+            self.profile_check(profile)
+        except Exception as e:  # noqa: BLE001 - a VaultError says why (locked, unknown id)
+            return f"error: {e}"
+        self._tab_profile[key] = profile
+        return ""
+
+    async def close_profile_windows(self, profile: str) -> int:
+        """Close every window bound to a named profile (its profile is deleted): what each changed is written back first, to a profile
+        that is deleted right after (nothing is kept)."""
+        keys = [k for k, p in list(self._tab_profile.items()) if p == profile]
+        for k in keys:
+            await self.close_tab(k)
+        return len(keys)
+
+    async def forget_profile_site(self, profile: str, site: str) -> None:
+        """A named profile is signed out of a site: its open contexts lose that site's cookies (the stored unit is the caller's)."""
+        reg = registrable(site.strip().lower())
+        ctxs = [wt.context for k, wt in self._profile_tabs.items() if self._tab_profile.get(k) == profile]
+        if self.work is not None:
+            ctxs += [wt.context for k, p in self._tab_profile.items() if p == profile and (wt := self.work.tab(k)) is not None]
+        for ctx in ctxs:
+            try:
+                kept = [c for c in await ctx.cookies() if registrable(str(c.get("domain") or "").lstrip(".").lower()) != reg]
+                await ctx.clear_cookies()
+                await ctx.add_cookies([{k: c[k] for k in COOKIE_KEYS if k in c} for c in kept if c.get("name") and c.get("domain")])
+            except Exception:  # noqa: BLE001 - a context that went away
+                pass
+
+    def profile_of(self, key: str) -> str:
+        """The named profile this tab's window uses ("" = the default profile, the owner's browser). Research jobs and private tabs are
+        signed out / private whatever was asked, so they have none."""
+        if key.startswith("buy:") or key in self._private or self.signed_out_tab(key):
+            return ""
+        return self._tab_profile.get(key, "")
+
+    def _touch_site(self, site: str, now: float | None = None, profile: str = "") -> None:
+        """The site was used by Kelo's browser: its sign-in row is marked used, at most once per TOUCH_SECONDS per site."""
+        if not site:
+            return
+        now = time.monotonic() if now is None else now
+        tk = f"{profile}:{site}" if profile else site
+        if now - self._touched.get(tk, -TOUCH_SECONDS) < TOUCH_SECONDS:
+            return
+        self._touched[tk] = now
+        self._hook(self.on_site_used, site, profile)
+
+    async def _main_storage(self, site: str) -> dict[str, dict[str, str]]:
+        """The local storage of `site` in the owner's browser, by origin, read through a page of the main context that already exists (a
+        blank one does; no page is opened). {} on any error."""
+        try:
+            ctx = self._main_context()
+            page = next((p for p in list(ctx.pages if ctx is not None else []) if not p.is_closed()), None)
+            if page is None:
+                return {}
+            state = await self.export_site_state(site, page=page)
+        except Exception:  # noqa: BLE001 - the cookies alone still carry most sign-ins
+            return {}
+        return {str(o["origin"]): {str(k): str(v) for k, v in o.get("localStorage") or []}
+                for o in state.get("origins") or [] if o.get("localStorage")}
+
+    def _seed_tab(self, key: str) -> WorkTab | None:
+        """The record a site is seeded into for this tab: a work tab's, or a named profile's own context's (None: nothing to seed)."""
+        if self.work is not None and self.work.tab(key) is not None:
+            return self.work.tab(key)
+        return self._profile_tabs.get(key)
+
+    async def _seed_work_site(self, key: str, site: str) -> None:
+        """Before a work tab (or a named profile's tab) goes to `site`: the sign-in for that site (cookies and local storage) is copied
+        into the tab's context, once per site: the owner's browser for the default profile, the profile's sealed unit for a named one
+        (never the owner's browser). Also notes the site as touched (what the job changed there is written back at close). A failure
+        is said on the tab's next reading (SEED_FAILED_NOTE). Counts only in the log."""
+        site = registrable(str(site or "").lower())
+        wt = self._seed_tab(key)
+        if wt is None or not site:
+            return
+        profile = self.profile_of(key)
+        try:
+            if profile:
+                unit = self.profile_unit(profile, site)
+                cookies = [c for c in unit.get("cookies") or []
+                           if registrable(str(c.get("domain") or "").lstrip(".").lower()) == site]
+                storage = dict(unit.get("storage") or {})
+            else:
+                cookies = [c for c in await self._main_cookies()
+                           if registrable(str(c.get("domain") or "").lstrip(".").lower()) == site]
+                storage = await self._main_storage(site)
+            if self.work is not None and self.work.tab(key) is not None:
+                n = await self.work.seed_site(key, site, cookies, storage)
+                self.work.note_touched(key, site)
+            else:
+                n = await seed_tab(wt, site, cookies, storage)
+                wt.touched.add(site)
+            self._touch_site(site, profile=profile)
+            if not profile and not wt.signed_out:
+                wt.owner_had.setdefault(site, len(cookies))   # what the owner's browser held for the site at the first copy (S3)
+            state = ("named profile" if profile else "signed-out tab" if wt.signed_out
+                     else "sign-in on record" if wt.owner_had.get(site) and self.signed_in_site(site) else "no sign-in")
+            log.info("work browser: tab %s, site %s: %d cookies copied of %d in the source, %s", key, site, n, len(cookies), state)
+        except Exception:  # noqa: BLE001 - the tab still loads, and the agent is told it may not be signed in
+            self._notes.setdefault(key, []).append(SEED_FAILED_NOTE)
+            log.info("work browser: tab %s could not be seeded", key)
+
+    def _seed_note(self, key: str, url: str) -> str:
+        """Once per site and job tab, on a reading of a page of a site whose sign-in copy found no sign-in in the owner's browser (nothing
+        there, or no record of a sign-in): the job knows before a refusal tells it (card p-signin-gaps). "" otherwise."""
+        wt = self.work.tab(key) if self.work is not None else None
+        site = _site_of(url)
+        if wt is None or wt.signed_out or not site or site in wt.told or site not in wt.owner_had:
+            return ""
+        wt.told.add(site)
+        found = wt.owner_had[site]
+        if found and self.signed_in_site(site):
+            return ""
+        return seed_signed_out_note(site, found, self.login_for(site)) + "\n"
+
+    async def _guard_work_context(self, key: str, ctx: Any) -> None:
+        """A document request in a work tab's context is seeded first (the route hook of card A3): the route always goes on
+        (fallback), also when seeding failed."""
+        if not hasattr(ctx, "route"):
+            return
+
+        async def guard(route: Any, request: Any) -> None:
+            try:
+                if request.resource_type == "document":
+                    await self._seed_work_site(key, registrable(str(urlsplit(request.url).hostname or "").lower()))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await route.fallback()
+            except Exception:  # noqa: BLE001 - the page went away
+                pass
+
+        try:
+            await ctx.route("**/*", guard)
+        except Exception:  # noqa: BLE001 - a context without routes works, the copy at open still runs
+            log.info("work browser: no route hook for tab %s", key)
+
+    async def _arm_seed(self, key: str, page: Any) -> None:
+        """Document requests of the tab's page are also paused on its own DevTools session (card A3, path R+F): a redirect to another host
+        is not seen by the context route, so the document is seeded here before it is sent. Every paused request is continued."""
+        try:
+            cdp = await self.cdp_session(page)
+            await cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "resourceType": "Document", "requestStage": "Request"}]})
+        except Exception:  # noqa: BLE001 - the route hook still seeds the first document of each site
+            return
+
+        async def paused(ev: dict[str, Any]) -> None:
+            try:
+                await self._seed_work_site(key, registrable(str(urlsplit(str(ev["request"]["url"])).hostname or "").lower()))
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                try:
+                    await cdp.send("Fetch.continueRequest", {"requestId": ev["requestId"]})
+                except Exception:  # noqa: BLE001 - the page went away
+                    pass
+
+        try:
+            cdp.on("Fetch.requestPaused", lambda ev: asyncio.ensure_future(paused(ev)))
+        except Exception:  # noqa: BLE001
+            return
+        self._seed_cdp[key] = cdp
+
+    def _forget_tab(self, key: str) -> None:
+        """Drop everything kept for a tab's page without closing anything (the page belongs to a connection that is gone)."""
+        for d in (self._pages, self._private, self._tab_cdp, self._type_cdp, self._targets, self._opened, self._doc, self._ref_words, self._look_url,
+                  self._shot_scale, self._windows):
+            d.pop(key, None)
+
+    def _forget_main_tabs(self) -> None:
+        """The main browser reconnected: its tabs are forgotten; the work tabs are the work browser's and stay."""
+        keys = {k for d in (self._pages, self._private, self._tab_cdp, self._type_cdp, self._targets, self._opened, self._doc, self._ref_words,
+                            self._look_url, self._shot_scale) for k in d if not work_tab(k)}
+        for k in keys:
+            self._forget_tab(k)
+
+    def _window_page(self, key: str) -> Any:
+        """The active tab of the window of `key` when its page is alive (None otherwise). A closed tab is dropped from the window; when it
+        was the active one, the window goes on in the tab that is active now, and the agent is told which."""
+        win = self._windows.get(key)
+        if win is None:
+            return None
+        for tab in list(win.tabs):
+            if tab.page.is_closed():
+                self._drop_tab(key, tab.page)
+        active = win.active_tab()
+        if active is None:
+            return None
+        self._pages[key] = active.page
+        return active.page
+
+    def _drop_tab(self, key: str, page: Any) -> None:
+        """A tab's page closed: it leaves its window; when that was the active tab, the next one is active and the agent is told."""
+        win = self._windows.get(key)
+        if win is None:
+            return
+        tab = win.find(page)
+        if tab is None:
+            return
+        was_active = win.active == tab.id
+        win.remove(page)
+        self._journal_tab(key, "tab_closed", tab)
+        if was_active:
+            nxt = win.active_tab()
+            if nxt is not None:
+                self._pages[key] = nxt.page
+                self._notes.setdefault(key, []).append(TAB_CLOSED_NOTE.format(id=nxt.id, title=str(nxt.page.url or "")[:200]))
+            else:
+                self._pages.pop(key, None)
+
+    def _on_context_page(self, page: Any) -> None:
+        """A page of the owner's browser that Kelo did not make (Ctrl+T, Ctrl+N, a link that opens a window of its own). A window opened by a
+        tab of a task is that tab's pop-up (_on_popup); any other page is a tab of the window the owner holds, or closed."""
+        if self._creating:
+            return
+        asyncio.ensure_future(self._adopt_owner_page(page))
+
+    async def _adopt_owner_page(self, page: Any) -> None:
+        try:
+            opener = await page.opener()
+        except Exception:  # noqa: BLE001 - no opener known: treated as a page of its own
+            opener = None
+        if opener is not None and any(win.find(opener) is not None for win in self._windows.values()):
+            return   # a pop-up of a task's tab: _on_popup made it a tab already
+        held = [k for k in self._windows if self._control.get(k) and any(t.page.context is page.context for t in self._windows[k].tabs)]
+        if len(held) != 1:
+            await self._quietly(page.close)   # nobody holds this window: a page nobody asked for is closed
+            return
+        key = held[0]
+        win = self._windows[key]
+        tab = win.add(page)                    # not activated: the owner switches with the tab chips or the page does
+        self._journal_tab(key, "tab_opened", tab)
+        await self._adopt(key, page)
+
+    def _journal_tab(self, key: str, kind: str, tab: Any) -> None:
+        """While the owner holds the window, what they did with its tabs goes to the takeover journal (C1d; host only)."""
+        if self.journal is not None and key in getattr(self.journal, "open", {}):
+            try:
+                self.journal.tab_event(key, kind, tab.id, str(getattr(tab.page, "url", "") or ""))
+            except Exception:  # noqa: BLE001 - the journal never breaks a tab
+                pass
+
+    async def _activate(self, key: str, tab_id: str) -> Any:
+        """Makes one tab of the window the active one: its DevTools sessions and target move with it, and the live listeners hear of it."""
+        win = self._windows[key]
+        cur = win.active_tab()
+        if cur is not None:
+            cur.tab_cdp = self._tab_cdp.pop(key, None)
+            cur.target = self._targets.pop(key, None)
+        tab = win.activate(tab_id)
+        self._pages[key] = tab.page
+        self._journal_tab(key, "tab_switched", tab)
+        if tab.tab_cdp is not None:
+            self._tab_cdp[key] = tab.tab_cdp
+        if tab.target is not None:
+            self._targets[key] = tab.target
+        for fn in list(self.active_listeners):
+            try:
+                await fn(key)
+            except Exception:  # noqa: BLE001 - a listener never breaks switching tabs
+                log.info("a tab-switch listener failed")
+        return tab.page
+
+    async def window_tabs(self, key: str) -> list[dict[str, Any]]:
+        """The tabs of this task's window with their addresses and titles (browser_tabs list)."""
+        win = self._windows.get(key)
+        if win is None:
+            return []
+        out = []
+        for row in win.listing():
+            tab = win.get(row["id"])
+            try:
+                title = str(await tab.page.title())[:200] if tab is not None and not tab.page.is_closed() else ""
+            except Exception:  # noqa: BLE001 - a tab that went away meanwhile
+                title = ""
+            out.append({**row, "title": title})
+        return out
+
+    async def switch_tab(self, key: str, tab_id: str) -> Any:
+        """Makes another tab of this task's window the one the task reads and acts in (browser_tabs switch)."""
+        win = self._windows.get(key)
+        if win is None or win.get(tab_id) is None:
+            raise BrowserPolicyError("no such tab in this window")
+        page = await self._activate(key, tab_id)
+        self._used[key] = self.clock()
+        return page
+
+    async def new_tab(self, key: str) -> Any:
+        """A new empty tab in this task's window, made the active one (browser_tabs new). A work, private or named-profile window is its
+        context, so the tab is a page of that context; a main-browser window is not offered (see the note below)."""
+        win = self._windows.get(key)
+        if win is None or win.active_tab() is None:
+            raise BrowserPolicyError("this task has no window yet: open a page first")
+        cur = win.active_tab().page
+        if self.work is not None and work_tab(key) or key in self._private or key in self._profile_ctx:
+            self._creating += 1
+            try:
+                page = await cur.context.new_page()
+            finally:
+                self._creating -= 1
+        else:
+            # live check (test_work_seed_live.py, C1c): Chrome opens such a tab in a new window, not in this task's: not offered here
+            raise BrowserPolicyError("a new tab in this window is not offered in the owner's browser; the task's own windows (its jobs) have it")
+        new = win.add(page)
+        self._watch(page, key)
+        await self._activate(key, new.id)
+        return page
+
+    async def close_window_tab(self, key: str, tab_id: str) -> None:
+        """Closes one tab of this task's window (browser_tabs close). The last tab of a window goes with the task, not here."""
+        win = self._windows.get(key)
+        tab = win.get(tab_id) if win is not None else None
+        if tab is None:
+            raise BrowserPolicyError("no such tab in this window")
+        if len(win.tabs) <= 1:
+            raise BrowserPolicyError("the last tab closes with the task")
+        was_active = win.active == tab.id
+        if was_active:
+            nxt = next(t for t in win.tabs if t is not tab)
+            await self._activate(key, nxt.id)
+        page = tab.page
+        self._drop_tab(key, page)                       # out of the window first: the close event then finds nothing to do
+        win.remove(page)
+        await self._quietly(page.close)
+
+    async def _new_window(self, ctx: Any) -> Any:
+        """A page in a Chrome window of its own (a task never shares a window with another task). Falls back to a tab of the context
+        when the browser cannot be told to open a window."""
+        try:
+            bcdp = await self._browser_cdp()
+            async with ctx.expect_page() as got:
+                await bcdp.send("Target.createTarget", {"url": "about:blank", "newWindow": True})
+            return await got.value
+        except Exception:  # noqa: BLE001 - a browser that does not do windows: a tab of the context (no window of its own)
+            return await ctx.new_page()
+
+    async def _browser_cdp(self) -> Any:
+        """The browser-wide DevTools session of the main browser (kept)."""
+        if getattr(self, "_bcdp", None) is None:
+            self._bcdp = await self._browser.new_browser_cdp_session()
+        return self._bcdp
 
     def _on_popup(self, key: str, opener: Any, popup: Any) -> None:
-        """A page of this tab opened a window: the tab goes on in it (the user's live view follows), in the tab's view."""
-        if self._pages.get(key) is not opener:
-            return   # a window opened by a page the tab already left
-        mobile = key in self._view_cdp
-        if mobile and self._first_phone:   # its first request went out as a phone (_phone_windows)
-            self._phone_asked.add(popup)
-        self._first_phone = False
-        self._openers.setdefault(key, []).append((opener, self._view_cdp.pop(key, None), self._tab_cdp.pop(key, None)))
-        del self._openers[key][:-5]
+        """A page of this tab opened a window: it becomes a tab of the task's window, and the active one (the user's live view follows).
+        A window opened by a page the tab already left is not the tab's."""
+        if self._pages.get(key) is not opener or key not in self._windows:
+            return
+        win = self._windows[key]
+        parent = win.find(opener)
+        cur = win.active_tab()
+        if cur is not None:
+            cur.tab_cdp = self._tab_cdp.pop(key, None)
+            cur.target = self._targets.pop(key, None)
+        new = win.add(popup, opener=parent.id if parent is not None else "")
+        win.activate(new.id)
         self._pages[key] = popup
-        self._popup_setup[key] = asyncio.ensure_future(self._adopt(key, popup, mobile))
+        self._journal_tab(key, "tab_opened", new)
+        self._popup_setup[key] = asyncio.ensure_future(self._adopt(key, popup))
 
-    async def _adopt(self, key: str, popup: Any, mobile: bool) -> None:
-        """Set up a window the tab moved into like a tab of its own: pop-ups answered, time zone and downloads, and the phone view
-        when the tab was in it (the window's first load was made before it could be set: it is loaded again in that view)."""
+    async def _adopt(self, key: str, popup: Any) -> None:
+        """Set up a window the tab moved into like a tab of its own: pop-ups answered, time zone and downloads."""
         self._watch(popup, key)
         if self.prepare_pages:
             try:
                 await self._prepare(popup, key)
             except Exception:  # noqa: BLE001 - the window works without them
                 pass
-        if not mobile:
-            return
-        try:
-            cdp = await self.cdp_session(popup)
-            self._mobile_id[key] = await self._phone(cdp, popup)
-            self._view_cdp[key] = cdp
-            self._phone_ready.add(popup)
-            try:
-                await popup.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
-            except Exception:  # noqa: BLE001
-                pass
-            # its first request already asked as a phone (_phone_windows): no second load (a form's window is never sent twice);
-            # otherwise it is loaded again in the phone view
-            if popup not in self._phone_asked and str(popup.url or "").startswith(("http://", "https://")):
-                await popup.reload(wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        except Exception:  # noqa: BLE001 - it stays in the desktop view
-            pass
 
     async def _ensure_browser(self) -> None:
         """Connect to the browser container (first use, or after it restarted). Everything tied to the old connection is forgotten."""
@@ -1571,14 +2362,79 @@ class BrowserSession:
         if self._pw is None:
             self._pw = await async_playwright().start()
         if self._ctx is None or not self._browser.is_connected():
+            # a connection that dropped (the browser restarted or crashed): its tabs' pages are gone; each tab's next step says so
+            if self._browser is not None:
+                self._lost.update({key: str(getattr(p, "url", "") or "") for key, p in self._pages.items()
+                                   if key not in self._private and not p.is_closed()})
             # Chrome's DevTools HTTP endpoint rejects Host headers that are not an IP or localhost.
             ip = (await asyncio.to_thread(socket.gethostbyname, self.cdp_host))
             self._browser = await self._pw.chromium.connect_over_cdp(f"http://{ip}:{self.cdp_port}")
             self._ctx = self._browser.contexts[0] if self._browser.contexts else await self._browser.new_context()
-            self._pages.clear()
-            for d in (self._private, self._tab_cdp, self._type_cdp, self._targets, self._doc, self._ref_words, self._look_url, self._shot_scale):
-                d.clear()
+            self._ctx.on("page", self._on_context_page)   # a page the owner opens by hand (C1d)
+            self._forget_main_tabs()
             self._dl_cdp, self._dl_contexts = None, set()
+            self._child_locales.clear()
+            await self._start_children(ip)
+
+    async def _start_children(self, ip: str) -> None:
+        """The frames and workers of the main browser's tabs (child_targets.py): one DevTools connection, started with the
+        connection. Without it their language is the browser's own; that is logged, not raised."""
+        old, self._children = self._children, None
+        self._children = await self._open_children(ip, self.cdp_port, old, "main")
+
+    async def work_connected(self, host: str, port: int) -> None:
+        """The work browser (re)connected: its frames and workers get the same treatment, over its own connection."""
+        ip = await asyncio.to_thread(socket.gethostbyname, host)
+        old, self._work_children = self._work_children, None
+        self._work_children = await self._open_children(ip, port, old, "work")
+
+    async def _open_children(self, ip: str, port: int, old: ChildTargets | None, which: str) -> ChildTargets | None:
+        if old is not None:
+            await old.close()
+        try:
+            import websockets
+            info = json.loads(await asyncio.to_thread(_devtools_version, ip, port))
+            url = re.sub(r"^wss?://[^/]+", f"ws://{ip}:{port}", str(info["webSocketDebuggerUrl"]))
+            children = ChildTargets(await websockets.connect(url, max_size=None, ping_interval=None), self._child_locale)
+            await children.start()
+            return children
+        except Exception as e:  # noqa: BLE001 - the tab's main frame is still covered
+            log.warning("the frames and workers of the %s browser are not covered: %s", which, type(e).__name__)
+            return None
+
+    def _child_locale(self, info: dict[str, Any], parent: str) -> str:
+        """The locale of a frame or a worker of a desktop tab: its tab's (the user's own language; "" = the browser's). A shared or
+        service worker takes the locale of a desktop tab that shows its site (its page is not known to the browser)."""
+        kind, tid = str(info.get("type") or ""), str(info.get("targetId") or "")
+        if kind in (FRAME_TYPE, "worker"):
+            loc = self._child_locales.get(parent, "") or self._page_locale(parent)
+            if kind == FRAME_TYPE and tid:
+                self._child_locales[tid] = loc
+            return loc
+        if kind in ("shared_worker", "service_worker"):
+            site = _site_of(str(info.get("url") or ""))
+            for key, page in list(self._pages.items()):
+                if site and _site_of(str(getattr(page, "url", "") or "")) == site:
+                    return self._tab_locales.get(key, "")
+        return ""
+
+    def _page_locale(self, target_id: str) -> str:
+        for key, (tid, _) in self._targets.items():
+            if tid and tid == target_id:
+                return self._tab_locales.get(key, "")
+        return ""
+
+
+    @staticmethod
+    async def _desktop_identity(page: Any, accept: str) -> dict[str, Any] | None:
+        """The browser's own User-Agent with the user's language list, and the client hints Google Chrome of this version sends on this
+        machine (browser_identity.identity_for: the stated OS, Linux by default, this CPU's architecture, no model, desktop). The override must carry the metadata:
+        without it Chrome sends no Sec-CH-UA headers any more (measured on Chromium 2026-11-18). None when the version is not known."""
+        ua = str(await page.evaluate("() => navigator.userAgent") or "")
+        m = re.search(r"Chrome/(\d+\.\d+\.\d+\.\d+)", ua)
+        if not m:
+            return None
+        return {"userAgent": ua, "acceptLanguage": accept, "userAgentMetadata": _chrome_override(m.group(1))["userAgentMetadata"]}
 
     async def _prepare(self, page: Any, key: str) -> None:
         """A new tab gets the user's time zone and language (Emulation overrides, kept for the tab's life by its own CDP session), is
@@ -1590,13 +2446,23 @@ class BrowserSession:
             return
         self._tab_cdp[key] = cdp
         tz = (self.timezone() or "").strip()
+        locale = tab_locale(self.user_language(), self.locale)   # the user's own language; the browser's default when none is set
         for method, params in (("Emulation.setTimezoneOverride", {"timezoneId": tz} if tz else None),
-                               ("Emulation.setLocaleOverride", {"locale": self.locale} if self.locale else None)):
+                               ("Emulation.setLocaleOverride", {"locale": locale} if locale else None)):
             if params:
                 try:
                     await cdp.send(method, params)
                 except Exception:  # noqa: BLE001 - an unknown zone name: the browser's own stays
                     pass
+        self._tab_locales[key] = locale   # the frames and workers of this tab keep its language (_child_locale)
+        accept = accept_language(locale)
+        if accept:   # the user's Accept-Language (and navigator.languages) with the browser's own User-Agent and client hints
+            try:
+                ident = await self._desktop_identity(page, accept)
+                if ident is not None:
+                    await cdp.send("Emulation.setUserAgentOverride", ident)
+            except Exception:  # noqa: BLE001 - the browser's own list stays
+                pass
         # a tab the agent works in is often not the one in front (the user's live view, another phone's tab): pages that pause in a
         # hidden or unfocused tab (timers, animations, "you left the page" checks) keep working as in a tab in front
         for method, params in (("Page.setWebLifecycleState", {"state": "active"}),
@@ -1610,6 +2476,8 @@ class BrowserSession:
             self._targets[key] = (str(info.get("targetId") or ""), str(info.get("browserContextId") or ""))
         except Exception:  # noqa: BLE001
             pass
+        if self.book is not None and key not in self._private and self._targets.get(key, ("", ""))[0]:
+            self.book.save(key, self._targets[key][0], str(getattr(page, "url", "") or ""))
         await self._route_downloads(key)
 
     # ------------------------------------------------------------------ downloads (downloads.py)
@@ -1617,6 +2485,9 @@ class BrowserSession:
         if self.downloads is None:
             return
         _, context = self._targets.get(key, ("", ""))
+        if self.work is not None and work_tab(key):
+            await self._route_work_downloads(key, context)
+            return
         if context and context in self._dl_contexts:
             return
         try:
@@ -1633,6 +2504,21 @@ class BrowserSession:
             await self._dl_cdp.send("Browser.setDownloadBehavior", params)
             self._dl_contexts.add(context)
         except Exception:  # noqa: BLE001 - downloads then stay with the browser's default handling
+            pass
+
+    async def _route_work_downloads(self, key: str, context: str) -> None:
+        """Downloads of a work tab: the work browser's own session, always for the tab's own context (never the default one)."""
+        try:
+            if self._work_dl is None:
+                bs = await self.work.browser_cdp()
+                bs.on("Browser.downloadWillBegin", self._download_began)
+                bs.on("Browser.downloadProgress", self._download_moved)
+                self._work_dl = bs
+            params: dict[str, Any] = {"behavior": "allowAndName", "downloadPath": self.downloads.browser_dir, "eventsEnabled": True}
+            if context:
+                params["browserContextId"] = context
+            await self._work_dl.send("Browser.setDownloadBehavior", params)
+        except Exception:  # noqa: BLE001 - downloads then stay with the work browser's default handling
             pass
 
     def _tab_of_frame(self, frame_id: str) -> str:
@@ -1656,37 +2542,69 @@ class BrowserSession:
             asyncio.ensure_future(self._cancel_download(d))
 
     async def _cancel_download(self, d: Any) -> None:
+        work = self.work is not None and work_tab(d.key)
         params: dict[str, Any] = {"guid": d.guid}
-        if d.context and d.key in self._private:
+        if d.context and (work or d.key in self._private):
             params["browserContextId"] = d.context
         try:
-            await self._dl_cdp.send("Browser.cancelDownload", params)
+            await (self._work_dl if work else self._dl_cdp).send("Browser.cancelDownload", params)
         except Exception:  # noqa: BLE001 - it finished or went away meanwhile
             pass
 
     def _watch(self, page: Any, key: str) -> None:
-        """A JavaScript pop-up (alert / confirm) is answered here: accepted only inside a purchase the user allowed on that site,
-        dismissed otherwise (what the browser would do with nobody there). Its words go into the next page reading."""
+        """A page's own pop-up (alert, confirm, prompt, leaving the page) is answered here (page_dialogs.answer_for: OK only for the
+        user or what they allowed) and kept for the next page reading (dialog_note) and the live view (page_dialog)."""
         if not hasattr(page, "on"):
             return
 
+        def on_crash(*_args: Any) -> None:   # the page's renderer crashed: the tab's next step reads a new blank page (BROWSER_LOST_NOTE)
+            if self._pages.get(key) is page:
+                self._pages.pop(key, None)
+                self._lost[key] = str(getattr(page, "url", "") or "")
+                self._told_lost(key)
+
+        try:
+            page.on("crash", on_crash)
+        except Exception:  # noqa: BLE001 - a page object without the event works as before
+            pass
+
+        def on_closed(*_args: Any) -> None:   # a tab's page closed (the site closed its window, or the owner did): it leaves the window
+            if key in self._windows and self._windows[key].find(page) is not None:
+                self._drop_tab(key, page)
+
+        try:
+            page.on("close", on_closed)
+        except Exception:  # noqa: BLE001 - a page object without the event works as before
+            pass
+
+        def on_navigated(frame: Any) -> None:   # card A3: the main frame of a work tab went to a site (noted for the write-back)
+            if work_tab(key) and self.work is not None and getattr(frame, "parent_frame", True) is None:
+                host = (urlsplit(str(getattr(frame, "url", "") or "")).hostname or "").lower()
+                if host:
+                    self.work.note_touched(key, registrable(host))
+
+        if work_tab(key):
+            try:
+                page.on("framenavigated", on_navigated)
+            except Exception:  # noqa: BLE001
+                pass
+
         async def on_dialog(dialog: Any) -> None:
-            host = (urlsplit(str(getattr(page, "url", "") or "")).hostname or "").lower()
+            url = str(getattr(page, "url", "") or "")
+            host = (urlsplit(url).hostname or "").lower()
+            kind = str(getattr(dialog, "type", "") or "")
+            message = str(getattr(dialog, "message", "") or "")
             token = browser_owner.set(key)
             try:
                 by_user = key in self._control   # the user is at the controls: a pop-up their tap caused is theirs to accept
-                accept = by_user or self.purchase_active(host) or self.cancel_active(host)
-                in_order = not accept and self.order_dialog is not None and self.order_dialog(key, host, str(getattr(dialog, "message", "") or ""))
-                accept = accept or in_order
+                in_purchase = self.purchase_active(host) or self.cancel_active(host)
+                in_order = not by_user and not in_purchase and self.order_dialog is not None and self.order_dialog(key, host, message)
             finally:
                 browser_owner.reset(token)
-            msgs = self._dialogs.setdefault(key, [])
-            how = ("accepted (the user was controlling the browser)" if by_user else "accepted (a step of the order the user asked for)"
-                   if in_order else "accepted (inside the purchase the user allowed)" if accept else "dismissed")
-            msgs.append(f"{str(getattr(dialog, 'message', '') or '')[:300]!r} -> {how}")
-            del msgs[:-5]
+            answer, _why = answer_for(kind, by_user=by_user, in_purchase=in_purchase, in_order=bool(in_order))
+            self._tab_dialogs(key).add(kind, message[:300], answer, _why, url, time.time())
             try:
-                await (dialog.accept() if accept else dialog.dismiss())
+                await (dialog.accept() if answer == "ok" else dialog.dismiss())
             except Exception:  # noqa: BLE001 - the pop-up may already be gone
                 pass
 
@@ -1762,6 +2680,20 @@ class BrowserSession:
         return "\n".join(lines)
 
     async def snapshot(self, *, handing: bool = True, clear: bool = False, changes: bool = False, only_controls: bool = False) -> str:
+        """The page as text for the agent (see _snapshot); with a task window of more than one tab, its first line says which tab this is."""
+        text = await self._snapshot(handing=handing, clear=clear, changes=changes, only_controls=only_controls)
+        win = self._windows.get(browser_owner.get())
+        if win is None or len(win.tabs) < 2 or win.active_tab() is None:
+            return text
+        active = win.active_tab()
+        title = ""
+        try:
+            title = str(await active.page.title())[:120]
+        except Exception:  # noqa: BLE001 - the header still names the tab
+            pass
+        return f"[tab {active.id} of {len(win.tabs)}: {title}]\n" + text
+
+    async def _snapshot(self, *, handing: bool = True, clear: bool = False, changes: bool = False, only_controls: bool = False) -> str:
         """The page as text for the agent. A human check on it: the agent may first try it itself (`check_tries` readings that still
         show it, `try_note`); then it is handed to the user (when the app set `handover` for this turn and `handing`): the step waits
         until it is solved, skipped or runs out, and the note says which.
@@ -1772,7 +2704,6 @@ class BrowserSession:
         The page is shown as its accessibility tree with refs (`button "Go" [ref=e5]`; `only_controls`: only what can be clicked or
         typed into, plus headings); when that cannot be read, as its plain text with the frames' text after it."""
         page = await self.page()
-        await self.keep_view(browser_owner.get())
         layers = await self._layers(page, browser_owner.get(), close=clear)
         try:
             title = await asyncio.wait_for(page.title(), CDP_SECONDS)
@@ -1785,19 +2716,28 @@ class BrowserSession:
             cut = f"\n[page text truncated, {len(text) - MAX_TEXT_CHARS} more chars]"
             text = text[:MAX_TEXT_CHARS]
         key = browser_owner.get()
-        popups = self._dialogs.pop(key, [])
+        popups = self._dialogs[key].take() if key in self._dialogs else []
         # the page's own words (title, text, pop-ups) are marked as external data: the loop fences them, and keeps these lines of
         # ours (address, notes, hand-over) outside (agent/fence.py)
-        said = "".join(f"[the page showed a pop-up: {data(m)}]\n" for m in popups)
+        said = "".join(dialog_note(d, site=_site_of(d.url), login=self.login_for(_site_of(d.url)) if d.answer == "cancel" else "",
+                                   job=self._is_job()) + "\n" for d in popups)
         said += "".join(f"{n}\n" for n in self._notes.pop(key, []))
+        self._owner_moved.discard(key)
+        self._lost_act.discard(key)
         said += "".join(f"{n}\n" for n in layers)
         if spots := masked_values(text):
             said += masked_note(spots, data) + "\n"
         said += await self._lists_note(page)
+        said += self._seed_note(key, str(getattr(page, "url", "") or ""))
         check, otp = await self._look(page, key)
         if check is None and (why := self._denied(key, page, title, text)):
             host = urlsplit(str(page.url or "")).hostname or ""
-            said += blocked_note(host, why, count=self._blocks(host)) + "\n" + (blocked_again_note(host) + "\n" if self._blocks(host) >= self._block_limit() else "")
+            site = _site_of(str(page.url or ""))
+            if site in self._pass_opened:   # the site is not signed in: the next step is the sign-in (brief B2)
+                self._pass_opened.discard(site)
+                said += signed_out_note(host, self.login_for(site), job=self._is_job(), minutes=SIGN_IN_PASS_SECONDS // 60) + "\n"
+            else:
+                said += blocked_note(host, why, count=self._blocks(host)) + "\n" + (blocked_again_note(host) + "\n" if self._blocks(host) >= self._block_limit() else "")
         if check is not None:
             host = urlsplit(str(page.url or "")).hostname or ""
             left = self._try_left(key, host) if handing else 0
@@ -1891,7 +2831,7 @@ class BrowserSession:
         if key in self._tries or key in self._checks or not hasattr(page, "evaluate"):
             return []   # a human check is on this tab: never touch it
         url = str(getattr(page, "url", "") or "").split("#")[0]
-        if self.in_checkout() or money_page(None, url):
+        if self.in_checkout():
             return []   # a payment or booking window is never closed for the user
         if self._own_layers.get(key, ("", set()))[0] != url:
             self._own_layers[key] = (url, set())
@@ -1917,7 +2857,7 @@ class BrowserSession:
             still = {signature(f) for f in found}
             notes = [open_note(f, data, tried=True) if signature(f) in still else closed_note(f, data) for f in shut]
             tried = {signature(f) for f in shut}
-            pick = next((f for f in found if f["close"] is not None and signature(f) not in tried), None)
+            pick = next((f for f in found if f["close"] is not None and "close_at" in f and signature(f) not in tried), None)
             if pick is None and round_ < OVERLAY_ROUNDS:
                 app = next((f for f in found if f.get("app") and signature(f) not in tried), None)
                 if app is not None and await self._dismiss(page, app):   # no control to press: Escape, then the dim area around the sheet
@@ -1928,14 +2868,10 @@ class BrowserSession:
             if pick is None or round_ == OVERLAY_ROUNDS:
                 notes += [open_note(f, data) for f in found if signature(f) not in tried]
                 break
-            sel = f'[data-kelo-close="{pick["close"]}"]'
-            try:
-                await page.click(sel, timeout=OVERLAY_CLICK_MS)
-            except Exception:  # noqa: BLE001 - covered or moving: a plain JavaScript click on the same control
-                try:
-                    await page.evaluate(click_js(pick["close"]))
-                except Exception:  # noqa: BLE001
-                    pass
+            try:   # a person's click at the control's centre: a trusted event, no mark, no JavaScript click
+                await asyncio.wait_for(self._press_at(page, key, pick["close_at"]), OVERLAY_CLICK_MS / 1000)
+            except Exception:  # noqa: BLE001 - covered or moving: the window is read again on the next round
+                pass
             shut.append(pick)
             if self.overlay_pause:
                 await asyncio.sleep(self.overlay_pause)
@@ -1955,7 +2891,50 @@ class BrowserSession:
         host = urlsplit(str(page.url or "")).hostname or ""
         count, _ = self._blocked.get((self._task(), host), (0, 0.0))
         self._blocked[(self._task(), host)] = (count + 1, self.clock())
+        site = _site_of(str(page.url or ""))
+        self._pause_site(site)   # a refusal spends nothing more: the site is not loaded for a while
+        if site in self._sign_in_pass:   # a refusal in the pass ends it
+            self._sign_in_pass.pop(site, None)
+        elif site and not self.signed_in_site(site) and site not in self._sign_in_pass_used:
+            self._sign_in_pass[site] = self.clock() + SIGN_IN_PASS_SECONDS
+            self._sign_in_pass_used.add(site)
+            self._pass_opened.add(site)
         return why
+
+    def end_sign_in_pass(self, site: str) -> None:
+        """A sign-in attempt on the site ended without success: the pass closes and the pause stays."""
+        self._sign_in_pass.pop(_site_of(site) or site, None)
+
+    def _pause_site(self, site: str) -> None:
+        if site:
+            self._refused_until[site] = max(self._refused_until.get(site, 0.0), self.clock() + REFUSAL_PAUSE_SECONDS)
+
+    def pause_note(self, url: str) -> str:
+        """The words for the site of `url` while it is paused after a refusal ("" = it may be loaded)."""
+        site = _site_of(url or "")
+        if not site or site not in self._refused_until:
+            return ""
+        now = self.clock()
+        if self._sign_in_pass.get(site, 0.0) > now:   # a sign-in pass for this site: it may load
+            return ""
+        if self._refused_until[site] <= now:
+            self._refused_until.pop(site, None)
+            return ""
+        return REFUSAL_PAUSE_NOTE.format(site=site, minutes=max(1, math.ceil((self._refused_until[site] - now) / 60)))
+
+    def refusal_pauses(self) -> list[dict[str, Any]]:
+        """The sites paused after a refusal, with the minutes left (the owner's list; expired pauses are dropped)."""
+        now = self.clock()
+        for site in [s for s, until in self._refused_until.items() if until <= now]:
+            self._refused_until.pop(site, None)
+        return [{"site": s, "minutes_left": max(1, math.ceil((until - now) / 60))} for s, until in self._refused_until.items()]
+
+    def clear_pause(self, site: str) -> bool:
+        """The owner clears a site's pause: the browser may load it again at once. False when it was not paused."""
+        key = _site_of(site) or site
+        self._sign_in_pass.pop(key, None)
+        self._sign_in_pass_used.discard(key)
+        return self._refused_until.pop(key, None) is not None
 
     def _blocks(self, host: str) -> int:
         """Access-denied answers of `host` in this task within the last BLOCK_SECONDS."""
@@ -1975,6 +2954,8 @@ class BrowserSession:
 
     def blocked_site(self, url: str) -> str:
         """The words for the agent when `url`'s host has already blocked it BLOCK_LIMIT times in this task ("" = go ahead)."""
+        if (paused := self.pause_note(url)):
+            return paused
         host = urlsplit(url or "").hostname or ""
         return blocked_again_note(host) if host and self._blocks(host) >= self._block_limit() else ""
 
@@ -2000,10 +2981,27 @@ class BrowserSession:
             pass
         return False
 
+    def _look_pause(self, *, glance: bool) -> Callable[[Any], Awaitable[Any]]:
+        """The pause after a step: a person's look at the page (mouse drift)."""
+        return human.glance if glance else human.dwell
+
+    async def _press_at(self, page: Any, key: str, at: list[float]) -> None:
+        """One press at a point of the page's viewport (CSS px), with the mouse, like a person's."""
+        await human.click_at(page, float(at[0]), float(at[1]))
+
+    async def _bring_into_view(self, page: Any, owner: Any, selector: str, key: str) -> None:
+        """Scroll the element into view as a person does, before the covered check and the step (addendum 8): the mouse wheel
+        (humanize.bring_into_view). A failure leaves the page as it is: the step then tries as before."""
+        try:
+            await human.bring_into_view(owner, owner.locator(selector).first, 10_000)
+        except Exception:  # noqa: BLE001 - the step tries as before
+            log.debug("could not bring the element into view", exc_info=True)
+
     async def _covered(self, page: Any, owner: Any, selector: str, key: str) -> str:
         """Before a click or typing step: "" when the element can be hit, else the words of the layer that covers it once the
         layer could not be closed (a window over the page: the step would only wait for a timeout). A covering layer is closed first
         (page_notes.OVERLAY_JS, once) and the element looked at again."""
+        await self._bring_into_view(page, owner, selector, key)
         async def hit() -> bool:   # True = something else is on top of the element's centre
             try:
                 return bool(await asyncio.wait_for(owner.locator(selector).first.evaluate(COVERED_JS), CDP_SECONDS))
@@ -2132,6 +3130,8 @@ class BrowserSession:
         """(JPEG, width, height, how many controls carry a label). The boxes come from the accessibility tree with boxes (viewport
         CSS px; an element in a frame is moved by where that frame sits). The labels are drawn into the page only for the picture and
         always taken out again. Remembers the picture's scale and the page address for browser_click_at / browser_drag."""
+        self._owner_moved.discard(browser_owner.get())   # the page is read now: what the owner changed by hand is seen (hold_to_act)
+        self._lost_act.discard(browser_owner.get())
         page = await self.page()
         key = browser_owner.get()
         await self._guard(page.url)
@@ -2161,15 +3161,18 @@ class BrowserSession:
                 boxes.append({"ref": ref, "x": round(x, 1), "y": round(y, 1), "w": round(b[2], 1), "h": round(b[3], 1)})
                 if len(boxes) >= LOOK_MAX_LABELS:
                     break
+        host = None
         try:
             if boxes:
                 try:
-                    await page.evaluate(LOOK_OVERLAY_JS, boxes)
+                    host = await page.evaluate_handle(LOOK_OVERLAY_JS, boxes)
                 except Exception:  # noqa: BLE001 - a page that refuses it: the picture without labels
                     boxes = []
             jpeg, w, h = await self.screenshot(key, LOOK_WIDTH, LOOK_BYTES)
         finally:
-            await self._quietly(lambda: page.evaluate(LOOK_CLEAR_JS))
+            if host is not None:
+                await self._quietly(lambda: host.evaluate("(e) => e.remove()"))
+                await self._quietly(host.dispose)
         if not jpeg or not w:
             return None, 0, 0, 0
         vw_css = await _viewport_width(page)
@@ -2214,45 +3217,11 @@ class BrowserSession:
             except asyncio.TimeoutError:
                 pass
 
-    def sign_in_continue(self, selector: str) -> bool:
-        """The click only goes on with the owner's own sign-in on this tab: browser_login ran here a short while ago, the page is
-        still a sign-in step (signin_state.still_signing_in) on the same site as that sign-in (its OAuth pages too: the same
-        registrable domain), and the element's words, as read on the page, only go on ("Continue", "Next", "OK", "Sign in"). Consent
-        ("Allow", "Agree"), sign-up and settings words are not this and keep their card (2026-11-10)."""
-        key = browser_owner.get()
-        info = self.judged_info(selector)
-        probe = self._probes.get(key)
-        if info is None or not self._signing_in(key) or not (isinstance(probe, dict) and probe.get("kelo_check")):
-            return False
-        site = str((self.sign_ins.get(key) or {}).get("site") or "")
-        if not site or registrable(self.current_host()) != site or not still_signing_in(probe):
-            return False
-        if str(info.get("type") or "").lower() == "checkbox" or str(info.get("role") or "") in ("checkbox", "switch") \
-                or selector in self._options.get(key, ()):
-            return True   # ticking a box of the sign-in page sends nothing ("stay signed in", "don't ask again on this browser")
-        return continue_only(label_of(info, selector))
-
-    def sign_in_remember(self, selector: str) -> bool:
-        """The click keeps the owner signed in on Kelo's own browser: browser_login ran on this tab a short while ago, the page is on the
-        same site as that sign-in, its reading is from Kelo's check and asks whether to remember this device or stay signed in (a
-        device-registration page may sit on a non-login path, so it need not still look like a sign-in), and the element's words
-        choose to keep it (commits.keep_signed_in). The negative choice is not this: it keeps today's rules (2026-11-15)."""
-        key = browser_owner.get()
-        info = self.judged_info(selector)
-        probe = self._probes.get(key)
-        if info is None or not self._signing_in(key) or not (isinstance(probe, dict) and probe.get("kelo_check")):
-            return False
-        site = str((self.sign_ins.get(key) or {}).get("site") or "")
-        if not site or registrable(self.current_host()) != site:
-            return False
-        page = f"{probe.get('title') or ''} {probe.get('text') or ''}"
-        return asks_to_keep_signed_in(page) and keep_signed_in(label_of(info, selector), page)
-
     def _signing_in(self, key: str) -> bool:
         """The agent started a sign-in on this tab a short while ago (browser_login)."""
         got = self.sign_ins.get(key) or {}
         try:
-            return time.time() - float(got.get("at") or 0) < SIGN_IN_SECONDS
+            return time.time() - max(float(got.get("at") or 0), self._login_at.get(key, 0.0)) < SIGN_IN_SECONDS
         except (TypeError, ValueError):
             return False
 
@@ -2294,7 +3263,7 @@ class BrowserSession:
         if options and not task.done():
             self._pending_hand[key] = (task, v, url, host, site, started)
             self._verified[key] = (url, "asked")
-            return options_note(v, host, "\n".join(f"- {sel}: {data(label)}" for sel, label in options)), False
+            return options_note(v, host, "\n".join(f"- `{sel}`: {data(label)}" for sel, label in options)), False
         return await self._finish_hand(key, task, v, url, host, site, started)
 
     async def _finish_hand(self, key: str, task: Any, v: Verification, url: str, host: str, site: str,
@@ -2310,7 +3279,7 @@ class BrowserSession:
         page = self.raw_page(key)
         if outcome == "done" and page is not None:   # the user said it is done (an older app's button): believed only past signing in
             _found, probe = await self._read_check(page, key)
-            if still_signing_in(probe):
+            if still_signing_in(probe, self._login_url.get(key, "")):
                 outcome = "pending"
         if outcome in ("solved", "done", "progressed"):
             self._hand_end[key] = (site, v.step, time.monotonic())
@@ -2338,6 +3307,7 @@ class BrowserSession:
                 probe = await page.evaluate(PROBE_JS)
             except Exception:  # noqa: BLE001 - the page is changing
                 continue
+            await self.judge_probe(probe, True)
             now = verification_step(probe, signing_in=True)
             if isinstance(probe, dict) and probe.get("kelo_check") and (now is None or now.step != v.step):
                 return True
@@ -2350,10 +3320,49 @@ class BrowserSession:
             got = await page.evaluate(OPTIONS_JS)
         except Exception:  # noqa: BLE001 - a page that is changing: no options this time
             return []
-        found = [(f'[data-kelo-opt="{o["id"]}"]', " ".join(str(o.get("label") or "").split())[:120]) for o in (got or [])[:8]
-                 if isinstance(o, dict) and o.get("id")]
+        found = [(str(o["path"]), " ".join(str(o.get("label") or "").split())[:120]) for o in (got or [])[:8]
+                 if isinstance(o, dict) and o.get("path")]
         self._options[browser_owner.get()] = {sel for sel, _ in found}
         return found
+
+    async def sign_in_links(self, hosts: list[str]) -> list[str]:
+        """The words of up to 3 visible links of the open page that go to one of `hosts` (a saved login's own hosts) on another host than
+        the page's (SIGN_IN_LINKS_JS). [] on any error."""
+        try:
+            got = await (await self.page()).evaluate(SIGN_IN_LINKS_JS, [h.lower() for h in hosts if not h.startswith("app:")])
+        except Exception:  # noqa: BLE001
+            return []
+        return [str(w) for w in (got or []) if isinstance(w, str) and w][:3]
+
+    async def open_sign_in(self, via: str) -> str:
+        """browser_login's own click on the site's sign-in link or button `via` (a ref or selector of the open page), made like any click
+        of the agent (pacing, a window it opens becomes the tab's page); the click's reading. Only an element that just opens something
+        (judged "" like a link): anything that may change something is refused, so the approval rules of browser_click stay whole.
+        BrowserPolicyError when `via` is not on the page or is such a step: nothing is clicked."""
+        page = await self.page()
+        try:
+            owner = await self.frame_for(page, via)
+            n = await owner.locator(ref_selector(via)).count()
+        except Exception:  # noqa: BLE001
+            n = 0
+        if n == 0:
+            raise BrowserPolicyError(f"{via} is not on this page: read the page again and pass the ref of the site's sign-in link or "
+                                     "button from that reading; nothing was clicked or typed")
+        if kind := await self.judge("browser_click", {"selector": via}):
+            raise BrowserPolicyError(f"{via} may change something ({kind}), so browser_login does not click it: click it with browser_click "
+                                     "(it asks as usual), then call browser_login on the page with the form; nothing was typed")
+        return await self.click(via)
+
+    def wait_keep_choice(self, name: str) -> None:
+        """browser_login listed the form's options for login `name`: its next call with `keep` is part of the same sign-in (S6)."""
+        self._keep_choice[name] = time.monotonic()
+
+    def keep_choice_open(self, name: str) -> bool:
+        at = self._keep_choice.get(name)
+        return at is not None and time.monotonic() - at < KEEP_CHOICE_SECONDS
+
+    def end_keep_choice(self, name: str) -> None:
+        self._keep_choice.pop(name, None)
 
     async def wait_verification_gone(self, key: str, url: str, step: Verification) -> bool | str:
         """How the sign-in verification `step`, handed to the user, ended on this tab (nobody holding the tab):
@@ -2380,9 +3389,10 @@ class BrowserSession:
             if not (isinstance(probe, dict) and probe.get("kelo_check")):
                 clean = 0
             else:
+                await self.judge_probe(probe, True)
                 now = verification_step(probe, signing_in=True)
                 same = now is not None and now.step == step.step
-                signed = not same and not still_signing_in(probe)
+                signed = not same and not still_signing_in(probe, self._login_url.get(key, ""))
                 clean = clean + 1 if signed else 0
                 away = 0 if same else away + 1
                 if same:
@@ -2432,9 +3442,26 @@ class BrowserSession:
             frame_urls = []
         return detect(probe, status=status, headers=headers, frame_urls=frame_urls), probe
 
+    def password_box_shown(self, key: str) -> bool | None:
+        """Whether the page of tab `key`, as last read, shows a password box (the structure of a sign-in form); None when it was not read."""
+        probe = self._probes.get(key)
+        if not isinstance(probe, dict) or not probe.get("kelo_check"):
+            return None
+        return bool(probe.get("secret_box"))
+
+    async def judge_probe(self, probe: Any, signing_in: bool) -> None:
+        """A short page right after a sign-in with no code box: the page judge says whether it is a verification step (code | approve) or
+        none (probe["judged_step"]). No judge or no answer leaves it unset: verification_step then takes the page for one (the safer side)."""
+        if self.page_judge is None or not unconfirmed(probe, signing_in=signing_in):
+            return
+        got = await self.page_judge.verification(probe)
+        if got is not None:
+            probe["judged_step"] = got
+
     async def _look(self, page: Any, key: str) -> tuple[Challenge | None, int]:
         """Read the page's structure once: a bot check (challenge.detect) and how many one-time-code boxes it shows."""
         found, probe = await self._read_check(page, key)
+        await self.judge_probe(probe, self._signing_in(key))
         self._probes[key] = probe
         if found is None:
             self._checks.pop(key, None)
@@ -2536,11 +3563,18 @@ class BrowserSession:
         return {"status": int(got["status"]), "content_type": str(got.get("contentType") or ""), "text": str(got.get("text") or "")[:cap],
                 "headers": {str(k).lower(): str(v) for k, v in dict(got.get("headers") or {}).items()}, "url": final}
 
-    async def open(self, url: str, view: str = "") -> str:
+    async def open(self, url: str) -> str:
         await self._guard(url)
         if said := self.blocked_site(url):
             return said
         page = await self.page()
+        if same_address(str(getattr(page, "url", "") or ""), url):
+            title = ""
+            try:
+                title = str(await page.title())[:120]
+            except Exception:  # noqa: BLE001 - the page has no title to give
+                pass
+            return SAME_PAGE_NOTE.format(url=str(page.url), title=title) + "\n" + await self.snapshot(clear=True)
         host = urlsplit(url).hostname or ""
         if note := self._pace_note(host, "nav", browser_owner.get()):
             return note
@@ -2548,11 +3582,9 @@ class BrowserSession:
         # opening an address starts a new flow: the clicks that finish an allowed purchase are those that follow from its page
         self.end_purchase()
         site = _site_of(url)
-        want = view if view in VIEWS else self._site_views.get(site, "")
-        switched = ""
-        if want and want != self.view():
-            await self.set_view(want)
-            switched = want
+        await self._seed_work_site(browser_owner.get(), site)
+        if self.work is None or not work_tab(browser_owner.get()):
+            self._touch_site(registrable(site))
         try:
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
         except Exception as e:
@@ -2560,136 +3592,29 @@ class BrowserSession:
                 raise BrowserPolicyError(note) from None
             raise
         status = getattr(resp, "status", None)
-        if view in VIEWS and (status is None or status < 400):
-            self.remember_view(site, view)
+        self._note_opened(browser_owner.get(), url)
         try:  # a redirect may have landed somewhere we would not have allowed directly
             await self._guard(page.url)
         except BrowserPolicyError:
             await page.goto("about:blank")
             raise
         await self._settle(page)
-        await self._human_pause(page, human.dwell)
+        await self._human_pause(page, self._look_pause(glance=False))
         self._own_layers.pop(browser_owner.get(), None)   # opened (again): its windows are the site's, not the agent's
         text = await self.snapshot(clear=True)
-        if switched and not view:
-            text = VIEW_REMEMBERED_NOTE.format(view=switched) + "\n" + text
         return f"{not_found_note(status)}\n{text}" if status in (404, 410) else text
 
-    # ------------------------------------------------------------------ desktop or phone view of a tab
-    def view(self, key: str | None = None) -> str:
-        """The view this tab shows sites: "mobile" (a phone's browser) or "desktop"."""
-        return "mobile" if (key or browser_owner.get()) in self._view_cdp else "desktop"
-
-    def remember_view(self, site: str, view: str) -> None:
-        """The view that worked on this site, used again when the agent opens it later (this task and the next ones)."""
-        if not site or view not in VIEWS:
-            return
-        self._site_views.pop(site, None)
-        self._site_views[site] = view
-        while len(self._site_views) > SITE_VIEWS_KEPT:
-            self._site_views.pop(next(iter(self._site_views)))
-
-    async def set_view(self, view: str) -> bool:
-        """Show sites in this tab as a phone's browser ("mobile") or a desktop one ("desktop"), keeping its sign-ins, cookies and
-        storage (the same browser context). The phone view is one DevTools session holding Emulation overrides for the tab: the
-        User-Agent with its client hints (Android, mobile, the same Chrome version and brands), a phone's viewport and pixel ratio,
-        touch. Going back to desktop detaches that session, which drops exactly those overrides (the browser's own identity stays).
-        True when the view changed; the page is not reloaded here."""
-        if view not in VIEWS:
-            raise ValueError(f"view must be one of {', '.join(VIEWS)}")
-        key = browser_owner.get()
-        if view == self.view(key):
-            return False
-        page = await self.page()
-        if view == "desktop":
-            cdp = self._view_cdp.pop(key, None)
-            try:
-                await cdp.send("Emulation.clearDeviceMetricsOverride", {})
-                await cdp.send("Emulation.setTouchEmulationEnabled", {"enabled": False})
-            except Exception:  # noqa: BLE001 - detaching drops them anyway
-                pass
-            try:
-                await cdp.detach()
-            except Exception:  # noqa: BLE001
-                pass
-            return True
-        cdp = await self.cdp_session(page)
-        self._mobile_id[key] = await self._phone(cdp, page)
-        self._view_cdp[key] = cdp
-        return True
-
-    @staticmethod
-    async def _phone(cdp: Any, page: Any) -> dict[str, Any]:
-        """The phone view's Emulation overrides on one page's DevTools session (set_view; a window the tab moved into)."""
-        full = ""
-        try:
-            full = str((await cdp.send("Browser.getVersion", {})).get("product") or "").split("/")[-1]
-        except Exception:  # noqa: BLE001 - read the version from the page instead
-            pass
-        if not full[:1].isdigit():
-            ua = str(await page.evaluate("() => navigator.userAgent"))
-            m = re.search(r"Chrome/([\d.]+)", ua)
-            full = m.group(1) if m else "130.0.0.0"
-        ident = mobile_identity(full)
-        await cdp.send("Emulation.setUserAgentOverride", ident)
-        await cdp.send("Emulation.setDeviceMetricsOverride", dict(PHONE))
-        await cdp.send("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 5})
-        return ident
-
-    async def keep_view(self, key: str) -> None:
-        """The phone view's screen again (a Playwright screenshot of a window-sized page resets the device metrics it finds)."""
-        cdp = self._view_cdp.get(key)
-        if cdp is not None:
-            try:
-                await cdp_send(cdp, "Emulation.setDeviceMetricsOverride", dict(PHONE))
-            except Exception:  # noqa: BLE001 - the page went away: page() starts the next one in the desktop view
-                pass
-
-    async def shoot(self, page: Any, key: str | None = None, *, type: str = "jpeg", quality: int | None = None,
+    async def shoot(self, page: Any, *, type: str = "jpeg", quality: int | None = None,
                     clip: dict[str, float] | None = None, css_scale: bool = False, timeout: int = 5_000) -> bytes:
-        """A picture of the tab's viewport (or `clip` of it). In the phone view it is taken through the view's own DevTools session,
-        so the phone screen stays as it is (Playwright's page.screenshot resets the device metrics of a window-sized page)."""
-        key = browser_owner.get() if key is None else key
-        cdp = self._view_cdp.get(key)
-        if cdp is None:
-            kw: dict[str, Any] = {"type": type, "timeout": timeout}
-            if quality is not None and type == "jpeg":
-                kw["quality"] = quality
-            if clip is not None:
-                kw["clip"] = clip
-            if css_scale:
-                kw["scale"] = "css"
-            return await page.screenshot(**kw)
-        params: dict[str, Any] = {"format": type}
+        """A picture of the tab's viewport (or `clip` of it)."""
+        kw: dict[str, Any] = {"type": type, "timeout": timeout}
         if quality is not None and type == "jpeg":
-            params["quality"] = quality
+            kw["quality"] = quality
         if clip is not None:
-            params["clip"] = {**{k: float(clip[k]) for k in ("x", "y", "width", "height")},
-                              "scale": 1.0 / PHONE["deviceScaleFactor"] if css_scale else 1.0}
-        got = await asyncio.wait_for(cdp.send("Page.captureScreenshot", params), timeout / 1000)
-        return base64.b64decode(got["data"])
-
-    async def switch_view(self, view: str) -> str:
-        """browser_view: switch this tab's view and load the page again in it (same address, same sign-ins)."""
-        changed = await self.set_view(view)
-        page = await self.page()
-        url = str(getattr(page, "url", "") or "")
-        status = None
-        if url.startswith(("http://", "https://")):
-            await self._guard(url)
-            resp = await page.reload(wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-            try:
-                await self._guard(page.url)
-            except BrowserPolicyError:
-                await page.goto("about:blank")
-                raise
-            await self._settle(page)
-            status = getattr(resp, "status", None)
-            if status is None or status < 400:
-                self.remember_view(_site_of(page.url), view)
-        text = await self.snapshot(clear=True)
-        head = VIEW_NOTE.format(view=view) if changed else VIEW_SAME_NOTE.format(view=view)
-        return f"{head}\n{not_found_note(status)}\n{text}" if status in (404, 410) else f"{head}\n{text}"
+            kw["clip"] = clip
+        if css_scale:
+            kw["scale"] = "css"
+        return await page.screenshot(**kw)
 
     @staticmethod
     async def _settle(page: Any) -> None:
@@ -2731,6 +3656,40 @@ class BrowserSession:
         return page
 
     @staticmethod
+    async def _layer_labels(page: Any) -> list[str]:
+        """The windows open over the page now (page_notes.LAYERS_JS); [] when they cannot be read."""
+        try:
+            got = await asyncio.wait_for(page.evaluate(LAYERS_JS), 2.0)
+        except Exception:  # noqa: BLE001 - a page that is changing: no window is claimed
+            return []
+        return [str(x) for x in got] if isinstance(got, list) else []
+
+    async def _offered_elsewhere(self, owner: Any, selector: str, key: str) -> tuple[str, bool] | None:
+        """Before a click: when the element sits in the window this tab's earlier click opened, (that window's label, whether another
+        control of it commits something by the step judge). None otherwise, or when it cannot be read. A judge that cannot answer
+        counts as no commit (the earlier click then stays done)."""
+        opened, page = self._opened_layer.get(key), self._pages.get(key)
+        if opened is None or page is None or str(getattr(page, "url", "") or "").split("#")[0] != opened[0]:
+            return None
+        try:
+            got = await asyncio.wait_for(owner.locator(selector).first.evaluate(LAYER_CHOICES_JS), 2.0)
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(got, dict) or str(got.get("label") or "") != opened[1]:
+            return None
+        for path in [str(p) for p in (got.get("paths") or []) if p][:4]:
+            info = await self.read_target(path)
+            if info is None or click_route(info) == "" or self.step_judge is None:
+                continue
+            try:
+                verdict = await self.step_judge.web(info)
+            except Exception:  # noqa: BLE001
+                verdict = None
+            if kind_of_verdict(verdict, info) not in ("", "unknown"):
+                return opened[1], True
+        return opened[1], False
+
+    @staticmethod
     async def _fingerprint(page: Any) -> str:
         """The address, markup and form values of the page and its frames (FINGERPRINT_JS): equal before and after a click = the
         click changed nothing."""
@@ -2749,6 +3708,19 @@ class BrowserSession:
     def last_click_changed_nothing(self, key: str | None = None) -> bool:
         return self._unchanged.get(key or browser_owner.get(), False)
 
+    def _tab_dialogs(self, key: str) -> TabDialogs:
+        return self._dialogs.setdefault(key, TabDialogs())
+
+    def page_dialog(self, key: str) -> dict[str, Any] | None:
+        """The live status's `dialog` for a tab (server.py LIVE VIEW API): its newest page pop-up while the tab still shows the address
+        it came from (page_dialogs.SHOW_SECONDS at most), else None. A native pop-up is never in the picture or on the X screen, so
+        without this the owner watches a page that seems to do nothing (owner report 2026-11-19)."""
+        tab, page = self._dialogs.get(key), self._pages.get(key)
+        if tab is None or page is None:
+            return None
+        d = tab.shown(str(getattr(page, "url", "") or ""), time.time())
+        return live_view(d) if d is not None else None
+
     async def click(self, selector: str) -> str:
         page = await self.page()
         key = browser_owner.get()
@@ -2756,6 +3728,8 @@ class BrowserSession:
         if said := self.blocked_site(before):   # a click on the page of a site that already blocked us twice: nothing is sent to it
             return said
         self._unchanged.pop(key, None)
+        pressed = self.judged(selector)   # the kind the gate judged for THIS click ("" = commits nothing)
+        declines = self._judged.get(key, ("",))[0] == selector and pressed == ""
         info = self.judged_info(selector) or {}
         owner = await self.frame_for(page, selector)
         selector = ref_selector(selector)
@@ -2773,23 +3747,13 @@ class BrowserSession:
                 return note
             await self._pace_wait(host, paced, key)
         mark = await self._fingerprint(page)
-        dialogs = len(self._dialogs.get(key, []))
-        release = await self._phone_windows(key, page)   # a window this click opens asks for the phone page from its first request
-        try:
-            # in the phone view a click is a tap (a touch), as on a phone: a phone site may listen to touch only (2026-11-10)
-            tapped = key in self._view_cdp and await self._tap(owner, selector, key)
-            if not tapped:
-                await human.click(owner, selector, timeout_ms=10_000, fallback=lambda ms: owner.click(selector, timeout=ms))
-            await self._loaded(page, key)
-            moved = await self._moved_to_window(key, page)
-            if (tapped and moved is None and len(self._dialogs.get(key, [])) == dialogs
-                    and await self._fingerprint(page) == mark):   # the tap changed nothing: one mouse click, for a mouse-only page
-                await human.click(owner, selector, timeout_ms=10_000, fallback=lambda ms: owner.click(selector, timeout=ms))
-                await self._loaded(page, key)
-                moved = await self._moved_to_window(key, page)
-        finally:
-            if release is not None:
-                release()   # never awaited: removing the route waits for a navigation that may never answer
+        layers = await self._layer_labels(page)
+        offered = await self._offered_elsewhere(owner, selector, key) if declines else None
+        pops = self._tab_dialogs(key)
+        dialogs = pops.mark()
+        await human.click(owner, selector, timeout_ms=10_000, fallback=lambda ms: owner.click(selector, timeout=ms))
+        await self._loaded(page, key)
+        moved = await self._moved_to_window(key, page)
         if moved is not None:   # the click opened a window: the agent goes on in it
             page = moved
             try:
@@ -2800,12 +3764,22 @@ class BrowserSession:
         if not paced and str(getattr(page, "url", "") or "") != before:   # went to another address: the site saw a request
             self.pacer.record(host, "nav", human.pace_factor())
         await self._settle(page)
-        await self._human_pause(page, human.dwell if str(getattr(page, "url", "") or "") != before else human.glance)
+        await self._human_pause(page, self._look_pause(glance=str(getattr(page, "url", "") or "") == before))
+        after = await self._layer_labels(page)
+        same = str(getattr(page, "url", "") or "") == before
         if moved is not None:
             self._notes.setdefault(key, []).insert(0, POPUP_NOTE.format(url=str(page.url or "")[:200]))
-        elif len(self._dialogs.get(key, [])) == dialogs and await self._fingerprint(page) == mark:
+        elif (cancelled := pops.only_cancelled(dialogs)) is not False and await self._fingerprint(page) == mark:
+            # nothing changed, or the only pop-ups were questions answered Cancel: the same click again does the same (2026-11-19)
             self._unchanged[key] = True
-            self._notes.setdefault(key, []).insert(0, NO_CHANGE_NOTE)
+            self._notes.setdefault(key, []).insert(0, DIALOG_ONLY_NOTE if cancelled else NO_CHANGE_NOTE)
+        elif same and (new := [x for x in after if x not in layers]):
+            self._notes.setdefault(key, []).insert(0, OPENED_NOTE)   # a window of the page itself opened: maybe a result, maybe a step
+            self._opened_layer[key] = (before.split("#")[0], new[0])
+        elif same and offered is not None and offered[1] and offered[0] not in after:
+            self._notes.setdefault(key, []).insert(0, DECLINED_NOTE)   # the job closed it without the step it offered
+        if (o := self._opened_layer.get(key)) is not None and (not same or o[1] not in after):
+            self._opened_layer.pop(key, None)   # that window is gone (closed any way): nothing more to decline
         return await self.snapshot(changes=True)   # a window the click opened on the same page is the agent's own (snapshot)
 
     # ------------------------------------------------------------------ pacing per site (pacing.py)
@@ -2848,93 +3822,6 @@ class BrowserSession:
                 raise
             await self.rescue(key)
             self._notes.setdefault(key, []).insert(0, STILL_LOADING_NOTE.format(seconds=round(CLICK_LOAD_MS / 1000)))
-
-    async def _tap(self, owner: Any, selector: str, key: str) -> bool:
-        """A touch at the middle of the element (Input.dispatchTouchEvent on the phone view's session; Chrome makes the click of it,
-        as on a phone). False when it could not be done (then the mouse clicks)."""
-        cdp = self._view_cdp.get(key)
-        down = False
-        shown = human._mouse_page(owner)   # None: no page mouse to show
-        try:
-            loc = owner.locator(selector).first
-            await loc.scroll_into_view_if_needed(timeout=10_000)
-            box = await loc.bounding_box(timeout=5_000)
-            if cdp is None or not box or box["width"] <= 0 or box["height"] <= 0:
-                return False
-            x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-            point = {"x": x, "y": y, "radiusX": 4, "radiusY": 4, "force": 1, "id": 1}
-            await cdp_send(cdp, "Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
-            down = True
-            human.set_pressed(shown, True, (x, y))   # the live view draws the finger (live.py PointerThrottle)
-            await asyncio.sleep(0.06 + 0.06 * random.random())   # a finger rests on the screen a moment
-            await cdp_send(cdp, "Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
-            return True
-        except Exception:  # noqa: BLE001 - not reachable this way (or the page does not answer): the mouse clicks
-            if down and cdp is not None:   # lift the finger so it cannot swallow the next touch
-                await self._quietly(lambda: cdp_send(cdp, "Input.dispatchTouchEvent", {"type": "touchCancel", "touchPoints": []}, RESCUE_SECONDS))
-            return False
-        finally:
-            if down:
-                human.set_pressed(shown, False)
-
-    async def _phone_windows(self, key: str, page: Any) -> Callable[[], None] | None:
-        """While a click on a phone-view tab may open a window (a pop-up, a target=_blank link): the requests of a new window opened by
-        `page` go out with the phone identity (User-Agent, Sec-CH-UA-Mobile ?1, Sec-CH-UA-Platform Android) until _adopt has put the
-        phone view's overrides on it, so its FIRST request already asks for the phone page (2026-11-10: a "바로구매" window came in the
-        PC version; the overrides attach only after the window exists). A context route, only for the length of the click (a route
-        turns the HTTP cache off). Returns the function that lets it go, or None (desktop view, or no context to route in). Letting go never
-        waits: the route stops doing anything at once (it passes every request on) and is removed in the background, because removing
-        it does not return while a navigation of this click has no answer (the step would hang with it)."""
-        live = {"on": True}
-        ident = self._mobile_id.get(key)
-        ctx = getattr(page, "context", None)
-        if key not in self._view_cdp or ident is None or ctx is None or not hasattr(ctx, "route"):
-            return None
-        ua = str(ident.get("userAgent") or "")
-
-        async def handler(route: Any, request: Any) -> None:
-            if not live["on"]:
-                try:
-                    await route.fallback()
-                except Exception:  # noqa: BLE001
-                    pass
-                return
-            phone = {**request.headers, "user-agent": ua, "sec-ch-ua-mobile": "?1", "sec-ch-ua-platform": '"Android"'}
-            headers = None
-            try:
-                pg = request.frame.page
-            except Exception:  # noqa: BLE001 - no frame yet: the first request of a window being opened (by this click)
-                pg = None
-                try:
-                    headers = phone if request.is_navigation_request() else None
-                    self._first_phone = True
-                except Exception:  # noqa: BLE001
-                    headers = None
-            try:
-                if pg is not None and pg is not page and pg not in self._phone_ready and await pg.opener() is page:
-                    headers = phone
-                    self._phone_asked.add(pg)
-            except Exception:  # noqa: BLE001 - a request without a page (a worker): as it is
-                headers = None
-            try:
-                await (route.fallback(headers=headers) if headers else route.fallback())
-            except Exception:  # noqa: BLE001 - the request was already handled or the page closed
-                pass
-        try:
-            await asyncio.wait_for(ctx.route("**/*", handler), RESCUE_SECONDS)
-        except Exception:  # noqa: BLE001 - no route: the window is loaded again in the phone view (_adopt)
-            return None
-
-        async def unroute() -> None:
-            try:
-                await asyncio.wait_for(ctx.unroute("**/*", handler), 120.0)
-            except Exception:  # noqa: BLE001
-                pass
-
-        def release() -> None:
-            live["on"] = False
-            self._later(unroute())
-        return release
 
     @staticmethod
     async def _lists_note(page: Any) -> str:
@@ -2995,8 +3882,8 @@ class BrowserSession:
         None when the click stayed on the page."""
         loop = asyncio.get_running_loop()
         until = loop.time() + POPUP_WAIT_SECONDS
-        while self._pages.get(key) is page and (loop.time() < until or (self._first_phone and loop.time() < until + NAV_TIMEOUT_MS / 1000)):
-            await asyncio.sleep(0.05)   # (a window whose first request went out (_phone_windows) is waited for until it shows up)
+        while self._pages.get(key) is page and loop.time() < until:
+            await asyncio.sleep(0.05)
         now = self._pages.get(key)
         if now is page or now is None:
             return None
@@ -3024,7 +3911,9 @@ class BrowserSession:
         before = str(getattr(page, "url", "") or "")
         self._unchanged.pop(key, None)
         mark = await self._fingerprint(page)
-        dialogs = len(self._dialogs.get(key, []))
+        layers = await self._layer_labels(page)
+        pops = self._tab_dialogs(key)
+        dialogs = pops.mark()
         try:
             if len(where) == 1:
                 await human.click_at(page, *where[0])
@@ -3042,20 +3931,28 @@ class BrowserSession:
                 pass
         await self._guard(page.url)
         await self._settle(page)
-        await self._human_pause(page, human.dwell if str(getattr(page, "url", "") or "") != before else human.glance)
+        await self._human_pause(page, self._look_pause(glance=str(getattr(page, "url", "") or "") == before))
+        after = await self._layer_labels(page)
+        same = str(getattr(page, "url", "") or "") == before
         if moved is not None:
             self._notes.setdefault(key, []).insert(0, POPUP_NOTE.format(url=str(page.url or "")[:200]))
-        elif len(self._dialogs.get(key, [])) == dialogs and await self._fingerprint(page) == mark:
+        elif (cancelled := pops.only_cancelled(dialogs)) is not False and await self._fingerprint(page) == mark:
+            # nothing changed, or the only pop-ups were questions answered Cancel: the same click again does the same (2026-11-19)
             self._unchanged[key] = True
-            self._notes.setdefault(key, []).insert(0, NO_CHANGE_NOTE)
+            self._notes.setdefault(key, []).insert(0, DIALOG_ONLY_NOTE if cancelled else NO_CHANGE_NOTE)
+        elif same and (new := [x for x in after if x not in layers]):
+            self._notes.setdefault(key, []).insert(0, OPENED_NOTE)   # a point click never declines a pop-up: fail closed
+            self._opened_layer[key] = (before.split("#")[0], new[0])
+        if (o := self._opened_layer.get(key)) is not None and (not same or o[1] not in after):
+            self._opened_layer.pop(key, None)
         return await self.snapshot(changes=True)
 
     async def _ime_sender(self, page: Any) -> Callable[[str, dict[str, Any]], Awaitable[Any]] | None:
         """send(method, params) on the tab's DevTools session, each call bounded (cdp_send), for typing Korean through the input-method
-        path (humanize.type_text). The phone view's own session when there is one; else a session kept per tab. None when there is none
+        path (humanize.type_text). The tab's own session when it has one; else a session kept per tab. None when there is none
         to be had (the text is then typed as before)."""
         key = browser_owner.get()
-        cdp = self._view_cdp.get(key) or self._tab_cdp.get(key)
+        cdp = self._tab_cdp.get(key)
         if cdp is None:
             held = self._type_cdp.get(key)
             if held is not None and held[0] is page:
@@ -3070,6 +3967,8 @@ class BrowserSession:
 
     async def type(self, selector: str, text: str, submit: bool = False) -> str:
         page = await self.page()
+        if said := self.pause_note(str(getattr(page, "url", "") or "")):   # a site paused after a refusal: nothing is typed into it
+            return said
         owner = await self.frame_for(page, selector)
         selector = ref_selector(selector)
         if layer := await self._covered(page, owner, selector, browser_owner.get()):
@@ -3093,35 +3992,84 @@ class BrowserSession:
             await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
             await self._guard(page.url)
             if str(getattr(page, "url", "") or "") != before:
-                await self._human_pause(page, human.dwell)
+                await self._human_pause(page, self._look_pause(glance=False))
         return await self.snapshot(changes=True)
 
     settle_seconds = 0.8     # how long a page gets to show its answer after Enter (a sign-in error often appears without a page load)
     sign_in_wait = 12.0      # how long a sign-in is watched for a clear answer (a site that redirects through a few pages takes seconds)
 
-    async def fill_login(self, username: str, password: str, *, step: str = "both", submit: bool = True) -> SignIn:
+    async def _password_field_ok(self, page: Any, origin_ok: Callable[[str], bool] | None, path: str, *, after: int | None = None) -> None:
+        """The checks at the moment of typing a password (docs/data-trail.md, browser login checks): the page is https and on the credential's
+        site, the tagged field is ONE input of type password, still the type it had when tagged, rendered masked; `after`: the length the
+        field must hold now (the secret's own length; only lengths are compared, the value is never read). Raises BrowserPolicyError."""
+        parts = urlsplit(str(getattr(page, "url", "") or ""))
+        if parts.scheme != "https" or (origin_ok is not None and not origin_ok(page.url)):
+            raise BrowserPolicyError("the page is not the credential's own site over https; nothing was typed")
+        st = await page.evaluate(_LOGIN_STATE, path)
+        if not isinstance(st, dict) or st.get("n") != 1:
+            raise BrowserPolicyError("ambiguous target: the password field to type into could not be told from the others; nothing was typed")
+        if not st.get("input") or st.get("type") != "password":
+            raise BrowserPolicyError("the target is not a password field or is not masked (its type is not password, or changed after it was "
+                                     "found); nothing was typed")
+        if not st.get("masked"):
+            raise BrowserPolicyError("the password field is not masked (it would show what is typed); nothing was typed")
+        if after is not None and int(st.get("length") or 0) != after:
+            raise BrowserPolicyError("the password was not applied: the field's value length does not match; the field was cleared and the "
+                                     "sign-in was not sent. Do not retry; tell the user")
+
+    async def fill_login(self, username: str, password: str, *, step: str = "both", submit: bool = True,
+                         origin_ok: Callable[[str], bool] | None = None, ask_options: bool = False,
+                         keep: str | None = None) -> SignIn:
         """Type a saved login into the visible sign-in form of the current page, and (optionally) press Enter.
         The values go straight from here to the page: the answer is the page afterwards with both values removed from it,
-        and a reading of whether the site accepted the login."""
+        and a reading of whether the site accepted the login. The password goes only into one masked input of type password on a
+        https page of the credential's site (`origin_ok(url)`), and its length in the field must equal the password's, else
+        nothing is sent, the field is cleared and a precise error says why (no retry).
+        `ask_options` (browser_login's submit call without a choice yet): a form with unticked boxes or switches raises LoginOptions
+        before anything is typed. `keep`: the listed option to tick before typing ("none": tick nothing)."""
         page = await self.page()
         await self._guard(page.url)
         before = page.url
+        self._login_url[browser_owner.get()] = before
+        self._login_at[browser_owner.get()] = time.time()   # a sign-in the agent started on this tab: a short page after it may be a verification step
         found = await page.evaluate(_TAG_LOGIN_FIELDS)
         want_user, want_pass = step in ("both", "username"), step in ("both", "password")
         if not ((want_user and found["u"]) or (want_pass and found["p"])):
-            await page.evaluate(_UNTAG_LOGIN_FIELDS)
-            raise BrowserPolicyError("no sign-in form with the expected field was found on this page")
+            raise NoSignInForm("no sign-in form with the expected field was found on this page")
+        if ask_options and keep is None and (options := await self._unticked_options(page)):
+            raise LoginOptions(options)   # nothing typed: the agent chooses the stay-signed-in option by its words first (S6)
+        if keep and keep != "none":
+            if keep not in self._options.get(browser_owner.get(), set()):
+                raise BrowserPolicyError("keep must be one of the option selectors browser_login listed for this page; nothing was typed")
+            try:
+                await human.click(page, keep, timeout_ms=10_000, fallback=lambda ms: page.locator(keep).click(timeout=ms))
+            except Exception as e:  # noqa: BLE001 - a driver message never reaches the model as it is
+                raise BrowserPolicyError(f"could not tick the chosen option ({type(e).__name__}); nothing was typed") from None
         try:
+            if want_pass and found["p"]:
+                if int(found.get("p_count", 1)) > 1:
+                    raise BrowserPolicyError("ambiguous target: the page has more than one password field; nothing was typed")
+                await self._password_field_ok(page, origin_ok, found["p_path"])   # before anything is typed
             if want_user and found["u"]:
-                user_box = page.locator("[data-vault-u]")
+                user_box = page.locator(found["u_path"])
                 await human.type_text(page, username, locator=user_box, secret=True, timeout_ms=10_000,
                                       fallback=lambda ms: user_box.fill(username, timeout=ms))
             if want_pass and found["p"]:
-                pass_box = page.locator("[data-vault-p]")
+                pass_box = page.locator(found["p_path"])
+                await pass_box.focus(timeout=10_000)   # a page that unmasks a field when it is focused shows here, before the typing
+                await self._password_field_ok(page, origin_ok, found["p_path"])
                 await human.type_text(page, password, locator=pass_box, secret=True, timeout_ms=10_000,
                                       fallback=lambda ms: pass_box.fill(password, timeout=ms))
+                try:
+                    await self._password_field_ok(page, origin_ok, found["p_path"], after=len(password.encode("utf-16-le")) // 2)
+                except BrowserPolicyError:
+                    try:
+                        await pass_box.fill("", timeout=5_000)
+                    except Exception:  # noqa: BLE001 - the page may be gone; the error below is what matters
+                        pass
+                    raise
             if submit:
-                target = "[data-vault-p]" if (want_pass and found["p"]) else "[data-vault-u]"
+                target = found["p_path"] if (want_pass and found["p"]) else found["u_path"]
                 await human.pause_before_submit()
                 await page.locator(target).press("Enter", timeout=10_000)
                 try:
@@ -3132,11 +4080,6 @@ class BrowserSession:
             raise
         except Exception as e:  # noqa: BLE001 - a driver message could quote what was typed: say only what kind of failure it was
             raise BrowserPolicyError(f"could not fill in the form ({type(e).__name__})") from None
-        finally:
-            try:
-                await page.evaluate(_UNTAG_LOGIN_FIELDS)
-            except Exception:  # noqa: BLE001 - the page may have navigated away
-                pass
         try:
             await self._guard(page.url)
         except BrowserPolicyError:
@@ -3151,13 +4094,15 @@ class BrowserSession:
                     state = await page.evaluate(_PAGE_STATE)
                 except Exception:  # noqa: BLE001 - the page was still changing (a redirect): look again
                     state = {"pw": True, "text": ""}
-                outcome, _ = classify_sign_in(before_url=before, after_url=page.url, password_visible=bool(state["pw"]), text=str(state["text"]))
+                outcome, _ = classify_sign_in(before_url=before, after_url=page.url, password_visible=bool(state["pw"]),
+                                              otp_boxes=int(state.get("otp") or 0), invalid_marked=bool(state.get("invalid")))
                 if outcome != "unknown" or waited >= self.sign_in_wait:
                     break
                 await asyncio.sleep(0.5)
                 waited += 0.5
             found, _ = await self._look(page, browser_owner.get())
-            outcome, detail = classify_sign_in(before_url=before, after_url=page.url, password_visible=bool(state["pw"]), text=str(state["text"]),
+            outcome, detail = classify_sign_in(before_url=before, after_url=page.url, password_visible=bool(state["pw"]),
+                                               otp_boxes=int(state.get("otp") or 0), invalid_marked=bool(state.get("invalid")),
                                                challenge=found.name if found is not None else "")
             ver = verification_step(self._probes.get(browser_owner.get()), signing_in=True) if found is None else None
             step = ver.step if ver is not None else ("code" if outcome == "code_needed" else "")
@@ -3173,16 +4118,41 @@ class BrowserSession:
         handed = self._handed.get(browser_owner.get())
         if outcome == "code_needed" and handed in ("solved", "done", "progressed"):
             outcome, detail = (("success", "the user completed the sign-in verification and the page is past signing in")
-                               if not still_signing_in(probe) else
+                               if not still_signing_in(probe, self._login_url.get(browser_owner.get(), "")) else
                                ("unknown", "the user did the verification step, but the sign-in is NOT finished: the page below shows the "
                                            "next step") if handed == "progressed" else
                                ("code_needed", "the sign-in verification is still pending: the page still shows a sign-in or verification step"))
-        elif outcome == "success" and isinstance(probe, dict) and probe.get("kelo_check") and still_signing_in(probe):
+        elif outcome == "success" and isinstance(probe, dict) and probe.get("kelo_check") and still_signing_in(probe, self._login_url.get(browser_owner.get(), "")):
             outcome, detail = "unknown", "the sign-in form was left, but the page still shows a sign-in or verification step"
         for secret in (password, username):
             if len(secret) >= 3:
                 text = text.replace(secret, "[hidden]")
         return SignIn(text, outcome, detail, step if outcome == "code_needed" else "")
+
+    async def extra_auth_signs(self) -> str:
+        """What shows, by structure, that the page asks the payer to prove it is them ("" = nothing): a one-time-code input in the page or a
+        frame, or the tab left the site a purchase was allowed on."""
+        key = browser_owner.get()
+        got = self._purchase.get(key)
+        page = self._pages.get(key)
+        if page is None:
+            return ""
+        signs: list[str] = []
+        host = (urlsplit(str(getattr(page, "url", "") or "")).hostname or "").lower()
+        if got and host and host != got[0] and not same_site(host, got[0]):
+            signs.append("the page left the shop's site")
+        try:
+            frames = list(page.frames) if hasattr(page, "frames") else [page]
+        except Exception:  # noqa: BLE001
+            frames = [page]
+        for frame in frames or [page]:
+            try:
+                if await frame.evaluate(_EXTRA_AUTH_JS) is True:
+                    signs.append("a one-time-code box")
+                    break
+            except Exception:  # noqa: BLE001 - a frame that is gone or closed to scripts
+                continue
+        return ", ".join(signs)
 
     def in_checkout(self) -> bool:
         """A purchase was allowed on this tab (the window may have run out): pages are read with payment authentication in mind."""
@@ -3204,7 +4174,12 @@ class BrowserSession:
         for frame in frames:
             where = urlsplit(str(getattr(frame, "url", "") or "")).hostname or "page"
             try:
-                found = await frame.evaluate(_TAG_CARD_FIELDS)
+                found = await frame.evaluate(_TAG_CARD_FIELDS, None)
+                if isinstance(found, dict) and found.get("open") and self.page_judge is not None:
+                    # fields with no autocomplete token: the page judge reads their labels (nothing is typed by a word list)
+                    named = await self.page_judge.fields("card", [r for r in found["open"] if isinstance(r, dict)])
+                    if named:
+                        found = await frame.evaluate(_TAG_CARD_FIELDS, named)
             except Exception:  # noqa: BLE001 - a frame that is gone or closed to scripts
                 unreachable.append(where)
                 continue
@@ -3214,11 +4189,6 @@ class BrowserSession:
                 done = await self._fill_frame(frame, found, number, cvc, exp_month, exp_year, holder, postal)
             except Exception as e:  # noqa: BLE001 - a driver message could quote what was typed: name only the kind of failure
                 raise BrowserPolicyError(f"could not fill the card form ({type(e).__name__})") from None
-            finally:
-                try:
-                    await frame.evaluate(_UNTAG_CARD_FIELDS)
-                except Exception:  # noqa: BLE001
-                    pass
             for k in done:
                 seen[k] = True
                 filled.append(k if where == "page" or frame is frames[0] else f"{k} ({where})")
@@ -3229,11 +4199,12 @@ class BrowserSession:
             await page.goto("about:blank")
             raise
         text = scrub_card(await self.snapshot(), number)
-        return CardFill(filled, missing, unreachable, extra_auth(text), text)
+        return CardFill(filled, missing, unreachable, await self.extra_auth_signs(), text)
 
     async def _fill_frame(self, frame: Any, found: dict[str, Any], number: str, cvc: str, m: int, y: int, holder: str, postal: str) -> list[str]:
         done: list[str] = []
-        loc = lambda kind: frame.locator(f'[data-kelo-cc="{kind}"]')  # noqa: E731
+        paths = found.get("paths") or {}
+        loc = lambda kind: frame.locator(paths.get(kind) or NO_ELEMENT)  # noqa: E731
 
         async def put(kind: str, value: str) -> None:   # typed key by key like a person (never a typo), or filled as before
             box = loc(kind)
@@ -3286,18 +4257,23 @@ class BrowserSession:
         postcode search fills) gets its value set directly. The answer names the fields that were filled."""
         page = await self.page()
         await self._guard(page.url)
-        got = await page.evaluate(_TAG_ADDRESS_FIELDS)
+        got = await page.evaluate(_TAG_ADDRESS_FIELDS, None)
+        if isinstance(got, dict) and got.get("open") and self.page_judge is not None:
+            # fields with no autocomplete token or telephone type: the page judge reads their labels (nothing is matched by a word list)
+            named = await self.page_judge.fields("shipping", [r for r in got["open"] if isinstance(r, dict)])
+            if named:
+                got = await page.evaluate(_TAG_ADDRESS_FIELDS, named)
         found: dict[str, list[dict[str, Any]]] = (got or {}).get("found") or {}
         filled: list[str] = []
         try:
             async def put(field: dict[str, Any], value: str) -> bool:
                 if not value:
                     return False
-                loc = page.locator(f'[data-kelo-addr="{field["tag"]}"]')
+                loc = page.locator(field["path"])
                 if field["el"] == "select":
                     return False
                 if field.get("ro"):
-                    return bool(await page.evaluate(_SET_READONLY, [field["tag"], value]))
+                    return bool(await page.evaluate(_SET_READONLY, [field["path"], value]))
                 await human.type_text(page, value, locator=loc, timeout_ms=5_000, fallback=lambda ms: loc.fill(value, timeout=ms))
                 return True
 
@@ -3305,7 +4281,7 @@ class BrowserSession:
                 value = pick_select(field.get("opts") or [], wants)
                 if value is None:
                     return False
-                loc = page.locator(f'[data-kelo-addr="{field["tag"]}"]')
+                loc = page.locator(field["path"])
                 await human.hover(page, loc)
                 await loc.select_option(value=value, timeout=5_000)
                 return True
@@ -3365,7 +4341,7 @@ class BrowserSession:
                 if first["el"] == "select":   # a list of area / mobile prefixes, then the boxes for the rest
                     pre = next((o[0] for o in first["opts"] if o[0] and national.startswith(o[0])), None)
                     if pre is not None:
-                        loc = page.locator(f'[data-kelo-addr="{first["tag"]}"]')
+                        loc = page.locator(first["path"])
                         await loc.select_option(value=pre, timeout=5_000)
                         for b, part in zip(tels[1:], split_by(national[len(pre):], [b["max"] for b in tels[1:]] or [0])):
                             await put(b, part)
@@ -3380,11 +4356,6 @@ class BrowserSession:
             await one("note", str(v.get("note") or ""), "delivery note")
         except Exception as e:  # noqa: BLE001 - a driver message could quote what was typed: name only the kind of failure
             raise BrowserPolicyError(f"could not fill the shipping form ({type(e).__name__})") from None
-        finally:
-            try:
-                await page.evaluate(_UNTAG_ADDRESS_FIELDS)
-            except Exception:  # noqa: BLE001
-                pass
         want = {"name": bool(v.get("name")), "address line 1": bool(v.get("address_line1")) and not found.get("street"),
                 "postal code": bool(v.get("postal_code")), "phone": bool(v.get("phone")), "city": bool(v.get("locality")),
                 "region": bool(v.get("admin_area"))}
@@ -3415,7 +4386,7 @@ class BrowserSession:
             title = ""
         image, size, w, h = None, 0, 0, 0
         try:
-            raw = await self.shoot(page, key, quality=70)
+            raw = await self.shoot(page, quality=70)
             jpeg, w, h = await asyncio.to_thread(shrink_jpeg, raw)
             if jpeg is not None:
                 image, size = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode(), len(jpeg)
@@ -3444,8 +4415,11 @@ class BrowserSession:
             except Exception:  # noqa: BLE001 - a tab that went away meanwhile
                 continue
             status, at = self._status.get(key, ("", 0.0))
+            win = self._windows.get(key)
             out.append({"key": key, "title": title, "url": url, "host": urlsplit(url).hostname or "", "status": status,
-                        "last_activity": max(at, self._seen_at.get(key, 0.0)) or None, "controlled_by": self._control.get(key)})
+                        "tabs": win.listing() if win is not None else [],
+                        "last_activity": max(at, self._seen_at.get(key, 0.0)) or None, "controlled_by": self._control.get(key),
+                        "browser": "work" if work_tab(key) and self.work is not None else "main"})
         return out
 
     # ------------------------------------------------------------------ closing idle tabs (driven by the server's sweeper)
@@ -3476,36 +4450,129 @@ class BrowserSession:
         page = self._pages.get(key)
         return page is not None and not page.is_closed()
 
+    def tab_state(self, key: str) -> str:
+        """What a restart or a lost browser left of a job's tab (job_cuts.py): "held" (the owner holds it), "kept" (the same page is open
+        again), "new" (the tab was booked and its page is gone), else "none"."""
+        if key in self._control:
+            return "held"
+        if self._restart_tabs.get(key) == "kept" and self.has_tab(key):
+            return "kept"
+        if self._restart_tabs.get(key) == "gone" or key in self._lost or (self.book is not None and key in self.book.all()):
+            return "new"
+        return "none"
+
+    def _told_lost(self, key: str) -> None:
+        if self.on_lost is None:
+            return
+        try:
+            self.on_lost(key)
+        except Exception:  # noqa: BLE001 - the job's card line is a courtesy; the tab goes on
+            log.exception("could not tell that the browser lost tab %s", key)
+
+    async def _target_of(self, page: Any) -> str:
+        try:
+            cdp = await self.cdp_session(page)
+            info = (await cdp.send("Target.getTargetInfo", {})).get("targetInfo") or {}
+            return str(info.get("targetId") or "")
+        except Exception:  # noqa: BLE001 - a page without DevTools access is no page of a booked tab
+            return ""
+
+    async def adopt_after_restart(self) -> dict[str, str]:
+        """After a server restart (the browser may have kept running): a booked tab whose page is still open gets that page back ("kept",
+        read again before any step); a booked tab with no page is forgotten ("gone"); http(s) pages no tab has are leftovers and are closed.
+        Never raises: a failure leaves every booked tab "gone"."""
+        out: dict[str, str] = {}
+        if self.book is None or self._connect:
+            self._restart_tabs = out
+            return out
+        booked = self.book.all()
+        if not booked:   # nothing to find again: no connection is made just to look
+            self._restart_tabs = out
+            return out
+        try:
+            await self._ensure_browser()
+            if self._ctx is None:
+                raise RuntimeError("no browser context")
+            by_target: dict[str, Any] = {}
+            for page in list(self._ctx.pages):
+                if not page.is_closed() and (target := await self._target_of(page)):
+                    by_target[target] = page
+            for key, entry in booked.items():
+                page = by_target.get(str(entry.get("target") or ""))
+                if page is None:
+                    self.book.forget(key)
+                    out[key] = "gone"
+                    continue
+                self._pages[key] = page
+                self._watch(page, key)
+                await self._prepare(page, key)
+                self._used[key] = self.clock()
+                out[key] = "kept"
+            wanted = {str(e.get("target") or "") for e in booked.values()}
+            for target, page in by_target.items():
+                if target not in wanted and str(page.url or "").startswith(("http://", "https://")):
+                    await self._quietly(page.close)   # a leftover of no tab: closed, never taken by a job
+        except Exception:  # noqa: BLE001 - the tabs start new; the job is told so by its pick-up note
+            log.exception("the browser tabs could not be found again after the restart")
+            out = {key: "gone" for key in booked}
+            for key in booked:
+                self.book.forget(key)
+        self._restart_tabs = out
+        return out
+
     async def screenshot(self, key: str, max_width: int = CARD_MAX_WIDTH, cap: int = CARD_MAX_BYTES) -> tuple[bytes | None, int, int]:
         """A JPEG of that tab, scaled to `max_width` and at most `cap` bytes; (None, 0, 0) when there is no tab or no picture fits."""
         page = self._pages.get(key)
         if page is None or page.is_closed() or not str(page.url or "").startswith(("http://", "https://")):
             return None, 0, 0
         try:
-            raw = await self.shoot(page, key, quality=75)
+            raw = await self.shoot(page, quality=75)
             return await asyncio.to_thread(shrink_jpeg, raw, max_width, cap)
         except Exception:  # noqa: BLE001
             return None, 0, 0
 
     async def close_tab(self, key: str) -> bool:
         """Close one tab. The browser context (cookies, sign-ins) stays: only the page goes. A private tab's own context goes with it,
-        and with that everything it kept (cookies, storage, cache)."""
+        and with that everything it kept (cookies, storage, cache). A work tab's sign-ins go back to the owner's browser (work_browser)."""
+        signed_here = (self.sign_ins.get(key) or {}).get("site", "")   # read before the sign-in is forgotten below
         async with self._lock:
             page = self._pages.pop(key, None)
             for d in (self._used, self._seen_at, self._status, self._last_card, self._purchase, self._dialogs, self._doc, self._notes,
-                      self._checks, self._targets, self._tries, self._shot_scale, self._check_clicked, self.sign_ins, self._probes,
+                      self._checks, self._targets, self._opened, self._tries, self._shot_scale, self._check_clicked, self.sign_ins, self._login_at, self._login_url, self._probes,
                       self._cancel, self._verified, self._last_text, self._ref_words, self._look_url):
                 d.pop(key, None)
             held = self._control.pop(key, None)
+            if self.book is not None:
+                self.book.forget(key)
+            self._lost.pop(key, None)
+            self._lost_act.discard(key)
             private = self._private.pop(key, None)
             cdp = self._tab_cdp.pop(key, None)
-            self._view_cdp.pop(key, None)   # its overrides end with the page
-            under = self._openers.pop(key, [])
+            win = self._windows.pop(key, None)
+            under = [t for t in (win.tabs if win is not None else []) if t.page is not page]   # the window's other tabs go with it
             self._popup_setup.pop(key, None)
             self._unchanged.pop(key, None)
-        for opener, _view, tab_cdp in under:   # the pages that opened the window the tab was in go with it
-            await self._quietly(tab_cdp.detach if tab_cdp is not None and hasattr(tab_cdp, "detach") else None)
-            await self._quietly(lambda p=opener: p.close())
+        profile = self._tab_profile.pop(key, "") if not self.profile_of(key) else self.profile_of(key)
+        self._tab_profile.pop(key, None)
+        ptab = self._profile_tabs.pop(key, None)
+        pctx = self._profile_ctx.pop(key, None)
+        if self.work is not None and self.work.tab(key) is not None:   # read before the context closes: what the job changed goes back
+            if signed_here:
+                self.work.note_signed(key, signed_here)
+            cookies, storage, sites = await self.work.close(key, read_storage=self._work_storage_now)
+            if profile:
+                self._write_back_unit(key, profile, cookies, storage, sites)
+            else:
+                await self._carry_back(key, cookies, storage, sites)
+        elif ptab is not None:   # a chat tab's own profile context
+            if signed_here:
+                ptab.signed.add(registrable(signed_here.lower()))
+            cookies, storage, sites = await collect_changes(ptab, self._work_storage_now)
+            await self._quietly(pctx.close if pctx is not None else None)
+            self._write_back_unit(key, profile, cookies, storage, sites)
+        for tab in under:   # the other tabs of the task's window go with it
+            await self._quietly(tab.tab_cdp.detach if tab.tab_cdp is not None and hasattr(tab.tab_cdp, "detach") else None)
+            await self._quietly(lambda p=tab.page: p.close())
         if held is not None:
             if self.journal is not None:
                 try:
@@ -3519,6 +4586,8 @@ class BrowserSession:
             await self._quietly(lambda: page.close())
         if private is not None:
             await self._quietly(lambda: private.close())
+        for fn in list(self.close_listeners):
+            await self._quietly(lambda fn=fn: fn(key))
         return page is not None
 
     @staticmethod
@@ -3550,6 +4619,11 @@ class BrowserSession:
         if on:
             if self._new_context is not None:
                 ctx = await self._new_context()
+            elif self.work is not None and work_tab(key):
+                try:
+                    ctx = await self.work.new_private_context()
+                except WorkBrowserDown:
+                    raise BrowserPolicyError(DOWN_NOTE) from None
             else:
                 await self._ensure_browser()
                 ctx = await self._browser.new_context(no_viewport=True, accept_downloads=True)
@@ -3628,16 +4702,9 @@ class BrowserSession:
     def forget_site_state(self, site: str) -> bool:
         return self._site_states.pop(site_of(site), None) is not None
 
-    async def forget_site(self, site: str, user_said: str = "") -> str:
-        """Clear cookies of `site`'s registrable domain from the default context, clear site data for known https origins, and drop saved sign-in state."""
-        words = (user_said or "").strip()
-        if not words:
-            return "Error: browser_forget_site refused: user agreement is required before clearing site data."
-        if re.search(r"\b(no|stop|cancel|don'?t|never)\b|그만|취소|중단|아니|안\s*해", words, re.I):
-            return "Error: browser_forget_site refused: user declined or chose to stop."
-        if not re.search(r"\b(yes|clear|retry|ok|sure|agree|proceed|yep|y)\b|지워|삭제|정리|다시|재시도|초기화|그래|응|좋아|쿠키", words, re.I):
-            return "Error: browser_forget_site refused: user did not agree to clear site data."
-
+    async def forget_site(self, site: str) -> str:
+        """Clear cookies of `site`'s registrable domain from the default context, clear site data for known https origins, and drop saved sign-in state.
+        The owner's yes is the approval card of the tool (browser_more), never words read from a message."""
         host = site_of(site)
         reg_domain = registrable(host)
         if not reg_domain:
@@ -3717,6 +4784,9 @@ class BrowserSession:
         for h in to_drop:
             self._site_states.pop(h, None)
 
+        if self.work is not None:
+            await self.work.forget(site)   # the open work tabs' contexts too
+        self._hook(self.on_site_forgotten, reg_domain)
         return (f"Removed {count} cookies for {reg_domain} and cleared its site data. "
                 "The site needs a new sign-in (the vault's saved login, if any, still works: browser_login).")
 
@@ -3803,43 +4873,34 @@ class BrowserSession:
         the answer is the page afterwards with the code taken out."""
         page = await self.page()
         await self._guard(page.url)
-        if ref_of(selector):   # a ref of the last reading: that element is marked for the code script (it reads only CSS selectors)
+        if ref_of(selector):   # a ref of the last reading: its CSS path is what the code script reads
             await self.frame_for(page, selector)
-            await page.locator(ref_selector(selector)).first.evaluate("(e) => e.setAttribute('data-kelo-refpick', '')")
-            selector = "[data-kelo-refpick]"
-        try:
-            found = await page.evaluate(_TAG_CODE_FIELDS, selector or None)
-        finally:
-            if selector == "[data-kelo-refpick]":
-                await self._quietly(lambda: page.evaluate(
-                    "() => document.querySelectorAll('[data-kelo-refpick]').forEach((e) => e.removeAttribute('data-kelo-refpick'))"))
+            selector = await page.locator(ref_selector(selector)).first.evaluate(PATH_OF_JS)
+        found = await page.evaluate(_TAG_CODE_FIELDS, selector or None)
         boxes = int(found.get("boxes") or 0) if isinstance(found, dict) else 0
+        paths = list(found.get("paths") or []) if isinstance(found, dict) else []
         if not boxes:
-            await self._quietly(lambda: page.evaluate(_UNTAG_CODE_FIELDS))
             raise BrowserPolicyError("no box for a one-time code was found on this page" + ("" if selector else "; name it with selector"))
         if boxes > 1 and boxes != len(code):
-            await self._quietly(lambda: page.evaluate(_UNTAG_CODE_FIELDS))
             raise BrowserPolicyError(f"the page has {boxes} code boxes but the code has {len(code)} characters")
         try:
             if boxes == 1:
-                one = page.locator('[data-kelo-otp="0"]')
+                one = page.locator(paths[0])
                 await human.type_text(page, code, locator=one, secret=True, timeout_ms=10_000, fallback=lambda ms: one.fill(code, timeout=ms))
             else:
                 for i, ch in enumerate(code):
-                    box = page.locator(f'[data-kelo-otp="{i}"]')
+                    box = page.locator(paths[i])
                     await human.type_text(page, ch, locator=box, secret=True, timeout_ms=5_000,
                                           fallback=lambda ms, box=box, ch=ch: box.fill(ch, timeout=ms))
             if submit:
                 await human.pause_before_submit()
-                await page.locator(f'[data-kelo-otp="{boxes - 1}"]').press("Enter", timeout=10_000)
+                await page.locator(paths[boxes - 1]).press("Enter", timeout=10_000)
                 try:
                     await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
                 except Exception:  # noqa: BLE001
                     pass
         except Exception as e:  # noqa: BLE001 - a driver message could quote the code: name only the kind of failure
             raise BrowserPolicyError(f"could not type the code ({type(e).__name__})") from None
-        finally:
-            await self._quietly(lambda: page.evaluate(_UNTAG_CODE_FIELDS))
         try:
             await self._guard(page.url)
         except BrowserPolicyError:
@@ -3849,6 +4910,8 @@ class BrowserSession:
         return (await self.snapshot()).replace(code, "[code hidden]")
 
     async def close(self) -> None:
+        if self.work is not None:
+            await self.work.shutdown()
         if self._pw is not None:
             await self._pw.stop()
             self._pw = self._ctx = self._browser = None
@@ -3884,12 +4947,28 @@ LISTS_JS = r"""() => { const out = [];
               options: [...e.options].slice(0, 25).map((o) => o.text.trim().slice(0, 30))}); });
   return out; }"""
 
-# The visible, unticked checkboxes and switches of a page, each marked with data-kelo-opt and named by the words next to it
-OPTIONS_JS = r"""() => {
+# Links of the open page that go to one of a saved login's own hosts, on another host than the page's: where the site's own sign-in most
+# likely is (structure only: the link's target, never its words). Their words, at most 3.
+SIGN_IN_LINKS_JS = r"""(hosts) => {
+  const shown = (e) => { const r = e.getBoundingClientRect(), c = getComputedStyle(e);
+    return r.width > 0 && r.height > 0 && c.visibility !== 'hidden' && c.display !== 'none'; };
+  const out = [];
+  for (const a of document.querySelectorAll('a[href]')) {
+    if (out.length >= 3) break;
+    let u; try { u = new URL(a.getAttribute('href'), location.href); } catch (e) { continue; }
+    if (u.protocol !== 'https:' || !hosts.includes(u.hostname.toLowerCase()) || u.hostname === location.hostname || !shown(a)) continue;
+    const words = (a.innerText || a.getAttribute('aria-label') || a.title || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+    if (words && !out.includes(words)) out.push(words);
+  }
+  return out;
+}"""
+
+# The visible, unticked checkboxes and switches of a page, each given as a CSS path and named by the words next to it
+OPTIONS_JS = with_path(r"""() => {
   const shown = (e) => { const r = e.getBoundingClientRect(), c = getComputedStyle(e);
     return r.width > 0 && r.height > 0 && c.visibility !== 'hidden' && c.display !== 'none'; };
   const words = (e) => (e && (e.innerText || e.textContent) || '').replace(/\s+/g, ' ').trim();
-  const out = []; let n = 0;
+  const out = [];
   for (const e of document.querySelectorAll('input[type=checkbox], [role=checkbox], [role=switch]')) {
     if (out.length >= 8) break;
     const checked = e.matches('input') ? e.checked : e.getAttribute('aria-checked') === 'true';
@@ -3899,12 +4978,11 @@ OPTIONS_JS = r"""() => {
     let label = e.getAttribute('aria-label') || words(lab);
     if (!label && e.getAttribute('aria-labelledby')) label = words(document.getElementById(e.getAttribute('aria-labelledby')));
     if (!label) label = words(e.parentElement).slice(0, 120);
-    const id = String(++n);
-    (shown(e) ? e : box).setAttribute('data-kelo-opt', id);   // a styled box hides its input: the label is what takes the click
-    out.push({id, label: label.slice(0, 120)});
+    // a styled box hides its input: the label is what takes the click
+    out.push({path: keloPath(shown(e) ? e : box), label: label.slice(0, 120)});
   }
   return out;
-}"""
+}""")
 
 
 def target_label(info: dict[str, Any] | None, selector: str) -> str:
@@ -3916,11 +4994,40 @@ def target_label(info: dict[str, Any] | None, selector: str) -> str:
     return words[:60] + "…" if len(words) > 60 else words
 
 
-SELECTOR_ARG = "ref (e12) or Playwright selector"
+def link_place(info: dict[str, Any] | None) -> str:
+    """Where a link goes, as a card shows it: host and path, without the query ("" for no link, a #fragment or a script link)."""
+    href = str((info or {}).get("href") or "").strip()
+    if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+        return ""
+    try:
+        parts = urlsplit(urljoin(str((info or {}).get("url") or ""), href))
+    except ValueError:
+        return ""
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return ""
+    place = parts.hostname + unquote(parts.path).rstrip("/")
+    return place[:60] + "…" if len(place) > 60 else place
+
+
+def page_words(info: dict[str, Any] | None) -> str:
+    """The plain text of what a step clicks when it is no control (a selector picked words on the page): the page's own words."""
+    words = " ".join(str((info or {}).get("text") or "").split())
+    return words[:60] + "…" if len(words) > 60 else words
+
+
+def ref_check(session: "BrowserSession", inner: Callable[[dict[str, Any]], str | None] | None = None) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
+    """A tool's `validate`: `inner`'s reason first, then a ref (args["selector"]) the page no longer has (STALE_REF), before any card."""
+    async def check(args: dict[str, Any]) -> str | None:
+        if inner is not None and (problem := inner(args)):
+            return problem
+        return await session.gone_ref(str(args.get("selector") or ""))
+    return check
+
+
+SELECTOR_ARG = "ref (e12) from your latest reading of the page (a ref ends when the page changes), or a Playwright selector"
 
 # What the approval card adds, by commit kind (commits.py).
 _COMMIT_WARNINGS = {
-    "pay": N_("This may be the button that confirms a payment, order or booking."),
     "send": N_("This may send or post something in your name."),
     "delete": N_("This may delete or cancel something."),
     "apply": N_("This may send an application or an entry in your name."),
@@ -3946,17 +5053,12 @@ def step_decider(session: BrowserSession, tool: str, *, approve_actions: bool = 
         if kind == "unknown":
             return False   # Kelo could not read what this step acts on: the user always sees it (no rule, grant or order covers it)
         sel = step_key(tool, args)
-        if as_tool == "browser_click" and not approve_actions and kind != "pay" and session.sign_in_remember(sel):
-            return True   # the owner's own sign-in on Kelo's own browser: keeping it signed in is what the owner wants (2026-11-15)
         if kind == "security":
             # the account's protection or an official document: only the very element the user just allowed (a retry of its
             # failed click) goes without a card; no rule, grant, order, purchase window or sign-in shortcut covers it
             return as_tool == "browser_click" and session.retry_of_allowed(sel)
-        if kind and as_tool == "browser_click" and kind != "pay" and session.retry_of_allowed(sel):
+        if kind and as_tool == "browser_click" and session.retry_of_allowed(sel):
             return True   # the same element the user just allowed, whose click failed: another selector for it
-        if kind and as_tool == "browser_click" and not approve_actions and kind not in ("pay", "delete", "optout") \
-                and session.sign_in_continue(sel):
-            return True   # a plain "continue" of the owner's own sign-in (an OAuth step of the same site included)
         if kind and grants is not None and grants.use(kind, session.current_host(), tool=as_tool, secret=session.judged_secret(sel)):
             return True   # the user allowed this kind of step on this site for the task running now
         if as_tool == "browser_click" and kind == "delete" and session.use_cancel_action(sel):
@@ -3966,16 +5068,10 @@ def step_decider(session: BrowserSession, tool: str, *, approve_actions: bool = 
             # follow from where it was allowed; browser_open ends it). Checked before the "paid" rule below: the final button
             # of an approved order is itself a "buy" that the paid order would otherwise ask about again
             return True
-        if (kind == "pay" and orders is not None and orders.paid_here(session.current_host())
-                and not money_page(session.judged_info(sel), session.current_url())):
-            return False  # the order is paid and its purchase window is over: a "buy" on a product page or cart starts a new purchase
-        if kind and orders is not None and not approve_actions and orders.current() is None and orders.covers_request(
-                kind, session.current_host(), tool=as_tool, info=session.judged_info(sel), selector=sel, url=session.current_url()):
-            return True   # the user's request names this commit (apply / enter / sign up / send) on the site the task works on
-        if kind and orders is not None and not approve_actions and kind in ("pay", "apply", "form") \
+        if kind and orders is not None and not approve_actions and kind == "apply" \
                 and (o := orders.start_implicit(session.current_host())) is not None:
-            # buying without begin_order (a weaker model often skips it): the order the user asked for starts here, so its
-            # preparing steps don't each ask; the final payment still goes through confirm_purchase
+            # a form step without begin_order (a weaker model often skips it): the order the user asked for starts here, so its
+            # preparing steps don't each ask; the final payment still goes through checkout_review
             from .order import IMPLICIT_NOTE
             session.note(browser_owner.get(), IMPLICIT_NOTE.format(site=o.site, what=o.what))
         return bool(kind and orders is not None and not approve_actions and orders.covers(
@@ -3994,14 +5090,10 @@ def browser_tools(session: BrowserSession, *, approve_actions: bool = False, gra
         return text
 
     async def open_(args: dict[str, Any]) -> str:
-        view = str(args.get("view") or "")
-        return await shown(await session.open(str(args["url"]), view if view in VIEWS else ""), t("Looking at the site"))
-
-    async def view_(args: dict[str, Any]) -> str:
-        return await shown(await session.switch_view(str(args["view"])), t("Looking at the site"))
-
-    def view_ok(args: dict[str, Any]) -> str | None:
-        return None if args.get("view") in VIEWS else "view must be desktop or mobile"
+        if profile := str(args.get("profile") or "").strip():   # only for a task window that is not open yet
+            if bad := session.try_bind_profile(browser_owner.get() or "", profile):
+                return bad
+        return await shown(await session.open(str(args["url"])), t("Looking at the site"))
 
     async def read(args: dict[str, Any]) -> str:
         return await shown(await session.snapshot(clear=True, only_controls=args.get("only") == "controls"), t("Checking the page"))
@@ -4013,13 +5105,12 @@ def browser_tools(session: BrowserSession, *, approve_actions: bool = False, gra
         except Exception:
             session.allowed_failed(target)   # tried again with another selector for the same element: no second card
             raise
-        if session.last_click_changed_nothing() and session.judged(str(args["selector"])) not in ("", "pay"):
-            # allowed, ran, changed nothing: the same element tried again (another selector) does not ask again; a payment button
-            # always does (the agent is told not to repeat the click)
+        if session.last_click_changed_nothing() and session.judged(str(args["selector"])):
+            # allowed, ran, changed nothing: the same element tried again (another selector) does not ask again
             session.allowed_failed(target)
         else:
             session.allowed_done()
-        if session.in_checkout() and (words := extra_auth(text)):
+        if session.in_checkout() and (words := await session.extra_auth_signs()):
             text += "\n\n" + EXTRA_AUTH_NOTE.format(words=words)
             return await shown(text, t("Waiting for payment verification"))
         return await shown(text, t("Working on the page"))
@@ -4042,12 +5133,25 @@ def browser_tools(session: BrowserSession, *, approve_actions: bool = False, gra
         kind = session.judged(str(args.get("selector", "")))
         return " " + t(_COMMIT_WARNINGS[kind]) if kind in _COMMIT_WARNINGS else ""
 
+    def unnamed(info: dict[str, Any] | None) -> str:
+        """Said after "a button" / "a field" when nothing names it: whether it has no words or could not be read at all."""
+        return " " + (t("It has no words on the page.") if info else t("Kelo could not read what is there."))
+
     async def describe_click(args: dict[str, Any]) -> str:
         host = session.current_host() or t("blank page")
         sel = str(args.get("selector", ""))
-        # what the user sees on the page, never the selector (for a ref the page's own name for it, never "aria-ref=…")
-        label = target_label(session.judged_info(sel), sel) or session.ref_label(sel)
-        line = t("Click “{label}” on {host}.", host=host, label=label) if label else t("Click a button on {host}.", host=host)
+        info = session.judged_info(sel)
+        # what the user sees on the page, never the selector (for a ref the page's own name for it, never "aria-ref=…"); never only
+        # "a button" (owner report 2026-11-19)
+        label = target_label(info, sel) or session.ref_label(sel)
+        if label:
+            line = t("Click “{label}” on {host}.", host=host, label=label)
+        elif place := link_place(info):
+            line = t("Click the link to {place} on {host}.", host=host, place=place)
+        elif text := page_words(info):
+            line = t("Click the text “{label}” on {host}.", host=host, label=text)
+        else:
+            line = t("Click a button on {host}.", host=host) + unnamed(info)
         return line + warning(args)
 
     async def describe_type(args: dict[str, Any]) -> str:
@@ -4056,45 +5160,40 @@ def browser_tools(session: BrowserSession, *, approve_actions: bool = False, gra
         info = session.judged_info(sel)
         label = target_label({**info, "text": "", "words": info.get("words") or info.get("attrs") or ""} if info else None, sel) \
             or session.ref_label(sel)
-        line = t("Type into “{label}” on {host}.", host=host, label=label) if label else t("Type into a field on {host}.", host=host)
+        line = t("Type into “{label}” on {host}.", host=host, label=label) if label else t("Type into a field on {host}.", host=host) + unnamed(info)
         return line + warning(args)
 
     obj = lambda props, req: {"type": "object", "properties": props, "required": req}  # noqa: E731
     return session.with_deadline([
-        Tool("browser_open", "Open a public http(s) address in your browser and return the page text. Only an address you were given "
-             "(a search result, a link on a page, the user, a tool); never one you made up: for a page inside a site, open the site "
-             "and follow its links, menu or search. Its reading marks elements with [ref=e12]: click and type by the refs of your "
-             "last reading.",
+        Tool("browser_open", "Open a public http(s) address in your browser and return the page text. Use it only to get onto a site: its "
+             "home page, an exact address the user gave, your job's start address, or a search result you were given (a person arrives "
+             "there by clicking it). Within a site, move the way a person does: click its links, menus and buttons and use its own search "
+             "box; never type or build an address of that site (a search, product, sign-in or account page), and never one you made up. "
+             "Its reading marks elements with [ref=e12]: click and type by the refs of your last reading.",
              obj({"url": {"type": "string"},
-                  "view": {"type": "string", "enum": list(VIEWS),
-                           "description": "optional: open it as a desktop or a phone browser (default: the view that last worked on "
-                                          "that site, else desktop); to switch later, load browser_view with find_tools"}}, ["url"]),
-             open_, untrusted=True, source="page", hold=session.hold_for_user),
-        Tool("browser_view", "Switch this tab between the desktop and the mobile (phone) view of sites and load the page again in "
-             "it; sign-ins and cookies stay. If a page or a step fails in one view (blocked, broken layout, a button that can't be "
-             "clicked, a dead end), try the other view before giving up.",
-             obj({"view": {"type": "string", "enum": list(VIEWS)}}, ["view"]), view_, untrusted=True, source="page",
-             validate=view_ok, hold=session.hold_for_user),
+                  "profile": {"type": "string", "description": "a browser_profiles id"}}, ["url"]),
+             open_, untrusted=True, source="page", hold=session.hold_for_navigation, trail="web"),
         Tool("browser_read", "Return the current page's title, URL and what it shows, one element per line. Readings mark elements "
              "with [ref=e12]: pass e12 to browser_click and browser_type. When the user questions a value you read, read the page again (or where it shows in full) "
              "before you answer.",
              obj({"only": {"type": "string", "enum": ["controls"],
                            "description": "controls: only what can be clicked or typed into, plus headings (shorter; use it when "
                                           "you only need to act)"}}, []),
-             read, untrusted=True, source="page", hold=session.hold_for_user),
+             read, untrusted=True, source="page", hold=session.hold_for_user, trail="web"),
         Tool("browser_click", "Click an element and return the page after (also inside frames of the page; a window the click "
              "opens becomes the page you are on). A click that commits something in "
              "the user's name shows them a card first.",
              obj({"selector": {"type": "string", "description": SELECTOR_ARG}}, ["selector"]), click, requires_approval=True, untrusted=True, source="page",
-             auto_approve=no_card("browser_click"), describe=describe_click, declined=declined_click, hold=session.hold_for_user),
+             validate=ref_check(session), auto_approve=no_card("browser_click"), describe=describe_click, declined=declined_click, hold=guarded(session, session.hold_to_act)),
         Tool("browser_type", "Type text into an input. On a list (a select or a dropdown) it chooses the option with that text instead: "
              "the one way to set a list (quantity, size, date). Personal details or "
              "a message show the user a card first.",
              obj({"selector": {"type": "string", "description": SELECTOR_ARG}, "text": {"type": "string"},
-                  "submit": {"type": "boolean", "description": "press Enter after"}},
+                  "submit": {"type": "boolean", "description": "press Enter after"},
+                  "uses": USES_PARAM},
                  ["selector", "text"]),
-             type_, requires_approval=True, untrusted=True, source="page", auto_approve=no_card("browser_type"), describe=describe_type,
-             hold=session.hold_for_user),
+             type_, requires_approval=True, untrusted=True, source="page", validate=ref_check(session), auto_approve=no_card("browser_type"), describe=describe_type,
+             hold=guarded(session, session.hold_to_act, only_submit=True)),
     ])
 
 
@@ -4152,7 +5251,7 @@ def point_tools(session: BrowserSession, *, approve_actions: bool = False, grant
               "required": ["x", "y"]},
              click_at, requires_approval=True, untrusted=True, source="page", validate=ok("browser_click_at"),
              auto_approve=step_decider(session, "browser_click_at", approve_actions=approve_actions, grants=grants, orders=orders),
-             describe=describe("browser_click_at"), hold=session.hold_for_user),
+             describe=describe("browser_click_at"), hold=guarded(session, session.hold_to_act, tool="browser_click_at")),
         Tool("browser_drag", "Drag along a path of points (x, y) of your last browser_look picture: press at the first, move through "
              "the others, let go at the last. Same rules as browser_click_at: canvas, map, slider or drag handle with no ref; look first, act, look again.",
              {"type": "object", "properties": {"path": {"type": "array", "items": point, "minItems": DRAG_POINTS[0],
@@ -4160,5 +5259,5 @@ def point_tools(session: BrowserSession, *, approve_actions: bool = False, grant
               "required": ["path"]},
              drag, requires_approval=True, untrusted=True, source="page", validate=ok("browser_drag"),
              auto_approve=step_decider(session, "browser_drag", approve_actions=approve_actions, grants=grants, orders=orders),
-             describe=describe("browser_drag"), hold=session.hold_for_user),
+             describe=describe("browser_drag"), hold=guarded(session, session.hold_to_act, tool="browser_drag")),
     ])

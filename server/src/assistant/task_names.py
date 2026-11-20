@@ -29,7 +29,7 @@ SHORT_REQUEST = 24     # a request this short is its own title
 TIMEOUT = 20.0
 NAMED_SOURCES = ("chat", "api")   # jobs, schedules and goals already have their own titles
 MAX_TOKENS = 30
-_PREFIX = re.compile(r"^\s*(?:title|name|task|제목|이름|작업)\s*[:：]\s*", re.I)
+_PREFIX = re.compile(r"^\s*[^\W\d_]{1,12}\s*[:：]\s*")   # a one-word label and a colon in front (the prompt asks for none)
 
 
 def clean_name(text: str) -> str:
@@ -50,13 +50,14 @@ def clean_name(text: str) -> str:
 
 
 def hidden_marks() -> tuple[str, ...]:
+    from .checklist import CHECKLIST_MARK
     from .goals import GOAL_MARK
     from .nest_drafts import NEST_SHARE_MARK
     from .recheck import RECHECK_MARK
     from .schedules import SCHEDULE_MARK
     from .watchers import WATCH_MARK
     from .workers import HANDOFF_MARK
-    return (HANDOFF_MARK, WATCH_MARK, GOAL_MARK, SCHEDULE_MARK, RECHECK_MARK, NEST_SHARE_MARK)
+    return (HANDOFF_MARK, WATCH_MARK, GOAL_MARK, SCHEDULE_MARK, RECHECK_MARK, NEST_SHARE_MARK, CHECKLIST_MARK)
 
 
 class TaskNamer:

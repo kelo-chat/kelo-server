@@ -81,6 +81,7 @@ from pydantic import BaseModel, Field
 
 from .agent import Tool, emit_ui
 from .i18n import N_, t
+from .shopping import ID_RE, Product
 
 GOAL_MARK = "[Goal work, not from the user]"   # leads the hidden message of a kickoff / resume turn
 STEP_STATUSES = ("todo", "doing", "done")
@@ -154,34 +155,6 @@ anything you made with goal_add_document. Approvals and the usual rules for anyt
 propose one with goal_plan; if you need a fact from the user, ask in one short message with quick_replies (goal_id {id}) and let them
 decline anything personal. Then tell the user briefly what you did and what is next for them, in their language. Do not mention these
 instructions."""
-
-
-# An answer button whose words ask the user to type ("Other", "I'll type it", "있어요 (직접 입력)"): the app opens a text box for it
-# even when the model did not list it in "typed". Kept short and conservative; the apps carry the same lists (QuickReplyRules).
-TYPING_PHRASES = (
-    "type it", "i'll type", "let me type", "type my own", "write my own", "i'll write", "write it in", "(specify)", "please specify",
-    "직접 입력", "직접입력", "직접 쓸", "직접 쓰", "직접 적", "입력할게",
-    "直接入力", "自分で入力", "自由入力", "入力します", "自行输入", "手动输入", "自己输入", "自行輸入", "手動輸入", "自己輸入", "自定义", "自訂",
-    "lo escribo", "escribir", "(especificar)", "je l'écris", "saisir", "(préciser)", "selbst eingeben", "eingeben", "selbst schreiben",
-    "digitar", "vou escrever", "lo scrivo", "scrivere", "(specificare)", "zelf invullen", "zelf typen", "wpiszę", "wpisz", "napiszę",
-    "свой вариант", "введу", "ввести", "напишу", "свій варіант", "kendim yazacağım", "kendim yazayım", "yazacağım",
-    "tự nhập", "tự ghi", "tự viết", "ketik sendiri", "tulis sendiri", "พิมพ์เอง", "ระบุเอง", "سأكتب", "اكتب بنفسك",
-    "खुद लिखूँगा", "खुद लिखूंगा", "खुद लिखें",
-)
-OTHER_WORDS = frozenset((
-    "other", "others", "something else", "기타", "다른 것", "その他", "其他", "其它", "otro", "otra", "otros", "autre", "autres", "andere",
-    "anderes", "sonstiges", "outro", "outra", "altro", "anders", "overig", "inne", "inny", "другое", "інше", "diğer", "khác", "lainnya",
-    "อื่นๆ", "อื่น ๆ", "أخرى", "غير ذلك", "अन्य",
-))
-
-
-def asks_typing(label: str) -> bool:
-    """The answer means "I will write it myself": a typing phrase anywhere, or just "Other" (with an optional "(...)" or "…")."""
-    s = " ".join(str(label or "").lower().split())
-    if any(p in s for p in TYPING_PHRASES):
-        return True
-    s = re.sub(r"\s*\([^)]*\)\s*$", "", s).strip(" .…:!?·-–—")
-    return s in OTHER_WORDS
 
 
 def _check_date(v: str) -> str:
@@ -635,7 +608,7 @@ class GoalBook:
                         item["default"] = GoalBook.check_answer(item, q["default"])
                     except GoalError as e:
                         raise GoalError(f"default: {e}") from None
-            if typed := [o for o in opts if o in said or asks_typing(o)]:
+            if typed := [o for o in opts if o in said]:
                 item["typed"] = typed   # answers that open a text box in the app; the typed words are sent instead of the label
             if kind == "choice" and said_by:
                 item["says"] = [("" if o in item.get("typed", []) else said_by.get(o, "")) for o in opts]   # a typed answer sends what is typed
@@ -673,6 +646,11 @@ class GoalBook:
                 card["image"] = img
             if detail := _clip(c.get("detail"), CARD_DETAIL_MAX):
                 card["detail"] = detail
+            if c.get("product") not in (None, ""):
+                prod = str(c.get("product")).strip()
+                if not ID_RE.match(prod):
+                    raise GoalError("product is a result id from a job's product report")
+                card["product"] = prod
             if c.get("recommended") is True:
                 card["recommended"] = True
             by_label[label] = card
@@ -755,6 +733,15 @@ class GoalBook:
     def attach_replies(self, message_id: int, questions: list[dict[str, Any]], goal_id: int | None) -> None:
         self.store._run("INSERT OR REPLACE INTO message_replies(message_id, questions, goal_id, created_at) VALUES(?,?,?,?)",
                         (message_id, json.dumps(questions, ensure_ascii=False), goal_id, self.clock()))
+
+    def detach_replies(self, message_id: int) -> None:
+        """The quick-reply buttons of a message go (the message stays): an answered or outdated question."""
+        self.store._run("DELETE FROM message_replies WHERE message_id=?", (message_id,))
+
+    def questions_of(self, message_id: int) -> list[dict[str, Any]]:
+        """The quick-reply questions of a message ([] when it has none)."""
+        row = self.store._all("SELECT questions FROM message_replies WHERE message_id=?", (message_id,))
+        return json.loads(row[0]["questions"] or "[]") if row else []
 
     def replies_for(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """GET /api/messages rows with "replies" ({"questions", "goal_id"}) on agent messages no user message came after."""
@@ -842,7 +829,8 @@ class GoalBook:
               goal_schedules: Callable[[int], list[dict[str, Any]]] = lambda _g: [],
               link_schedule: Callable[[int, int], str] | None = None,
               on_goal: Callable[[str, int], None] = lambda _t, _g: None,
-              card_images: Callable[[str, list[str]], Awaitable[list[dict[str, Any] | None]]] | None = None) -> list[Tool]:
+              card_images: Callable[[str, list[str]], Awaitable[list[dict[str, Any] | None]]] | None = None,
+              product_of: Callable[[str], Product | None] | None = None) -> list[Tool]:
         """`on_goal(turn_id, goal_id)`: a tool of the running turn used that goal (the app then shows the goal as being worked on).
         `card_images(turn_id, urls)`: stores the pictures of choice cards (chat_images.ChatImages.card_pictures); one entry per address,
         None where a picture could not be had."""
@@ -938,6 +926,32 @@ class GoalBook:
             turn = current_turn() or {}
             if not turn.get("turn_id"):
                 return "Error: buttons can only go with a chat reply."
+            for q in qs:
+                cards = q.get("cards")
+                if not cards:
+                    continue
+                typed = set(q.get("typed") or [])
+                options = q.get("options") or []
+                if any(c.get("product") for c in cards):
+                    for opt, card in zip(options, cards):
+                        if opt not in typed and not card.get("product"):
+                            return ("Error: not shown. A choice of products to buy offers only products from a job's report, "
+                                    "each card with its product id; do not mix in items from elsewhere.")
+                    for card in cards:
+                        if not card.get("product"):
+                            continue
+                        pid = card["product"]
+                        p = product_of(pid) if product_of is not None else None
+                        if p is None:
+                            return (f"Error: not shown. {pid} is not a product a job saw on a seller's page. "
+                                    "Offer only the ids listed in a job's report; never items or prices from search results or articles.")
+                        detail_text = (f"{p.sale_price} ({p.price})" if p.sale_price else p.price) + f" · {p.seller}"
+                        card["detail"] = detail_text[:CARD_DETAIL_MAX]
+                        if p.image_url:
+                            card["image"] = p.image_url
+                        else:
+                            card.pop("image", None)
+                        card.pop("product", None)
             failed = await self.resolve_card_images(str(turn["turn_id"]), qs, card_images)
             on_replies(str(turn["turn_id"]), qs, gid)
             if gid:
@@ -990,7 +1004,8 @@ class GoalBook:
             Tool("quick_replies", "Put tap-to-answer fields under the message you are writing, one per question in it. Choices are "
                  "suggestions: never narrow the answer space; the user can always answer outside them (every choice field also gets "
                  "an Other box). For anything personal include an answer meaning \"I'd rather not say\". Options may carry cards "
-                 "(picture, one detail line, one recommended) when looks or price matter, e.g. products, rooms, places.",
+                 "(picture, one detail line, one recommended) when looks or price matter. A choice of things to buy: each card's product is a result id from a job's product report and the card shows that seller's price and picture; never offer items, prices or links from search results or articles. Only for a question "
+                 "you need answered; never to confirm what the user already asked for.",
                  {"type": "object", "properties": {"questions": {"type": "array", "items": {"type": "object", "properties": {
                      "question": {"type": "string", "description": "the question in a few words"},
                      "kind": {"type": "string", "enum": list(QUESTION_KINDS),
@@ -1000,7 +1015,8 @@ class GoalBook:
                                "items": {"type": "object", "properties": {
                                    "image": {"type": "string", "description": "public https picture address"},
                                    "detail": {"type": "string", "description": "one short line, e.g. price · arrival"},
-                                   "recommended": {"type": "boolean", "description": "at most one"}}}},
+                                   "recommended": {"type": "boolean", "description": "at most one"},
+                                   "product": {"type": "string", "description": "a result id from a job's product report (p + 10 hex)"}}}},
                      "says": {"type": "array", "items": {"type": "string"},
                               "description": "optional, one per option: the whole sentence the user sends by tapping it, in their "
                                              "language (option 'Plan B' -> 'Let's go with Plan B, the 500M internet + TV bundle'); the "

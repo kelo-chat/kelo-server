@@ -18,22 +18,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .cli import ensure_keyring_token, ensure_secret_key, ensure_token, read_env, write_env
+from .cli import ensure_keyring_token, ensure_secret_key, ensure_token, read_env, remove_env, write_env
 
 NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}[a-z0-9]$")
 SERVER_PORT_BASE = 8100
-VIEWER_PORT_BASE = 6100
 MAIN = "main"
 IMAGE = "assistant:local"
 WORKROOM_IMAGE = "assistant-workroom:local"   # the work room (runs code); also shared by every copy
 # compose.yml names every image of ours through one variable each, so a copy can be held at older images (after a rollback, see
 # updates.py) by setting the variable in its env file. Unset (the normal case) = the shared tag, or that variable from the shell.
 IMAGE_VARS: dict[str, tuple[str, tuple[str, ...]]] = {
-    "KELO_IMAGE": (IMAGE, ("server", "browser", "egress", "vpn")),
+    "KELO_IMAGE": (IMAGE, ("server", "browser", "work-browser", "egress", "vpn", "voice")),
     "KELO_WORKROOM_IMAGE": (WORKROOM_IMAGE, ("workroom",)),
     "KELO_CLI_CLAUDE_IMAGE": ("assistant-cli-claude:local", ("claude-cli",)),
     "KELO_CLI_AGY_IMAGE": ("assistant-cli-agy:local", ("agy-cli",)),
 }
+# a site-only copy (site_only.py) runs the server and its tunnel only: these are removed (containers only, never volumes) before it starts
+SITE_ONLY_OFF = ("browser", "egress", "vpn", "keyring", "workroom", "claude-cli", "agy-cli", "android", "updater", "work-browser", "voice")
 DOMAIN = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 
 
@@ -46,11 +47,11 @@ class Instance:
     name: str
     env: Path
     server_port: int
-    viewer_port: int
     browser: bool
     public_url: str
     connect_mode: str = ""       # how phones reach it from outside: kelo, tailscale, funnel, cloudflare, direct, proxy or "" (not set up)
     connect_url: str = ""
+    site_only: bool = False      # ASSISTANT_SITE_ONLY=1: serves kelo.chat and the operator's services, runs no assistant (site_only.py)
 
     @property
     def is_main(self) -> bool:
@@ -115,21 +116,34 @@ class Instances:
         env = self.env_path(name)
         if name == MAIN and not env.is_file():
             raise InstanceError("no .env here: run `assistant setup` in the folder that holds compose.yml first")
-        return Instance(name, env, int(read_env(env, "SERVER_PORT") or 8080), int(read_env(env, "VIEWER_PORT") or 6080),
-                        name == MAIN or "BROWSER_CDP_HOST=" not in env.read_text().splitlines(),
-                        read_env(env, "ASSISTANT_PUBLIC_URL"), read_env(env, "CONNECT_MODE"), read_env(env, "CONNECT_URL"))
+        site_only = name != MAIN and read_env(env, "ASSISTANT_SITE_ONLY").strip().lower() in ("1", "true", "yes", "on")   # as settings.py
+        return Instance(name, env, int(read_env(env, "SERVER_PORT") or 8080),
+                        name == MAIN or ("BROWSER_CDP_HOST=" not in env.read_text().splitlines() and not site_only),
+                        read_env(env, "ASSISTANT_PUBLIC_URL"), read_env(env, "CONNECT_MODE"), read_env(env, "CONNECT_URL"),
+                        site_only=site_only)
+
+    runtime_name = "Docker"    # what a message calls the program that runs the parts
+
+    def host_capacity(self) -> tuple[int | None, int | None]:
+        """(CPUs, RAM bytes) that the runtime can hand out on this computer; None when it does not say."""
+        r = self.run(["docker", "info", "--format", "{{.NCPU}} {{.MemTotal}}"], capture_output=True, text=True)
+        try:
+            cpus, mem = (r.stdout or "").split()[:2]
+            return int(cpus), int(mem)
+        except (ValueError, TypeError):
+            return None, None
 
     def token(self, name: str | None = None) -> str:
         return read_env(self.load(name).env, "ASSISTANT_TOKEN")
 
-    def _next_port(self, base: int, avoid: frozenset[int] = frozenset()) -> int:
-        used: set[int] = set(avoid)
+    def _next_port(self, base: int) -> int:
+        used: set[int] = set()
         for n in [MAIN, *self.names()]:
             try:
                 inst = self.load(n)
             except InstanceError:
                 continue
-            used |= {inst.server_port, inst.viewer_port}
+            used.add(inst.server_port)
         port = base
         while port in used or not self.port_free(port):
             port += 1
@@ -146,14 +160,13 @@ class Instances:
         if domain is not None and not DOMAIN.match(domain):
             raise InstanceError(f"{domain!r} is not a domain name (example: example.com)")
         server_port = self._next_port(SERVER_PORT_BASE)
-        viewer_port = self._next_port(VIEWER_PORT_BASE, frozenset({server_port}))   # never the same number as the server port
         env = self.env_path(name)
         env.parent.mkdir(parents=True, exist_ok=True)
         env.parent.chmod(0o700)
-        write_env(env, {"ENV_FILE": f"instances/{name}/env", "SERVER_PORT": str(server_port), "VIEWER_PORT": str(viewer_port),
+        write_env(env, {"ENV_FILE": f"instances/{name}/env", "SERVER_PORT": str(server_port),
                         "BROWSER": read_env(self.root / ".env", "BROWSER") or "chromium"})
         if not browser:
-            write_env(env, {"BROWSER_CDP_HOST": ""})
+            write_env(env, {"BROWSER_CDP_HOST": "", "WORK_BROWSER_CDP_HOST": ""})
         if domain:
             write_env(env, {"ASSISTANT_PUBLIC_URL": f"https://{name}.{domain}"})
         ensure_token(env)
@@ -198,7 +211,10 @@ class Instances:
                 self.out(f"could not check the Kelo address: {type(e).__name__}")
         # without a browser only the server (and the tunnel, when there is one) is started, not everything it could depend on
         sidecar = {"cloudflare": "cloudflared", "kelo": "kelo-tunnel", "direct": "caddy"}.get(inst.connect_mode)
-        only = [] if inst.browser else ["--no-deps", "server", *([sidecar] if sidecar else []), "workroom", "vpn"]
+        only = [] if inst.browser else ["--no-deps", "server", *([sidecar] if sidecar else []), "workroom", "vpn", "voice"]
+        if inst.site_only:   # only the server and its tunnel; the rest is removed first (its volumes stay: no data is deleted)
+            self.run(self.compose(inst, "rm", "--stop", "--force", *SITE_ONLY_OFF), cwd=self.root, env=self.compose_env(inst))
+            only = ["--no-deps", "server", *([sidecar] if sidecar else [])]
         if self.skip_services and not only:   # the updater restarting its own copy names every service but itself
             r = self.run(self.compose(inst, "config", "--services"), cwd=self.root, capture_output=True, text=True,
                          env=self.compose_env(inst))
@@ -207,6 +223,19 @@ class Instances:
                 raise InstanceError(f"could not list the services of {inst.name} (docker compose config failed)")
         self.run(self.compose(inst, "up", "-d", "--no-build", *only), cwd=self.root, check=True, env=self.compose_env(inst))
         return inst
+
+    def set_site_only(self, name: str, on: bool) -> Instance:
+        """`instance site-only <name> on|off`: the two settings lines only; the next start applies it. Nothing is deleted."""
+        if name == MAIN:
+            raise InstanceError("the main copy is the owner's Kelo; site-only is for an extra copy")
+        inst = self.load(name)
+        if on:
+            write_env(inst.env, {"ASSISTANT_SITE_ONLY": "1", "BROWSER_CDP_HOST": ""})
+            self.out(f"{name} is site-only from its next start: it runs only the server and its tunnel. No data is deleted.")
+        else:
+            remove_env(inst.env, ["ASSISTANT_SITE_ONLY", "BROWSER_CDP_HOST"])
+            self.out(f"{name} runs the whole assistant again from its next start. No data was deleted.")
+        return self.load(name)
 
     def stop(self, name: str | None = None) -> None:
         self.run(self.compose(self.load(name), "stop"), cwd=self.root, check=True)
@@ -224,6 +253,8 @@ class Instances:
             r = self.run(["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}", "--filter", f"reference={repo}:rollback-{name}-*"],
                          cwd=self.root, capture_output=True, text=True)
             tags = (r.stdout or "").split() if r.returncode == 0 else []
+            own = re.compile(rf"rollback-{re.escape(name)}-\d{{8}}-\d{{6}}")       # `rollback-rev-*` also lists copy rev-1's tags
+            tags = [t for t in tags if own.fullmatch(t.rpartition(":")[2])]
             if tags:
                 self.run(["docker", "image", "rm", *tags], cwd=self.root, capture_output=True, text=True)
         shutil.rmtree(self.dir / name)

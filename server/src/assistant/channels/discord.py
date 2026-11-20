@@ -326,14 +326,15 @@ class Discord(Channel):
 
     def _message(self, d: dict[str, Any]) -> Incoming | None:
         author = d.get("author") or {}
-        if str(author.get("id", "")) == self.me_id or author.get("bot") or d.get("webhook_id") or d.get("type", 0) not in (0, 19):
-            return None                       # itself, other bots and webhooks (no loops), join notices and the like
+        if str(author.get("id", "")) == self.me_id or d.get("type", 0) not in (0, 19):
+            return None                       # itself, join notices and the like (other bots and webhooks are kept: they are read like anyone's message)
         mid, channel = str(d.get("id", "")), str(d.get("channel_id", ""))
         text = str(d.get("content") or "")
         if self.me_id:
             text = re.sub(rf"<@!?{re.escape(self.me_id)}>", f"@{self.me_name or 'bot'}", text)
         inc = Incoming(chat_id=channel, user_id=str(author.get("id", "")), message_id=mid, text=text, private=not d.get("guild_id"),
-                       name=str(author.get("global_name") or author.get("username") or ""))
+                       name=str(author.get("global_name") or author.get("username") or ""),
+                       forwarded=bool(d.get("message_snapshots")))   # a forwarded message carries its snapshots (Discord API)
         if d.get("guild_id"):
             gid = str(d["guild_id"])
             guild = self.guilds.get(gid, {}).get("name", "")

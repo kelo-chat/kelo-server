@@ -5,7 +5,10 @@ the hosts a key may be sent to, where it goes in the request, and the request th
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .i18n import N_, t
@@ -42,9 +45,42 @@ class KeyPreset:
     endpoint_field: str = ""                   # n8n: the field that holds the full MCP URL (the address is taken from it)
     sends: bool = False                        # posts to people (a messenger): a change through it is a "send" for the owner's limits (effects.py)
     route: str = ""                            # "wireguard" / "proxy": the VPN connectors (vpn.py): they set the route of Kelo's web browsing
+    situation: Any = None                      # the one read-only call that shows the service's state (situation_reads.py); None = none
 
 
 TOKEN = (Field("token", N_("API key / token")),)
+
+# Key presets with no situation read, each with the reason (situation.md). A test checks that every preset has a read or an entry here.
+NO_SITUATION: dict[str, str] = {
+    "actual_budget": "needs a sync id first; the budget is the owner's own entries, nothing that changes by the hour",
+    "asana": "needs a workspace id first (follow-up)",
+    "calendly": "its meetings are on the calendar",
+    "clickup_key": "needs a workspace or team id first (follow-up)",
+    "datadog": "the monitor state needs a check on a real account (follow-up)",
+    "discord": "Kelo's own chat channels, not a state of the owner's",
+    "figma": "files, no state that changes the owner's situation",
+    "grocy": "the date-filtered stock path could not be confirmed (follow-up)",
+    "immich": "saved photos, nothing that changes the situation by the hour",
+    "incident_io": "needs an id or a live check (follow-up)",
+    "karakeep": "saved items, nothing that changes the situation by the hour",
+    "linkwarden": "saved items, nothing that changes the situation by the hour",
+    "mealie": "the date-filtered meal-plan path could not be confirmed (follow-up)",
+    "monday": "needs a board id and a live check (follow-up)",
+    "n8n_mcp": "the MCP endpoint's tools are the server's (follow-up); the n8n executions are read by its own declaration",
+    "places": "a place lookup, no state",
+    "shopify": "the host is the owner's store; a binding for it is a follow-up",
+    "slack": "the right search query needs a check on a real workspace (follow-up)",
+    "stripe_key": "MCP, or needs a live check (follow-up)",
+    "tandoor": "the date-filtered meal-plan path could not be confirmed (follow-up)",
+    "telegram": "Kelo's own chat channels",
+    "ticketmaster": "event search, no state of the owner's",
+    "vpn_proxy": "a VPN connection, not a service the owner's situation depends on",
+    "vpn_wireguard": "a VPN connection, not a service the owner's situation depends on",
+    "wallabag": "saved items, nothing that changes the situation by the hour",
+    "wise": "needs a profile id first (follow-up)",
+    "zapier": "its runs are not reachable by one read-only call yet (follow-up)",
+    "zoom": "their meetings are on the calendar",
+}
 
 KEYS: dict[str, KeyPreset] = {p.id: p for p in [
     KeyPreset("asana", "Asana", "asana-api", ("app.asana.com",), {"type": "bearer_header"},
@@ -207,26 +243,26 @@ GOOGLE = KeyPreset(
     fields=(Field("key", N_("Service account key (JSON)")),), mint="google")
 GOOGLE_CONNECTORS = ("google_calendar", "google_docs", "google_drive", "google_forms", "google_sheets", "google_slides")
 
-# The agent's own browser does the work; a login, when the site needs one, is kept in the vault and typed by the server.
-BROWSER: dict[str, str] = {
-    "agoda": "https://www.agoda.com", "canva": "https://www.canva.com", "expedia": "https://www.expedia.com", "opentable": "https://www.opentable.com",
-    "instacart": "https://www.instacart.com", "facebook_cli": "https://www.facebook.com", "instagram": "https://www.instagram.com", "threads": "https://www.threads.com",
-    "messenger_read": "https://www.messenger.com", "box": "https://app.box.com", "quickbooks": "https://qbo.intuit.com", "spotify": "https://open.spotify.com",
-    "google_contacts": "https://contacts.google.com", "google_tasks": "https://calendar.google.com/calendar/u/0/r/tasks", "meta_catalog_search": "https://www.facebook.com/marketplace",
-    # used mostly in Korea (featured there: catalog.Service.regions)
-    "naver": "https://www.naver.com", "kakao": "https://map.kakao.com", "coupang": "https://www.coupang.com", "baemin": "https://www.baemin.com",
-    "toss": "https://toss.im", "daangn": "https://www.daangn.com",
-}
-BLOCKS_BOTS = {"facebook_cli", "instagram", "threads", "messenger_read", "google_contacts", "google_tasks", "meta_catalog_search", "coupang"}
+def _ways() -> dict[str, Any]:
+    """content/connector_ways.json (ASSISTANT_CONTENT_DIR in the container): which catalog services are reached through the agent's own
+    browser (a login, when the site needs one, is kept in the vault and typed by the server) and which cannot be used, with the reason."""
+    root = Path(os.environ.get("ASSISTANT_CONTENT_DIR") or Path(__file__).resolve().parents[2] / "content")
+    try:
+        return json.loads((root / "connector_ways.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
-UNSUPPORTED: dict[str, str] = {
-    "apple_healthkit": N_("iPhone health data can only be read by an app installed on the phone. A web app can't."),
-    "google_health_connect": N_("Health Connect data can only be read by an app installed on Android. A web app can't."),
-    "shop-pay": N_("This app doesn't pay for you with a saved card."),
-    "stripe-link": N_("This app doesn't pay for you with a saved card."),
-    "shopify-ucp": N_("This payment link is made only for another product, so this app can't use it."),
-    "philips_hue": N_("For safety, the agent is blocked from devices on your home network."),
+
+_REASONS = {
+    "phone_app_only_ios": N_("iPhone health data can only be read by an app installed on the phone. A web app can't."),
+    "phone_app_only_android": N_("Health Connect data can only be read by an app installed on Android. A web app can't."),
+    "no_saved_card_pay": N_("This app doesn't pay for you with a saved card."),
+    "other_product_only": N_("This payment link is made only for another product, so this app can't use it."),
+    "home_network": N_("For safety, the agent is blocked from devices on your home network."),
 }
+BROWSER: dict[str, str] = {k: str(v["url"]) for k, v in (_ways().get("browser") or {}).items()}
+BLOCKS_BOTS = {k for k, v in (_ways().get("browser") or {}).items() if v.get("blocks_bots")}
+UNSUPPORTED: dict[str, str] = {k: _REASONS[v] for k, v in (_ways().get("unsupported") or {}).items() if v in _REASONS}
 
 
 def browser_hint(cid: str) -> str:

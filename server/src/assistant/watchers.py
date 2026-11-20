@@ -23,15 +23,16 @@ times as late, and the owner is told once a day to open the page in Kelo's brows
 A watcher that is READY TO BUY (it has a purchase permission with count and money left, buy_ready.py, docs/instant-buy.md) may look
 every 2 minutes (ARMED_MIN_MINUTES) and its hit fires at once, without the 30 s look: at the hit a short buying run starts on its parked tab.
 Internal APIs: `method` GET|POST, `body` (POST, at most 4 KB), `headers` (at most 8: Accept, Content-Type, X-Requested-With, Referer, Origin or
-X-...; never Cookie or Authorization), `signed_in`. A watcher only reads: a POST whose address or body names an action (order, pay, book,
-cancel, ...) is refused.
+X-...; never Cookie or Authorization), `signed_in`. A watcher only reads: it is a GET unless the owner approves a POST: the agent's
+watch_dry_run and watch_enable of a POST watcher are cards showing the method, the address and the body (no word of the address decides).
 
 kind "script"  a short Python snippet run in the work room (no network, no secrets): it gets the fetched page (when `url` is set) as
                  page.html and page.txt in its folder and prints a last line of JSON {"hit": true|false, "value": "..."}.
 
 Each watcher starts off. A dry run (`watch_dry_run`, POST /api/watchers/{id}/dry-run) checks it once and shows what it found; the agent
-shows that to the user, and only a watcher with a successful dry run since its condition last changed (and within DRY_RUN_FRESH) can be
-turned on (`watch_enable`, which the user approves). The dry run's finding is the starting point: the watcher fires on the next change
+reports it, and only a watcher with a successful dry run since its condition last changed (and within DRY_RUN_FRESH) can be
+turned on (`watch_enable`: a GET watcher checks once itself and turns on at once, since the user's request is the go-ahead; a
+watcher that POSTs asks the user's approval card). The dry run's finding is the starting point: the watcher fires on the next change
 into the condition (text that appears, a number that crosses the line, any change), not again while the condition simply stays true.
 
 When it fires: a notification (watch_fired, with a push) and a hidden handoff to the main agent (like a background job's report, never
@@ -43,17 +44,18 @@ Watcher: {"id", "name", "kind": page|script, "url", "mode", "match", "selector",
   (GET|POST), "body", "headers" ({name: value} or null), "level" (light|tab|page, the raised level now in force, else null), "level_until"
   (when that ends), "code" (script only, else null), "note" (what to do when it fires), "every_minutes", "enabled", "once", "state": off|watching|error|done,
   "description" (Korean words), "last_value", "last_checked_at", "next_check_at", "last_fired_at", "fire_count", "error_count",
-  "last_error", "disabled_reason", "dry_run": DryRun|null, "can_enable": bool, "created_at", "updated_at", "created_by": user|agent,
+  "last_error", "disabled_reason", "dry_run": DryRun|null, "last_check": LastCheck|null, "can_enable": bool, "created_at", "updated_at", "created_by": user|agent,
   "buy": null | {"armed": true, "tab": "buy:<id>", "last_kept_at", "signed_in": bool|null, "problems": [{"code", "text"}], "remembered": bool}
   (ready to buy: a purchase permission with count and money left; problem codes card_needs_phone, no_card, no_shipping, signed_out, cap_used, browser_off)}
 DryRun: {"at", "ok", "satisfied", "value", "detail" (Korean line), "error", "url", "title", "level": light|tab|page|null (how it looked)}
+LastCheck: {"at", "detail", "value", "hit": bool, "error"}
 GET    /api/watchers                    {"items": [Watcher], "limit": MAX_WATCHERS}
 POST   /api/watchers                    201 Watcher (always off). 422 {"detail"} for a bad url / mode / selector / regex / interval
 GET/PATCH/DELETE /api/watchers/{id}     PATCH: any POST field; changing what is checked turns it off until a new dry run
 POST   /api/watchers/{id}/buy-check     the ready-to-buy keep-alive now -> the `buy` object; 404 when the watcher is not ready to buy
 POST   /api/watchers/{id}/dry-run       {"result": DryRun, "watcher": Watcher}
 POST   /api/watchers/{id}/enable        {"enabled": bool} -> Watcher; 409 {"detail"} when turning on without a fresh successful dry run
-GET    /api/watchers/{id}/events        {"items": [{"id", "at", "kind": fired|error|dry_run|enabled|disabled, "detail", "value"}]}
+GET    /api/watchers/{id}/events        {"items": [{"id", "at", "kind": fired|error|dry_run|enabled|disabled|checked, "detail", "value", "count"}]}
 """
 
 from __future__ import annotations
@@ -70,7 +72,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import unquote_plus, urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException
@@ -122,10 +124,11 @@ CREATE TABLE IF NOT EXISTS watchers (
     last_value TEXT, last_hit INTEGER, last_checked_at REAL, next_check_at REAL, last_fired_at REAL,
     fire_count INTEGER NOT NULL DEFAULT 0, error_count INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '',
     dry_run TEXT NOT NULL DEFAULT '', dry_run_at REAL, config_at REAL NOT NULL, disabled_reason TEXT NOT NULL DEFAULT '',
+    last_detail TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL, updated_at REAL NOT NULL, created_by TEXT NOT NULL DEFAULT 'user');
 CREATE TABLE IF NOT EXISTS watch_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, watch_id INTEGER NOT NULL, at REAL NOT NULL, kind TEXT NOT NULL,
-    detail TEXT NOT NULL DEFAULT '', value TEXT);
+    detail TEXT NOT NULL DEFAULT '', value TEXT, count INTEGER NOT NULL DEFAULT 1);
 CREATE INDEX IF NOT EXISTS watch_events_by_watch ON watch_events(watch_id, id);
 """
 CONDITION_FIELDS = ("kind", "url", "mode", "match", "selector", "regex", "threshold", "use_browser", "code", "signed_in", "method", "body",
@@ -133,12 +136,9 @@ CONDITION_FIELDS = ("kind", "url", "mode", "match", "selector", "regex", "thresh
 # columns added after the first release (CREATE TABLE above has the first ones): added to an older database when the module starts
 NEW_COLUMNS = (("signed_in", "INTEGER NOT NULL DEFAULT 0"), ("method", "TEXT NOT NULL DEFAULT 'GET'"), ("body", "TEXT NOT NULL DEFAULT ''"),
                ("headers", "TEXT NOT NULL DEFAULT ''"), ("level", "TEXT NOT NULL DEFAULT ''"), ("level_until", "REAL"),
-               ("backoff", "INTEGER NOT NULL DEFAULT 1"), ("human_notice_at", "REAL"), ("confirming", "INTEGER NOT NULL DEFAULT 0"))
+               ("backoff", "INTEGER NOT NULL DEFAULT 1"), ("human_notice_at", "REAL"), ("confirming", "INTEGER NOT NULL DEFAULT 0"),
+               ("last_detail", "TEXT NOT NULL DEFAULT ''"))
 
-ACTION_WORDS = frozenset("order pay payment checkout purchase buy book booking reserve reservation cancel delete remove apply submit send "
-                         "confirm".split())
-ACTION_KO = ("결제", "주문", "구매", "예약", "예매", "신청", "취소", "삭제", "발송")
-READ_KO = ("조회", "검색", "목록")
 HEADER_OK = frozenset({"accept", "content-type", "x-requested-with", "referer", "origin"})
 HEADER_NEVER = frozenset({"cookie", "authorization", "proxy-authorization", "x-http-method-override", "x-method-override"})
 CHECK_MARKS = ("challenges.cloudflare.com", "_cf_chl_opt", "cf-browser-verification", "captcha-delivery.com", "px-captcha")
@@ -256,23 +256,9 @@ def default_content_type(body: str) -> str:
 
 
 # ---------------------------------------------------------------------------------------------------------------- what a watcher may send
-def action_word(text: str) -> str | None:
-    """The first word in `text` (a url path or a body) that names an action (order, book, cancel, 결제, ...), else None. Whole words only:
-    words split at anything but letters and digits and at camelCase; a plural counts; a Korean run counts when it holds an action word and
-    no reading word (조회, 검색, 목록)."""
-    spread = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", unquote_plus(text or ""))
-    for tok in re.findall(r"[A-Za-z]+|[가-힣]+", spread):
-        low = tok.lower()
-        if low.isascii():
-            if low in ACTION_WORDS:
-                return low
-            if low.endswith("s") and low[:-1] in ACTION_WORDS:
-                return low[:-1]
-        elif not any(r in tok for r in READ_KO):
-            for a in ACTION_KO:
-                if a in tok:
-                    return a
-    return None
+# A watcher's own request is a GET unless the owner approves a POST: the agent's watch_dry_run of a POST watcher (the first time its
+# request is made) and its watch_enable are cards that show the method, the address and the body (watch_tools). No word in the address
+# or the body decides anything (docs/no-word-lists.md, H7).
 
 
 def clean_headers(raw: Any) -> dict[str, str]:
@@ -362,6 +348,19 @@ def parse_html(html: str) -> _Tree:
     except Exception:  # noqa: BLE001 - a broken page still gives what was read
         pass
     return t
+
+
+def has_password_box(html: str) -> bool:
+    """The page holds an input of type password: the structure of a sign-in form (signin_state.sign_in_address reads the address)."""
+    stack = [parse_html(html).root]
+    while stack:
+        n = stack.pop()
+        for c in n.children:
+            if isinstance(c, Node):
+                if c.tag == "input" and c.attrs.get("type", "").lower() == "password":
+                    return True
+                stack.append(c)
+    return False
 
 
 def text_of(node: Node) -> str:
@@ -659,6 +658,9 @@ class Watchers:
             for col, ddl in NEW_COLUMNS:
                 if col not in have:
                     store._db.execute(f"ALTER TABLE watchers ADD COLUMN {col} {ddl}")
+            have_events = {r[1] for r in store._db.execute("PRAGMA table_info(watch_events)")}
+            if "count" not in have_events:
+                store._db.execute("ALTER TABLE watch_events ADD COLUMN count INTEGER NOT NULL DEFAULT 1")
             store._db.commit()
 
     # ------------------------------------------------------------------ the light look
@@ -703,6 +705,11 @@ class Watchers:
         else:
             state = "done" if (r["once"] and r["fire_count"]) else "off"
         kept = r["level"] in LEVELS and (r["level_until"] or 0) > self.clock()
+        last_check = {
+            "at": r["last_checked_at"], "detail": r.get("last_detail") or None,
+            "value": _shown_value(r["last_value"]), "hit": bool(r["last_hit"]),
+            "error": r["last_error"] or None,
+        } if r["last_checked_at"] is not None else None
         return {"id": r["id"], "name": r["name"], "kind": r["kind"], "url": r["url"] or None, "mode": r["mode"], "match": r["match"] or None,
                 "selector": r["selector"] or None, "regex": r["regex"] or None, "threshold": r["threshold"],
                 "use_browser": bool(r["use_browser"]), "signed_in": bool(r["signed_in"]), "method": r["method"] or "GET",
@@ -712,7 +719,7 @@ class Watchers:
                 "description": describe(r), "last_value": _shown_value(r["last_value"]), "last_checked_at": r["last_checked_at"],
                 "next_check_at": r["next_check_at"] if r["enabled"] else None, "last_fired_at": r["last_fired_at"],
                 "fire_count": r["fire_count"], "error_count": r["error_count"], "last_error": r["last_error"] or None,
-                "disabled_reason": r["disabled_reason"] or None, "dry_run": dry, "can_enable": self._fresh(r),
+                "disabled_reason": r["disabled_reason"] or None, "dry_run": dry, "last_check": last_check, "can_enable": self._fresh(r),
                 "created_at": r["created_at"], "updated_at": r["updated_at"], "created_by": r["created_by"],
                 "buy": self.buy_view(r["id"]) if self.buy_view is not None else None}
 
@@ -742,7 +749,8 @@ class Watchers:
 
     def events(self, wid: int, limit: int = 30) -> list[dict[str, Any]]:
         rows = self.store._all("SELECT * FROM watch_events WHERE watch_id = ? ORDER BY id DESC LIMIT ?", (wid, max(1, min(limit, KEEP_EVENTS))))
-        return [{"id": r["id"], "at": r["at"], "kind": r["kind"], "detail": r["detail"], "value": _shown_value(r["value"])} for r in rows]
+        return [{"id": r["id"], "at": r["at"], "kind": r["kind"], "detail": r["detail"], "value": _shown_value(r["value"]),
+                 "count": int(r.get("count") or 1)} for r in rows]
 
     def fired_since(self, since: float) -> list[dict[str, Any]]:
         rows = self.store._all("SELECT e.*, w.name FROM watch_events e JOIN watchers w ON w.id = e.watch_id "
@@ -750,8 +758,19 @@ class Watchers:
         return [dict(r) for r in rows]
 
     def _event(self, wid: int, kind: str, detail: str, value: str | None = None) -> None:
-        self.store._run("INSERT INTO watch_events(watch_id, at, kind, detail, value) VALUES(?,?,?,?,?)",
+        self.store._run("INSERT INTO watch_events(watch_id, at, kind, detail, value, count) VALUES(?,?,?,?,?,1)",
                         (wid, self.clock(), kind, detail[:400], value))
+        self.store._run("DELETE FROM watch_events WHERE watch_id = ? AND id NOT IN (SELECT id FROM watch_events WHERE watch_id = ? "
+                        "ORDER BY id DESC LIMIT ?)", (wid, wid, KEEP_EVENTS))
+
+    def _checked_event(self, wid: int, detail: str, value: str | None = None) -> None:
+        last = self.store._all("SELECT id, kind, value FROM watch_events WHERE watch_id = ? ORDER BY id DESC LIMIT 1", (wid,))
+        if last and last[0]["kind"] == "checked" and last[0]["value"] == value:
+            self.store._run("UPDATE watch_events SET at = ?, detail = ?, count = count + 1 WHERE id = ?",
+                            (self.clock(), detail[:400], last[0]["id"]))
+            return
+        self.store._run("INSERT INTO watch_events(watch_id, at, kind, detail, value, count) VALUES(?,?,?,?,?,1)",
+                        (wid, self.clock(), "checked", detail[:400], value))
         self.store._run("DELETE FROM watch_events WHERE watch_id = ? AND id NOT IN (SELECT id FROM watch_events WHERE watch_id = ? "
                         "ORDER BY id DESC LIMIT ?)", (wid, wid, KEEP_EVENTS))
 
@@ -833,8 +852,6 @@ class Watchers:
                     raise WatchError(f"body is too long (at most {MAX_BODY} characters)")
                 if use_browser:
                     raise WatchError("use_browser loads the page itself, so it cannot POST; use method GET, or drop use_browser")
-                if word := action_word(urlsplit(url).path) or action_word(body):
-                    raise WatchError(f"a watcher only reads; that address looks like it does something ('{word}')")
         else:
             signed_in = 0
         return {"name": name, "kind": kind, "url": url, "mode": mode, "match": match, "selector": selector, "regex": regex,
@@ -846,12 +863,22 @@ class Watchers:
         if self.store._all("SELECT COUNT(*) AS n FROM watchers")[0]["n"] >= MAX_WATCHERS:
             raise WatchError(f"at most {MAX_WATCHERS} watchers; remove one first")
         f = self._clean(fields)
+        if created_by == "agent" and (twin := self._twin(f)) is not None:   # the same watch again: the one that exists, refreshed
+            self.update(twin, name=f["name"], note=f["note"], once=f["once"])
+            return self.get(twin) or {}
         now = self.clock()
         cols = list(f)
         wid = int(self.store._run(f"INSERT INTO watchers({', '.join(cols)}, enabled, config_at, created_at, updated_at, created_by) "
                                   f"VALUES({', '.join('?' * len(cols))}, 0, ?, ?, ?, ?)",
                                   (*f.values(), now, now, now, created_by)).lastrowid or 0)
         return self.get(wid) or {}
+
+    def _twin(self, f: dict[str, Any]) -> int | None:
+        """The agent's own watcher with the same check and interval, if there is one: the same watch is not kept twice."""
+        for r in self.store._all("SELECT * FROM watchers WHERE created_by = 'agent'"):
+            if all(r[k] == f[k] for k in (*CONDITION_FIELDS, "every_seconds")):
+                return int(r["id"])
+        return None
 
     def update(self, wid: int, **changes: Any) -> dict[str, Any] | None:
         r = self._row(wid)
@@ -913,8 +940,8 @@ class Watchers:
                 self._event(wid, "disabled", t("Turned off"))
             return self.get(wid)
         if not self._fresh(r):
-            raise WatchError("run a dry run first (watch_dry_run) and show the user its result; a watcher can be turned on only after a "
-                             "successful dry run of its current settings within the last 24 hours")
+            raise WatchError("run a dry run first (watch_dry_run); a watcher can be turned on only after a successful dry run of its "
+                             "current settings within the last 24 hours")
         dry = json.loads(r["dry_run"])
         # the dry run's finding is the starting point: only a change into the condition fires
         self.store._run("UPDATE watchers SET enabled = 1, next_check_at = ?, last_value = ?, last_hit = ?, error_count = 0, last_error = '', "
@@ -1001,7 +1028,7 @@ class Watchers:
                     raise WatchError(f"the site asks for a check that a background look cannot pass ({why})")
                 if page.status >= 400:
                     raise WatchError(f"the page answered HTTP {page.status}")
-                if sign_in_address(page.url) and not sign_in_address(r["url"]):
+                if (sign_in_address(page.url) or has_password_box(page.body)) and not sign_in_address(r["url"]) and page.url != r["url"]:
                     return self._signed_out(r, page, level, first)   # never evaluate the condition on a sign-in page (a false "gone")
             if r["kind"] == "script":
                 if self.script_runner is None:
@@ -1108,14 +1135,15 @@ class Watchers:
         fires = res["satisfied"] and (r["mode"] == "changed" or not r["last_hit"])
         if fires and not r["confirming"] and not armed:   # a hit: look once more in 30 s (the scheduler comes back) before it wakes the owner; a watcher ready to buy fires at once (the buying run looks at the page itself)
             self.store._run("UPDATE watchers SET last_checked_at = ?, next_check_at = ?, error_count = 0, last_error = '', backoff = 1, "
-                            "confirming = 1 WHERE id = ?", (now, now + CONFIRM_DELAY, wid))
+                            "confirming = 1, last_detail = ? WHERE id = ?", (now, now + CONFIRM_DELAY, res.get("detail", ""), wid))
             return {**res, "confirming": True}
         if r["mode"] == "changed":
             last_value = res["value"] if (res["satisfied"] or not r["last_value"]) else r["last_value"]
         else:
             last_value = res["value"]
         self.store._run("UPDATE watchers SET last_checked_at = ?, next_check_at = ?, error_count = 0, last_error = '', last_value = ?, "
-                        "last_hit = ?, backoff = 1, confirming = 0 WHERE id = ?", (now, nxt, last_value, int(bool(res["satisfied"])), wid))
+                        "last_hit = ?, backoff = 1, confirming = 0, last_detail = ? WHERE id = ?",
+                        (now, nxt, last_value, int(bool(res["satisfied"])), res.get("detail", ""), wid))
         if fires:
             self.store._run("UPDATE watchers SET fire_count = fire_count + 1, last_fired_at = ? WHERE id = ?", (now, wid))
             self._event(wid, "fired", res["detail"], res.get("value"))
@@ -1124,6 +1152,8 @@ class Watchers:
                                 (t("Turned off after telling you once"), wid))
             if self.on_fire:
                 _call(self.on_fire, self.get(wid) or {}, res)
+        else:
+            self._checked_event(wid, res["detail"], _shown_value(res.get("value")))
         return res
 
     def due(self, now: float) -> list[int]:
@@ -1203,13 +1233,36 @@ def watch_tools(watchers: Watchers) -> list[Tool]:
               "signed_in", "method", "body", "headers")
 
     async def add(args: dict[str, Any]) -> str:
+        known = {r["id"] for r in watchers.list()}
         try:
             w = watchers.create("agent", **{k: args.get(k) for k in fields})
         except WatchError as e:
             return f"error: {e}"
-        return (f"Saved watcher #{w['id']} '{w['name']}' ({w['description']}); it is off. Next: watch_dry_run(id={w['id']}), show the user "
-                "what it found, then watch_enable. If you are to buy, book, send or change something when it fires, also ask once now with "
-                f"task_allow(watcher_id={w['id']}, trigger, action, ...) so that it is not stuck on a card nobody answers in time.")
+        wid_ = w["id"]
+        again = wid_ in known
+        head = f"Watcher #{wid_} '{w['name']}' ({w['description']})"
+        kept = " was already set up with these settings; kept." if again else " saved."
+        task = (" If you will act when it fires (buy, book, send, change something), also ask once now with "
+                f"task_allow(watcher_id={wid_}, trigger, action, ...) so that it is not stuck on a card nobody answers in time.")
+        if not args.get("start"):
+            return (f"{head}{kept} It is off. Next: watch_enable(id={wid_}), which checks once and turns it on. Then tell the user it is "
+                    "on, with the current value." + task)
+        if w["method"] != "GET":
+            return f"{head}{kept} It is off: a watcher that POSTs needs the user's approval card first: watch_enable(id={wid_})." + task
+        if w["enabled"]:
+            return f"{head}{kept} It is already on. Tell the user, with the interval." + task
+        dry = await watchers.dry_run(wid_)
+        if dry is None or not dry["ok"]:
+            why = (dry or {}).get("error") or (dry or {}).get("detail") or "no such watcher"
+            return f"{head}{kept} Not turned on: the check failed ({data(str(why))}). Fix the watcher with watch_update, then " \
+                   f"watch_enable(id={wid_})."
+        watchers.enable(wid_, True)
+        now = "the condition is TRUE right now" if dry["satisfied"] else "the condition is not true right now"
+        found = str(dry["detail"]) + (f"; value: {dry['value']}" if dry["value"] else "")   # quotes the page: marked, fenced
+        return (f"{head}{kept} It is ON now: it checks every {w['every_minutes']} minutes and tells the user on the next change into "
+                f"the condition. Right now {now}: " + data(found) +
+                "\nTell the user it is on, the interval and this current value. Do not ask them to confirm it, and do not ask again "
+                "whether to turn it on." + task)
 
     async def list_(args: dict[str, Any]) -> str:
         items = watchers.list()
@@ -1226,7 +1279,7 @@ def watch_tools(watchers: Watchers) -> list[Tool]:
             return f"error: {e}"
         if w is None:
             return "error: no such watcher"
-        return "Updated:\n" + line(w) + ("" if w["enabled"] else "\nIt is off: run watch_dry_run, show the result, then watch_enable.")
+        return "Updated:\n" + line(w) + ("" if w["enabled"] else "\nIt is off: call watch_enable (it checks once first).")
 
     async def remove(args: dict[str, Any]) -> str:
         return "Removed." if watchers.delete(wid(args)) else "error: no such watcher"
@@ -1241,33 +1294,50 @@ def watch_tools(watchers: Watchers) -> list[Tool]:
         found = str(res['detail']) + (f"; value: {res['value']}" if res["value"] else "")   # quotes the page: marked, fenced by the loop
         how = {"light": "a plain request from the server", "tab": "a request made inside the browser (with the owner's sign-ins)",
                "page": "a full page load in the browser"}.get(res.get("level") or "", "")
-        return (f"Dry run, {now}" + (f" (looked via {res['level']}: {how})" if how else "") + ": " + data(found) + "\nShow this to the user "
-                "before turning it on. Once on, it tells them on the next change into the condition (not about the current state, so "
-                "if it is already true, say so now).")
+        return (f"Dry run, {now}" + (f" (looked via {res['level']}: {how})" if how else "") + ": " + data(found) + "\nThis is the current value. "
+                "Once on, it tells the user on the next change into the condition (not about the current state, so if it is already true, "
+                "say so now).")
+
+    def is_get(args: dict[str, Any]) -> bool:
+        return ((watchers.get(wid(args)) or {}).get("method") or "GET") == "GET"
 
     def validate_enable(args: dict[str, Any]) -> str | None:
         if problem := validate_id(args):
             return problem
-        if args.get("enabled", True) is False:
+        if args.get("enabled", True) is False or is_get(args):   # a GET watcher checks once itself when it is turned on
             return None
-        w = watchers.get(wid(args)) or {}
-        if not w.get("can_enable"):
-            return "run watch_dry_run first and show the user its result; then call watch_enable"
+        if not (watchers.get(wid(args)) or {}).get("can_enable"):
+            return "a watcher that POSTs needs a dry run first (watch_dry_run), then the user's approval"
         return None
+
+    def request_text(w: dict[str, Any]) -> str:
+        """What the watcher sends: the method and the address, and the body of a POST."""
+        if not w.get("url"):
+            return ""
+        return (f"{w['method']} {w['url']}" + (" · " + t("body: {body}", body=w["body"][:200]) if w.get("method") == "POST" and w.get("body") else "") +
+                (" · " + t("signed in") if w.get("signed_in") else ""))
+
+    async def describe_dry_run(args: dict[str, Any]) -> str:
+        w = watchers.get(wid(args)) or {}
+        return t("Check watcher '{name}' once with this request: {request}", name=w.get("name", ""), request=request_text(w) or "-")[:700]
 
     async def describe_enable(args: dict[str, Any]) -> str:
         w = watchers.get(wid(args)) or {}
         dry = w.get("dry_run") or {}
-        request = ""
-        if w.get("url"):   # what it sends: the method and the address, and the body of a POST
-            request = (f"{w['method']} {w['url']}" + (" · " + t("body: {body}", body=w["body"][:200]) if w.get("method") == "POST" and w.get("body") else "") +
-                       (" · " + t("signed in") if w.get("signed_in") else ""))
+        request = request_text(w)
         return t("Turn on watcher '{name}' · {description} · {request} · result of the check just now: {detail}", name=w.get("name", ""),
                  description=w.get("description", ""), request=request or "-", detail=str(dry.get("detail", "-"))[:150])[:700]
 
     async def enable(args: dict[str, Any]) -> str:
         on = args.get("enabled", True) is not False
         try:
+            if on and not (watchers.get(wid(args)) or {}).get("can_enable") and is_get(args):
+                dry = await watchers.dry_run(wid(args))   # a GET watcher: its check is run here (never a POST's)
+                if dry is None:
+                    return "error: no such watcher"
+                if not dry["ok"]:
+                    return (f"Not turned on: the check failed ({data(str(dry['error'] or dry['detail']))}). Fix the watcher with "
+                            "watch_update, then call watch_enable again.")
             w = watchers.enable(wid(args), on)
         except WatchError as e:
             return f"error: {e}"
@@ -1287,8 +1357,7 @@ def watch_tools(watchers: Watchers) -> list[Tool]:
              "signed_in": {"type": "boolean", "description": "the page or address shows the owner's own data and needs their sign-in "
                                                              "(looked at inside the browser)"},
              "method": {"type": "string", "enum": ["GET", "POST"], "description": "GET (default) or POST to a site's own JSON address that "
-                                                                                  "only reads (search, list, status); an address that orders, "
-                                                                                  "books, pays, cancels... is refused"},
+                                                                                  "only reads (search, list, status); a POST asks the user first"},
              "body": {"type": "string", "description": "POST only: JSON or form text, at most 4096 characters"},
              "headers": {"type": "object", "additionalProperties": {"type": "string"},
                          "description": "at most 8: Accept, Content-Type, X-Requested-With, Referer, Origin, X-...; never Cookie or Authorization"},
@@ -1300,23 +1369,28 @@ def watch_tools(watchers: Watchers) -> list[Tool]:
              "once": {"type": "boolean", "description": "turn off after the first hit"}}
     bare = {k: {kk: vv for kk, vv in v.items() if kk != "description"} for k, v in props.items()}   # watch_update: same fields, described once
     return [
-        Tool("watch_add", "Set up a watcher: a cheap repeated check of a page, the site's own JSON address, or a small script that wakes you only when its "
-             "condition holds. For waiting on a condition, rather than a schedule; every_minutes as often as the request needs (5 for "
-             "something that sells out). It starts off: watch_dry_run next. If you will act when it fires, ask task_allow at setup.",
-             {"type": "object", "properties": props, "required": ["name"]}, add),
+        Tool("watch_add", "Set up a watcher: a cheap repeated check of a page, the site's own JSON address, or a small script that wakes you only when "
+             "its condition holds. For waiting on a condition, rather than a schedule; every_minutes as often as the request needs (5 only when "
+             "minutes matter). Pass start=true when the request already says what to watch, the line and how often: it is then "
+             "checked once and turned on in this one call; the user's request is the go-ahead, so never ask them to confirm it. Otherwise "
+             "it starts off (watch_enable next). If you will act when it fires, ask task_allow at setup.",
+             {"type": "object", "properties": {**props, "start": {"type": "boolean", "description": "check once and turn it on in this call"}},
+              "required": ["name"]}, add),
         Tool("watch_list", "List the watchers with their state and last finding.", {"type": "object", "properties": {}}, list_, read_only=True,
              untrusted=True, source="page"),
         Tool("watch_update", "Change a watcher (fields as in watch_add). Changing what it checks turns it off until a new dry run.",
              {"type": "object", "properties": {"id": {"type": "integer"}, **bare}, "required": ["id"]}, update, validate=validate_id),
         Tool("watch_remove", "Remove a watcher.", {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}, remove,
              validate=validate_id),
-        Tool("watch_dry_run", "Check a watcher once now without turning it on, and show the user what it found.",
+        Tool("watch_dry_run", "Check a watcher once now without turning it on, and report what it found. A watcher that POSTs asks the "
+             "user first (the card shows the method, the address and the body).",
              {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}, dry_run, validate=validate_id,
-             untrusted=True, source="page"),
-        Tool("watch_enable", "Turn a watcher on after a dry run the user saw (they approve), or off.",
+             untrusted=True, source="page", requires_approval=True, describe=describe_dry_run, auto_approve=is_get),
+        Tool("watch_enable", "Turn a watcher on or off. A GET watcher checks once and turns on at once (the user's request is the go-ahead); "
+             "a watcher that POSTs asks the user's approval card.",
              {"type": "object", "properties": {"id": {"type": "integer"}, "enabled": {"type": "boolean"}}, "required": ["id"]}, enable,
              requires_approval=True, validate=validate_enable, describe=describe_enable,
-             auto_approve=lambda a: a.get("enabled", True) is False),
+             auto_approve=lambda a: a.get("enabled", True) is False or is_get(a)),
     ]
 
 

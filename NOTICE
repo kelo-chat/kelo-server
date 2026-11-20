@@ -122,6 +122,10 @@ none is built in.
     - Korea Meteorological Administration short-term forecast (기상청 단기예보 조회서비스, data.go.kr), only with the owner's own
       service key: Korea Open Government License type 1 (credit the source, 기상청).
     - WeatherAPI.com, only with the owner's own key, under its terms (https://www.weatherapi.com/terms.aspx).
+    - US National Weather Service (https://www.weather.gov/, api.weather.gov): the forecast for places in the United States, no key;
+      a work of the US government, credited "Forecast by the US National Weather Service".
+    - MET Norway (https://api.met.no/): a fallback when Open-Meteo cannot be reached, no key; data licensed under CC BY 4.0, credited
+      "Weather data from MET Norway" with a link to https://api.met.no/.
 server/src/assistant/calendars.py reads CalDAV calendars (iCloud, Yahoo, Naver, your own server) with these Python packages, installed from
 PyPI (not copied into this repository):
     - icalendar (https://github.com/collective/icalendar): BSD 2-Clause License, Copyright (c) Plone Foundation and contributors.
@@ -135,6 +139,25 @@ PyPI (not copied into this repository):
       network layer, so that every request is pinned to one registered host.)
 server/src/assistant/day_types.py uses the `holidays` Python package (https://github.com/vacanza/holidays, MIT License) to tell public
 holidays from working days.
+
+Speech recognition for voice input (server/src/assistant/voice*.py, docs/voice.md)
+-----------------------------------------------------------------------------------
+Not part of this repository or the images. The Kelo server downloads these speech models from Hugging Face on the owner's request
+(My → 음성 입력), checks each file by its SHA-256, and keeps them in the server's own volume:
+    - SenseVoice Small, https://github.com/FunAudioLLM/SenseVoice, FunASR Model License (ONNX int8 conversion: k2-fsa, unchanged).
+    - Parakeet TDT 0.6B v3, https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3, CC BY 4.0 (int8 ONNX conversion: k2-fsa, unchanged).
+Included in the server image (the `voice` container): sherpa-onnx (k2-fsa), Apache-2.0; onnxruntime (Microsoft), MIT; Silero VAD
+(snakers4/silero-vad), MIT; opencc-python-reimplemented, Apache-2.0 (Simplified to Traditional Chinese for zh-Hant owners).
+
+Text to speech for call mode (server/src/assistant/voice_speak.py, docs/voice.md)
+---------------------------------------------------------------------------------
+Not part of this repository or the images. The Kelo server downloads this model from Hugging Face when the owner agrees (the first
+call, or My → 음성), checks each file by its SHA-256, and keeps it in the server's own volume:
+    - Supertonic 3, by Supertone Inc., https://huggingface.co/Supertone/supertonic-3, BigScience OpenRAIL-M
+      (https://huggingface.co/Supertone/supertonic-3/blob/3cadd1ee6394adea1bd021217a0e650ede09a323/LICENSE). Its use is subject to
+      the use restrictions in Attachment A of that licence. ONNX int8 conversion by k2-fsa
+      (huggingface.co/csukuangfj2/sherpa-onnx-supertonic-3-tts-int8-2026-05-11), used unchanged.
+Used as unmodified libraries: num2words (LGPL-2.1), Babel (BSD-3-Clause).
 
 Service icons (third-party trademarks)
 --------------------------------------

@@ -31,11 +31,13 @@ from urllib.parse import urlsplit
 
 from ..agent import Ours, Tool, ToolOutput, current_call, emit_ui, handover
 from ..agent.fence import data
+from ..code_shelf import SHELF
 from ..browser_history import FRAME_BYTES, FRAME_WIDTH, ActionArchive
 from ..deliverables import LibraryFileError
 from ..home import HomeError
+from ..data_trail import USES_PARAM
 from ..i18n import t
-from .browser import BrowserPolicyError, BrowserSession, browser_owner, code_mask, one_run_tab, site_of
+from .browser import BrowserPolicyError, BrowserSession, browser_owner, code_mask, one_run_tab, ref_check, site_of
 from .challenge import CHECK_TRIES, Challenge
 from .downloads import DownloadArea, DownloadError, blocked_name, clean_name
 from .login_code import AUTO_WINDOW_SECONDS, FoundCode, find_code, pick_auto_code
@@ -51,14 +53,15 @@ CODE_HOLD_SECONDS = 600    # a found code waits this long for the user's answer,
 AUTO_CODE_WAIT_SECONDS = 40.0   # after a sign-in asks for a code, the site's own mail is waited for this long before asking the user
 AUTO_CODE_FIND_WAIT_SECONDS = 15.0   # ...and this long when the agent calls find_login_code later in that sign-in
 AUTO_CODE_POLL_SECONDS = 8.0    # the mailbox is looked at this often meanwhile
-ARCHIVED_TOOLS = ("browser_", "confirm_purchase", "purchase_result", "find_login_code")
+ARCHIVED_TOOLS = ("browser_", "confirm_purchase", "checkout_review", "checkout_submit", "purchase_result", "find_login_code")
 
 
 class BrowserExtras:
     def __init__(self, session: BrowserSession, *, home: Any = None, files: Any = None, mail: Any = None, archive: ActionArchive | None = None,
                  notify: Callable[[str, str, int | None, bool], Any] | None = None, timezone: Callable[[], str] | None = None,
-                 locale: str = "", download_dir: str | None = None, clock: Callable[[], float] = time.monotonic,
-                 auto_codes: Callable[[], bool] | None = None, vault_log: Callable[..., Any] | None = None):
+                 locale: str = "", language: Callable[[], str] | None = None, download_dir: str | None = None,
+                 clock: Callable[[], float] = time.monotonic, auto_codes: Callable[[], bool] | None = None,
+                 vault_log: Callable[..., Any] | None = None, profiles: Any = None):
         """`auto_codes`: the owner's "Use codes from my mail automatically" (default on); `vault_log(item, action, detail)`: where a code
         typed without asking is recorded for the owner (never the code itself)."""
         self.session, self.home, self.files, self.mail, self.archive, self.notify = session, home, files, mail, archive, notify
@@ -66,9 +69,12 @@ class BrowserExtras:
         self.wall: Callable[[], float] = time.time           # mail times are wall-clock times
         self.auto_codes = auto_codes or (lambda: True)
         self.vault_log = vault_log
+        self.profiles = profiles   # the store: named browser profiles (brief C2)
+        self.code_judge: Any = None   # code_judge.CodeJudge; None = the shared shelf's judge (no judge: no code is typed unasked)
         self.code_wait, self.find_wait, self.code_poll = AUTO_CODE_WAIT_SECONDS, AUTO_CODE_FIND_WAIT_SECONDS, AUTO_CODE_POLL_SECONDS
         session.timezone = timezone or (lambda: "")
         session.locale = locale
+        session.user_language = language or (lambda: "")
         session.downloads = DownloadArea(download_dir or None)
         session.journal = TakeoverJournal(session.cdp_session)
         session.has_mailbox = self.has_mailbox
@@ -82,7 +88,27 @@ class BrowserExtras:
         except Exception:  # noqa: BLE001
             return False
 
-    # ------------------------------------------------------------------ a sign-in code from the site's own mail, typed without asking
+    # ------------------------------------------------------------------ a code the model read as "[verification code #N]" (code_shelf.py)
+    def hold_ref(self, args: dict[str, Any], ref: Any, site: str) -> str | None:
+        """Put the held code `ref` up for the owner's approval, or say why not (the answer is the model's). The code may only go to the page
+        of the site that sent it (a phone number has no site: the owner's approval names the sender), on https, once, within its ttl."""
+        from ..wallet import site_key
+
+        try:
+            held = SHELF.get(int(ref))
+        except (TypeError, ValueError):
+            held = None
+        if held is None:
+            return ("error: there is no held verification code with that number (it was used, or it expired after 10 minutes). Read the "
+                    "message again for a new handle, or ask the user to type the code in the live browser. Never ask for the code in chat.")
+        if urlsplit(self.session.current_url()).scheme != "https":
+            return "error: a code is typed only into an https page"
+        if held.site and site_key(site) != held.site:
+            return (f"error: verification code #{held.ref} came from {held.site} and can be typed only into a page of that site; this page is "
+                    f"{site_key(site) or site}.")
+        self._codes[current_call.get()] = (FoundCode(held.code, held.sender or "your phone", "", held.at, ref=held.ref), self.clock())
+        return None
+
     def sign_in_for(self, host: str) -> dict[str, Any] | None:
         """The sign-in the agent itself started on this tab, in this task, on the site of `host` (same registrable domain), while it is
         fresh enough for a code to be typed without asking."""
@@ -114,7 +140,8 @@ class BrowserExtras:
                 msgs = await self.mail.recent(AUTO_WINDOW_SECONDS / 60 + 2)
             except Exception:  # noqa: BLE001 - a mailbox problem: the normal flow
                 return None
-            found, why = pick_auto_code(msgs, rec["site"], float(rec["at"]), self.wall())
+            from .. import code_shelf
+            found, why = await pick_auto_code(msgs, rec["site"], float(rec["at"]), self.wall(), self.code_judge or code_shelf.SHELF.judge)
             if found is not None or why in ("ambiguous", "late") or self.wall() >= deadline:
                 break
             await asyncio.sleep(max(0.0, min(self.code_poll, deadline - self.wall())))
@@ -151,7 +178,7 @@ class BrowserExtras:
             return
         await emit_ui({"type": "browser_check", "tab": key, "site": host, "vendor": c.vendor, "name": c.name, "kind": c.kind})
         turn = current_turn.get() or {}
-        if self.notify is not None and turn.get("unattended"):
+        if self.notify is not None and turn.get("unattended") and not turn.get("self_started"):
             self.notify(t("A human check is needed"), t("{site} is showing a screen that checks whether you are a person. Open the browser tab and do it yourself.", site=host or t("The site")),
                         turn.get("task_id"), True)
 
@@ -241,6 +268,36 @@ class BrowserExtras:
                                  [(n, mimetypes.guess_type(n)[0] or "application/octet-stream", b) for n, b in got])
             return await shown(out, t("Uploading files"))
 
+        async def tabs_tool(args: dict[str, Any]) -> str:
+            action = str(args.get("action") or "")
+            tab = str(args.get("tab") or "").strip()
+            key = browser_owner.get()
+            try:
+                if action == "list":
+                    rows = await s.window_tabs(key)
+                    if not rows:
+                        return "This task has no browser window yet: open a page first."
+                    lines = [f"{'*' if r['active'] else ' '} {r['id']}: {r['title'] or '(no title)'} | {r['url'] or '(blank)'}"
+                             + (f" (opened from {r['opener']})" if r["opener"] else "") for r in rows]
+                    return "This task's tabs (* = the one you act in):\n" + "\n".join(lines)
+                if action == "switch":
+                    if not tab:
+                        return "error: give the tab id from list"
+                    await s.switch_tab(key, tab)
+                    return await s.snapshot()
+                if action == "new":
+                    await s.new_tab(key)
+                    return "A new empty tab is open in this task's window and it is the one you act in now. Open a page with browser_open."
+                if action == "close":
+                    if not tab:
+                        return "error: give the tab id from list"
+                    await s.close_window_tab(key, tab)
+                    active = next((r["id"] for r in await s.window_tabs(key) if r["active"]), "")
+                    return f"Tab {tab} is closed. This task's tab now: {active or 'none'}."
+            except BrowserPolicyError as e:
+                return f"error: {e}"
+            return "error: action must be list, switch, new or close"
+
         def check_upload(args: dict[str, Any]) -> str | None:
             paths = args.get("files")
             if not isinstance(paths, list) or not paths or len(paths) > 10:
@@ -301,12 +358,51 @@ class BrowserExtras:
             return "error: action must be save, load, forget or list"
 
         async def forget_site(args: dict[str, Any]) -> str:
-            site, user_said = str(args.get("site") or ""), str(args.get("user_said") or "")
+            site = str(args.get("site") or "")
             try:
-                res = await s.forget_site(site, user_said=user_said)
+                res = await s.forget_site(site)
             except BrowserPolicyError as e:
                 return f"Error: {e}"
             return await shown(res, t("Clearing site data"))
+
+        async def profiles_tool(args: dict[str, Any]) -> str:
+            if self.profiles is None:
+                return "error: named browser profiles are not available here"
+            action = str(args.get("action") or "")
+            try:
+                if action == "create":
+                    label = str(args.get("label") or "").strip()
+                    if not label:
+                        return "error: give the profile a name (label)"
+                    p = self.profiles.create_browser_profile(label)
+                    return (f"Browser profile {p['id']} ({p['label']}) is made. It is not signed in anywhere yet. Hand a job to it with "
+                            f"delegate(kind=browser, profile={p['id']}); the job signs in there once.")
+                if action == "list":
+                    rows = self.profiles.browser_profiles()
+                    if not rows:
+                        return "No named profiles. Every task uses the default profile (the user's own browser sign-ins)."
+                    return "Named browser profiles:\n" + "\n".join(
+                        f"- {p['id']} · {p['label']} · " + (", ".join(x["site"] for x in p["sites"]) or "not signed in anywhere") for p in rows)
+            except ValueError as e:
+                return f"error: {e}"
+            except Exception as e:  # noqa: BLE001 - a VaultError (locked keychain) is safe to show
+                return f"error: {e}"
+            return "error: action must be list or create"
+
+        def describe_profile_delete(args: dict[str, Any]) -> str:
+            pid = str(args.get("profile") or "")
+            label = next((p["label"] for p in self.profiles.browser_profiles() if p["id"] == pid), pid) if self.profiles is not None else pid
+            return t("Delete the browser profile {label} and every sign-in kept in it.", label=label)
+
+        async def profile_delete(args: dict[str, Any]) -> str:
+            if self.profiles is None:
+                return "error: named browser profiles are not available here"
+            pid = str(args.get("profile") or "").strip()
+            if not any(p["id"] == pid for p in self.profiles.browser_profiles()):
+                return "error: no such profile; browser_profiles lists them"
+            await s.close_profile_windows(pid)
+            self.profiles.delete_browser_profile(pid)
+            return await shown(f"The browser profile {pid} and every sign-in kept in it are deleted.", t("Deleting a browser profile"))
 
         # ---- one-time codes from the user's mail
         def purge_codes() -> None:
@@ -325,6 +421,9 @@ class BrowserExtras:
                 return f"error: {e}"
             if (why := getattr(s, "approve_pending", lambda _s: None)(site)) is not None:   # an approval on the phone has no code to find (2026-11-10)
                 return why
+            ref = args.get("code_ref")
+            if ref not in (None, ""):
+                return self.hold_ref(args, ref, site)
             if not self.has_mailbox():
                 return ("No mailbox is connected, so there is no mail to look in. Ask the user to type the code into the page themselves in the "
                         "live browser (Browser, then Take control), or to connect their mailbox. Never ask for the code in chat.")
@@ -366,6 +465,8 @@ class BrowserExtras:
                 text = await s.fill_code(f.code, selector=str(args.get("selector") or ""), submit=bool(args.get("submit", True)))
             except BrowserPolicyError as e:
                 return f"error: {e}"
+            if f.ref:
+                SHELF.forget(f.ref)      # single use
             return await shown(f"Found the code ({len(f.code)} digits) and typed it into the page after the user allowed it. The code is not kept.\n\n{text}",
                                t("Entering the verification code"))
 
@@ -419,12 +520,20 @@ class BrowserExtras:
             Tool("browser_upload", "Put the user's files into a file input of the page; the user approves every upload.",
                  obj({"selector": {"type": "string", "description": "the file input, or the button that adds a photo or video (the hidden input "
                                                                          "behind it is found)"},
-                      "files": {"type": "array", "items": {"type": "string"}, "description": "paths under uploads/ or files/"}},
+                      "files": {"type": "array", "items": {"type": "string"}, "description": "paths under uploads/ or files/"},
+                      "uses": USES_PARAM},
                      ["selector", "files"]),
-                 upload, requires_approval=True, untrusted=True, source="page", validate=check_upload, describe=describe_upload,
+                 upload, requires_approval=True, untrusted=True, source="page", validate=ref_check(s, check_upload), describe=describe_upload,
                  declined="The user did not allow uploading those files. Do not retry; ask what they want instead."),
             Tool("browser_save_pdf", "Save the page of your browser tab as a PDF in the user's library (files/).",
                  obj({"name": {"type": "string"}}, []), save_pdf),
+            Tool("browser_tabs", "This task's browser window and its tabs. list: the tabs with id, title and address (the active one marked). "
+                 "switch: make another tab of this window the one you read and act in. new: open an empty tab in this window and switch to it "
+                 "(then browser_open; for a job's own window). close: close a tab of this window (not the last one). Tabs of other tasks are "
+                 "never listed or reachable.",
+                 obj({"action": {"type": "string", "enum": ["list", "switch", "new", "close"]},
+                      "tab": {"type": "string", "description": "a tab id from list, for switch and close"}}, ["action"]),
+                 tabs_tool, untrusted=True, source="page"),
             Tool("browser_private", "Private browsing for a sensitive one-off visit: on gives this tab a fresh context that keeps nothing; "
                  "off goes back to the normal profile.",
                  obj({"on": {"type": "boolean"},
@@ -434,17 +543,30 @@ class BrowserExtras:
                  "this tab; forget; list). Normal tabs already share sign-ins: this is for private tabs or a lost sign-in.",
                  obj({"action": {"type": "string", "enum": ["save", "load", "forget", "list"]}, "site": {"type": "string"}}, ["action"]),
                  site_state),
-            Tool("browser_forget_site", "Remove cookies and site data of that site's domain from the browser's default context, and drop its saved sign-in state. Use it only right after the user agreed to clear that site's data in this conversation. user_said must be the user's words agreeing to clear cookies and retry (required to ensure the user explicitly consented before data is removed).",
-                 obj({"site": {"type": "string", "description": "the site to forget (e.g. example.com)"},
-                      "user_said": {"type": "string", "description": "the user's words agreeing to clear that site's cookies and site data"}},
-                     ["site", "user_said"]),
-                 forget_site),
+            Tool("browser_forget_site", "Remove cookies and site data of that site's domain from the browser's default context, and drop its saved "
+                 "sign-in state. The user sees a card with the site and answers with a button; nothing is removed before they allow it.",
+                 obj({"site": {"type": "string", "description": "the site to forget (e.g. example.com)"}}, ["site"]),
+                 forget_site, requires_approval=True,
+                 declined="The user did not allow clearing that site's data. Nothing was removed. Do not retry; ask them how to go on."),
+            Tool("browser_profiles", "Named browser profiles: a separate set of sign-ins for another account on the same site. Create one only "
+                 "when the user asks for another account; list shows each profile's id, name and the sites it was signed in to (a listed site "
+                 "does not prove the sign-in still works). The default profile is the one every task uses unless a profile is given.",
+                 obj({"action": {"type": "string", "enum": ["list", "create"]},
+                      "label": {"type": "string", "description": "the name, for create"}}, ["action"]),
+                 profiles_tool),
+            Tool("browser_profile_delete", "Delete a named browser profile and every sign-in kept in it. The user sees a card and answers with a button.",
+                 obj({"profile": {"type": "string", "description": "a profile id from browser_profiles"}}, ["profile"]),
+                 profile_delete, requires_approval=True, describe=describe_profile_delete,
+                 declined="The user did not allow deleting that profile. Nothing was removed. Do not retry; ask them how to go on."),
             Tool("find_login_code", "A sign-in page wants a one-time code the site sent by email: finds it in the user's mailbox (last "
                  f"{CODE_MINUTES} minutes) and types it in once the user allows. You never see the code.",
                  obj({"site": {"type": "string", "description": "default: the page's"},
+                      "code_ref": {"type": "integer", "description": "the number N of a '[verification code #N]' you read in a message or text: "
+                                   "that held code is typed (once, only into its sender's site, after the user allows). Without it the "
+                                   "mailbox is searched."},
                       "selector": {"type": "string", "description": "the code box, if not found by itself"},
                       "submit": {"type": "boolean", "description": "press Enter after (default true)"}}, []),
-                 code_enter, requires_approval=True, untrusted=True, source="page", hold=code_hold, describe=code_describe, approval_extra=code_extra,
+                 code_enter, requires_approval=True, untrusted=True, source="page", hold=code_hold, validate=ref_check(s), describe=code_describe, approval_extra=code_extra,
                  declined="The user did not want that code typed. Do not retry; ask them how to go on."),
             Tool("browser_look", "A picture of the visible part of your page with a box and its ref (e12) on everything that can be "
                  "clicked or typed into. For a page that is mostly pictures, a canvas or a map, or when a reading gives no ref for what "

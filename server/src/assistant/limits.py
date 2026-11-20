@@ -29,15 +29,19 @@ OPTIONS: dict[str, tuple[str, str, str]] = {
     "browser_memory": ("BROWSER_MEMORY", "size", "browser RAM"),
     "browser_cpus": ("BROWSER_CPUS", "cpus", "browser CPUs"),
     "browser_cache": ("BROWSER_CACHE_MB", "mb", "browser disk cache"),
+    "work_browser_memory": ("WORK_BROWSER_MEMORY", "size", "work browser RAM"),
+    "work_browser_cpus": ("WORK_BROWSER_CPUS", "cpus", "work browser CPUs"),
     "cli_memory": ("CLI_MEMORY", "size", "Claude/agy container RAM"),
     "cli_cpus": ("CLI_CPUS", "cpus", "Claude/agy container CPUs"),
     "workroom_memory": ("WORKROOM_MEMORY", "size", "work room RAM"),
     "workroom_cpus": ("WORKROOM_CPUS", "cpus", "work room CPUs"),
     "workroom_disk": ("WORKROOM_DISK", "size", "work room scratch space"),
+    "voice_memory": ("VOICE_MEMORY", "size", "speech-to-text RAM"),
+    "voice_cpus": ("VOICE_CPUS", "cpus", "speech-to-text CPUs"),
 }
 # The work room runs code the agent wrote, so it is capped even when nothing was chosen (compose.yml has the same defaults).
 # `none` writes 0 for these, which lifts the cap; leaving them unset keeps the default.
-DEFAULTS: dict[str, int] = {"workroom_memory": 2 * 1024**3, "workroom_disk": 2 * 1024**3}
+DEFAULTS: dict[str, int] = {"workroom_memory": 2 * 1024**3, "workroom_disk": 2 * 1024**3, "voice_memory": 2 * 1024**3}
 DOCKER_MIN_MEMORY = 6 * MB
 
 
@@ -76,7 +80,7 @@ def whole(opt: str, cap: Capacity) -> str:
     if opt in ("disk", "workroom_disk"):
         return f"whole disk ({fmt_size(cap.disk_free)} free)" if cap.disk_free is not None else "whole disk"
     if opt == "browser_cache":
-        return "browser default"
+        return "browser default (1 GB)"
     if kind == "cpus":
         return f"all {cap.cpus} CPUs" if cap.cpus else "all CPUs"
     return f"whole computer ({fmt_size(cap.ram)})" if cap.ram else "whole computer"
@@ -92,13 +96,8 @@ PROFILE_LABEL = profiles.LABEL
 
 
 def host_capacity(m: Instances) -> tuple[int | None, int | None]:
-    """(CPUs, RAM bytes) that Docker can hand out on this computer."""
-    r = m.run(["docker", "info", "--format", "{{.NCPU}} {{.MemTotal}}"], capture_output=True, text=True)
-    try:
-        cpus, mem = (r.stdout or "").split()[:2]
-        return int(cpus), int(mem)
-    except (ValueError, TypeError):
-        return None, None
+    """(CPUs, RAM bytes) that Docker can hand out here."""
+    return m.host_capacity()
 
 
 def prepare(m: Instances, wanted: dict[str, str | None]) -> tuple[dict[str, str], list[str], list[str]]:
@@ -125,14 +124,14 @@ def prepare(m: Instances, wanted: dict[str, str | None]) -> tuple[dict[str, str]
             looked = True
         if kind == "cpus":
             if host_cpus and value > host_cpus:
-                raise LimitError(f"--{opt.replace('_', '-')}: this computer's Docker has {host_cpus} CPUs, so {value:g} is too many.")
+                raise LimitError(f"--{opt.replace('_', '-')}: this computer's {m.runtime_name} has {host_cpus} CPUs, so {value:g} is too many.")
             set_[key] = f"{value:g}"
         else:
             if opt not in ("disk", "browser_cache", "workroom_disk"):
                 if value < DOCKER_MIN_MEMORY:
-                    raise LimitError(f"--{opt.replace('_', '-')}: Docker needs at least {fmt_size(DOCKER_MIN_MEMORY)} of RAM.")
+                    raise LimitError(f"--{opt.replace('_', '-')}: {m.runtime_name} needs at least {fmt_size(DOCKER_MIN_MEMORY)} of RAM.")
                 if host_mem and value > host_mem:
-                    raise LimitError(f"--{opt.replace('_', '-')}: this computer's Docker has {fmt_size(host_mem)} of RAM, so {fmt_size(value)} is too much.")
+                    raise LimitError(f"--{opt.replace('_', '-')}: this computer's {m.runtime_name} has {fmt_size(host_mem)} of RAM, so {fmt_size(value)} is too much.")
             set_[key] = str(max(1, round(value / MB))) if kind == "mb" else str(value)
         low = profiles.FLOOR[opt]
         if value < low:          # still allowed: the person may know better, but they are told what was measured
@@ -211,12 +210,14 @@ def report(m: Instances, *, only: str | None = None, get: Callable[..., Any] = h
         inst = m.load(n)
         cur, stats = {o: shown(inst, o, cap) for o in OPTIONS}, _stats(m, inst)
         lines.append(f"{n}  size: {size_text(inst)}")
-        rows = [("server", "memory", "cpus"), ("browser", "browser_memory", "browser_cpus")]
+        rows = [("server", "memory", "cpus"), ("browser", "browser_memory", "browser_cpus"),
+                ("work-browser", "work_browser_memory", "work_browser_cpus")]
         if inst.is_main:
             rows += [(s, "cli_memory", "cli_cpus") for s in ("claude-cli", "agy-cli") if s in stats]
         rows.append(("workroom", "workroom_memory", "workroom_cpus"))
+        rows.append(("voice", "voice_memory", "voice_cpus"))
         for service, mem_opt, cpu_opt in rows:
-            if service == "browser" and not inst.browser:
+            if service in ("browser", "work-browser") and not inst.browser:
                 continue
             st = stats.get(service)
             now_mem = f"{fmt_size(st['mem'])} now, " if st else ""
@@ -342,7 +343,7 @@ def committed_ram(m: Instances, exclude: str | None = None) -> int:
         if n == (exclude or MAIN) or not m.env_path(n).is_file():
             continue
         inst = m.load(n)
-        for opt in ("memory", "browser_memory", "workroom_memory"):
+        for opt in ("memory", "browser_memory", "work_browser_memory", "workroom_memory", "voice_memory"):
             total += int(_setting(inst, opt) or 0)
         total += int(_setting(inst, "cli_memory") or 0) * cli_containers(inst)
     return total

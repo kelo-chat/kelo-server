@@ -97,9 +97,9 @@ NAME_LEN, DESC_LEN, AUTHOR_LEN, LINE_LEN, NOTE_LEN = 60, 300, 80, 200, 400
 SKILL_DESC_LEN = 1024                         # SKILL.md descriptions run long in other agents' skills; the prompt index cuts them
 
 TOP_FIELDS = {"format", "id", "kind", "version", "name", "description", "author", "homepage", "license", "icon", "strings",
-              "skill", "connector", "permissions", "ui", "store", "provides"}
+              "skill", "connector", "permissions", "ui", "store", "provides", "rules"}
 STRING_FIELDS = {"name", "description", "blurb", "reason", "help", "key_label"}
-CONNECTOR_FIELDS = {"regions", "featured", "connect"}
+CONNECTOR_FIELDS = {"regions", "featured", "connect", "situation"}
 SKILL_FIELDS = {"requires"}
 CONNECT_FIELDS = {
     "mcp": {"type", "url", "blurb"},
@@ -148,6 +148,8 @@ class Package:
     store: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     declared: bool = False                    # the manifest has a permissions section (else they are what it uses)
     provides: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))   # connector: the mail / calendar it holds and how
+    rules: tuple[Any, ...] = ()               # connector: which of its methods send / post / delete, their policy and recipient (connector_rules.py)
+    situation: Any = None                     # connector: the one read-only call that shows its state (situation_reads.SituationRead), or None
 
     @property
     def kinds(self) -> tuple[str, ...]:
@@ -657,9 +659,11 @@ def load_package(folder: Path, *, source: str = "installed", warnings: list[str]
         raise PackageError("connector.featured must be true or false")
     if "skill" in manifest:
         raise PackageError("a connector has no skill section")
+    from . import nest_manifest as nm
+    connect = _connect(sec.get("connect"))
     pkg = Package(**common, name=_line(manifest.get("name"), "name", NAME_LEN, required=True),
                   description=_line(manifest.get("description"), "description", DESC_LEN, required=True),
-                  regions=tuple(regions), featured=featured, connect=_connect(sec.get("connect")))
+                  regions=tuple(regions), featured=featured, connect=connect, situation=nm.parse_situation(sec.get("situation"), connect=connect))
     return _with_nest(pkg, manifest)
 
 
@@ -672,8 +676,17 @@ def _with_nest(pkg: Package, manifest: Mapping[str, Any]) -> Package:
     # without a permissions section a fixed picture's host is taken from the ui itself (implied below)
     ui = nm.parse_ui(manifest.get("ui"), connect=pkg.connect, store=store, image_hosts=None if declared is None else declared["image_hosts"])
     provides = nm.parse_provides(manifest.get("provides"), kind=pkg.kind, connect=pkg.connect)
-    perms = nm.effective_permissions(declared, nm.implied_permissions(pkg.connect, ui, store, provides))
-    return dc_replace(pkg, permissions=perms, ui=ui, store=store, declared=declared is not None, provides=provides)
+    perms = nm.effective_permissions(declared, nm.implied_permissions(pkg.connect, ui, store, provides, situation=pkg.situation))
+    rules: tuple[Any, ...] = ()
+    if manifest.get("rules") is not None:
+        from . import connector_rules as cr
+        if pkg.kind != "connector":
+            raise PackageError("rules belong to a connector")
+        try:
+            rules = cr.parse_rules({pkg.id: manifest["rules"]}, "rules").get(pkg.id.casefold(), ())
+        except cr.RulesError as e:
+            raise PackageError(str(e)) from e
+    return dc_replace(pkg, permissions=perms, ui=ui, store=store, declared=declared is not None, provides=provides, rules=rules)
 
 
 # ---------------------------------------------------------------------------------------------------------------- built-ins
@@ -864,7 +877,9 @@ class Registry:
                     continue
                 installed[pkg.id] = pkg
         drafts: dict[str, Package] = {}
+        draft_approved_skills: dict[str, Package] = {}
         if self.drafts_dir and self.drafts_dir.is_dir():
+            draft_records = self._read_records(self.drafts_dir)
             try:
                 folders = sorted(self.drafts_dir.iterdir())
             except OSError:
@@ -875,14 +890,23 @@ class Registry:
                 try:
                     pkg = load_package(d, source="draft", warnings=warnings)
                     drafts[pkg.id] = pkg
+                    if pkg.kind == "skill":
+                        hashes = file_hashes(d)
+                        digest = content_hash(hashes)
+                        rec = draft_records.get(pkg.id)
+                        if rec is not None and rec.get("approved_hash") == digest:
+                            draft_approved_skills[pkg.id] = pkg
                 except (PackageError, OSError) as e:
                     problems.append(f"draft {d.name}: {e}")
         if adopted:
             self._write_records(records)
         for msg in problems + warnings:
             log.warning("package: %s", msg)
-        self._skills = {**skills, **custom, **{k: v for k, v in installed.items() if v.kind == "skill"},
-                        **{k: v for k, v in drafts.items() if v.kind == "skill"}}
+        # Drafts can never shadow an installed, custom, or built-in skill id
+        safe_draft_skills = {k: v for k, v in draft_approved_skills.items()
+                             if k not in skills and k not in custom and k not in installed}
+        self._skills = {**safe_draft_skills, **{k: v for k, v in installed.items() if v.kind == "skill"},
+                        **custom, **skills}
         self._installed = installed
         self._drafts = drafts
         self._custom, self.custom_pending = custom, custom_pending
@@ -1043,6 +1067,37 @@ class Registry:
             raise PackageError(f"{pid} could not be loaded: {'; '.join(self.problems) or 'unknown reason'}")
         return got
 
+    def approve_draft(self, pid: str, *, expected_hash: str | None = None) -> Package:
+        """The owner approves a draft skill's files as they are on disk now. With `expected_hash`,
+        only when the files are still the ones they looked at. Raises PackageError."""
+        if self.drafts_dir is None:
+            raise PackageError("this server has no folder for package drafts")
+        pid = (pid or "").strip().lower()
+        if not SKILL_ID.fullmatch(pid):
+            raise PackageError(f"no draft package {pid!r}")
+        with self._lock:
+            folder = self.drafts_dir / pid
+            if not folder.is_dir() or folder.is_symlink():
+                raise PackageError(f"no draft package {pid!r}")
+            pkg = load_package(folder, source="draft")
+            hashes = file_hashes(folder)
+            digest = content_hash(hashes)
+            if expected_hash is not None and digest != expected_hash:
+                raise PackageError(f"{pid} changed again since you looked; look at it once more")
+            records = self._read_records(self.drafts_dir)
+            old = records.get(pid) or {}
+            rec = self._new_record(pkg, hashes, old.get("source") or {"type": "draft"}, reviewed=False)
+            if old.get("installed_at"):
+                rec["installed_at"] = old["installed_at"]
+            records[pid] = rec
+            self._write_records(records, self.drafts_dir)
+            self._fingerprint = None
+        self.refresh()
+        got = self.draft(pid)
+        if got is None:
+            raise PackageError(f"{pid} could not be loaded: {'; '.join(self.problems) or 'unknown reason'}")
+        return got
+
     # ---- reading
     def skills(self) -> list[Package]:
         """Built-in skills first (by id), then custom ones, then installed ones."""
@@ -1075,6 +1130,11 @@ class Registry:
         """(connector id, key_pattern) of every installed key connector that declares the shape of its keys."""
         return [(p.id, p.connect["key_pattern"]) for p in self.installed("connector")
                 if p.connect.get("type") == "key" and p.connect.get("key_pattern")]
+
+    def rules_of(self, cid: str) -> dict[str, tuple[Any, ...]] | None:
+        """The declared methods of an installed connector ({id: methods}), for connector_rules.set_package_source."""
+        p = self.installed_connector(cid)
+        return {cid: p.rules} if p is not None and p.rules else None
 
     def installed_connector(self, cid: str) -> Package | None:
         self.refresh()
@@ -1231,6 +1291,7 @@ class Registry:
     def write_custom(self, sid: str, files: Mapping[str, str], *, origin: Mapping[str, Any] | None = None, keep_others: bool = True) -> Package:
         """The owner approved exactly this text: write the custom skill's files (by default the other approved .md files stay) and
         record their content hash as approved. Refuses a built-in or installed id. Raises PackageError."""
+        from .home import front_matter
         if self.custom_dir is None:
             raise PackageError("this server has no folder for custom skills")
         sid = self.check_custom_id(sid)
@@ -1256,6 +1317,13 @@ class Registry:
                 rec["texts"] = dict(sorted(texts.items()))
                 if old.get("installed_at"):
                     rec["installed_at"] = old["installed_at"]
+                if origin and origin.get("outside_text"):
+                    rec["outside_text"] = True
+                if origin and origin.get("body"):
+                    rec["approved_body"] = str(origin["body"])
+                elif SKILL_FILE in texts:
+                    _, b = front_matter(texts[SKILL_FILE])
+                    rec["approved_body"] = b.strip()
                 records[sid] = rec
                 self._write_records(records, root)
                 if target.exists() or target.is_symlink():
@@ -1273,6 +1341,7 @@ class Registry:
     def approve_custom(self, sid: str, *, expected_hash: str | None = None) -> Package:
         """The owner approves a custom skill's files as they are on disk now (after looking at what changed). With `expected_hash`,
         only when the files are still the ones they looked at. Raises PackageError."""
+        from .home import front_matter
         if self.custom_dir is None:
             raise PackageError("this server has no folder for custom skills")
         sid = self.check_custom_id(sid)
@@ -1290,6 +1359,9 @@ class Registry:
             rec["texts"] = dict(sorted(self.custom_files(sid).items()))
             if old.get("installed_at"):
                 rec["installed_at"] = old["installed_at"]
+            if SKILL_FILE in rec["texts"]:
+                _, b = front_matter(rec["texts"][SKILL_FILE])
+                rec["approved_body"] = b.strip()
             records[sid] = rec
             self._write_records(records, self.custom_dir)
             self._fingerprint = None

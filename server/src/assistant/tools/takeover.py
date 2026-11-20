@@ -20,6 +20,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..agent.fence import data
 
@@ -27,25 +28,31 @@ WORLD = "kelo-journal"
 BINDING = "__keloJournalNote"
 MAX_ENTRIES = 60          # kept per takeover (the oldest go first)
 MAX_LINES = 14            # lines in the summary
+TAB_KINDS = ("tab_opened", "tab_switched", "tab_closed")   # what the owner did with the held window's tabs (C1d)
 
 SCRIPT = r"""(() => {
   if (window.__keloJournal) return; window.__keloJournal = 1;
   const send = (o) => { try { %(binding)s(JSON.stringify(o)); } catch (e) {} };
   const clip = (s, n) => (s || '').replace(/\s+/g, ' ').trim().slice(0, n);
   const label = (el) => clip(el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('alt')) || el.innerText
-    || (el.tagName === 'INPUT' ? el.value : '') || el.getAttribute && el.getAttribute('name') || el.id || el.tagName.toLowerCase(), 60);
+    || (el.tagName === 'INPUT' && /^(button|submit|reset)$/i.test(el.type) ? el.value : '') || el.getAttribute && el.getAttribute('name') || el.id || el.tagName.toLowerCase(), 60);
   const fieldLabel = (el) => {
     let t = '';
     if (el.labels && el.labels.length) t = el.labels[0].innerText;
     t = t || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('name') || el.id || el.type || el.tagName.toLowerCase();
     return clip(t, 50);
   };
-  const secret = (el) => {
+  // What the journal may quote (docs/no-word-lists.md): by STRUCTURE only, never by a word of the field's label. A value is kept only
+  // for a check box, a radio button, a list and a search box; every other typed value (text, number, phone, e-mail, password, a
+  // one-time code, a card field, anything typed inside a frame) is masked. When unsure, mask.
+  const quotable = (el) => {
+    if (window !== window.top) return false;
     const type = (el.getAttribute('type') || '').toLowerCase(), ac = (el.getAttribute('autocomplete') || '').toLowerCase();
-    const words = [el.name, el.id, el.getAttribute('placeholder'), el.getAttribute('aria-label')].filter(Boolean).join(' ').toLowerCase();
-    return type === 'password' || /cc-|one-time-code|password/.test(ac)
-      || /card|cvc|cvv|csc|security.?code|pin\b|otp|passcode|password|passwd|ssn|social.?security|iban|account.?num|routing|카드|비밀번호|보안\s*코드|인증|주민|계좌/.test(words);
+    if (/(^|\s)(cc-[a-z-]+|one-time-code|[a-z-]*password)(\s|$)/.test(ac)) return false;
+    if (el.tagName === 'SELECT') return true;
+    return type === 'checkbox' || type === 'radio' || type === 'search';
   };
+  const secret = (el) => !quotable(el);
   document.addEventListener('click', (e) => {
     const t = e.target && e.target.closest ? e.target : null;
     if (!t) return;
@@ -90,6 +97,7 @@ class TakeoverJournal:
         self.cdp_for = cdp_for            # page -> awaitable CDP session (BrowserSession.cdp_session)
         self.clock = clock
         self.open: dict[str, Takeover] = {}
+        self.signed_in: set[str] = set()     # tabs whose hand-back shows a sign-in typed by the owner (browser.owner_handed_back)
         self._tasks: set[asyncio.Task[Any]] = set()
 
     # ------------------------------------------------------------------ recording
@@ -151,12 +159,18 @@ class TakeoverJournal:
         except Exception:  # noqa: BLE001 - a partial journal (navigations only) is still useful
             pass
 
+    def tab_event(self, key: str, kind: str, tab_id: str, url: str) -> None:
+        """A tab of the held window was opened, switched to or closed (kind: tab_opened | tab_switched | tab_closed). Only the host of
+        its address is kept."""
+        host = (urlsplit(url or "").hostname or "").lower()[:200]
+        self.add(key, {"k": kind, "label": tab_id, "url": host})
+
     def add(self, key: str, entry: dict[str, Any]) -> None:
         t = self.open.get(key)
         if t is None or not isinstance(entry, dict):
             return
         e = {"at": self.clock(), **{k: entry.get(k) for k in ("k", "label", "href", "url", "value", "secret")}}
-        if e.get("k") not in ("click", "field", "submit", "nav"):
+        if e.get("k") not in ("click", "field", "submit", "nav", *TAB_KINDS):
             return
         if isinstance(e.get("value"), str) and _card_like(e["value"]):
             e["value"], e["secret"] = None, True       # a number that looks like a card is never kept, whatever the field said
@@ -171,6 +185,8 @@ class TakeoverJournal:
         t = self.open.pop(key, None)
         if t is None:
             return ""
+        if signed_in_by_hand(t.entries):
+            self.signed_in.add(key)
         if t.cdp is not None:
             self._spawn(self._detach(t.cdp, t.script_id))
         return summarize(t.entries, self.clock() - t.started)
@@ -188,6 +204,17 @@ class TakeoverJournal:
             await cdp.detach()
         except Exception:  # noqa: BLE001
             pass
+
+
+def signed_in_by_hand(entries: list[dict[str, Any]]) -> bool:
+    """The owner typed into a private field (a password, a code) and then submitted a form or went on to another page: a sign-in."""
+    typed = False
+    for e in entries:
+        if e.get("k") == "field" and e.get("secret"):
+            typed = True
+        elif typed and e.get("k") in ("submit", "nav"):
+            return True
+    return False
 
 
 def summarize(entries: list[dict[str, Any]], seconds: float) -> str:
@@ -210,6 +237,13 @@ def summarize(entries: list[dict[str, Any]], seconds: float) -> str:
                 lines.append(f"- set '{label}' to '{v}'" if v not in (None, "") else f"- cleared '{label}'")
         elif k == "submit":
             lines.append(f"- submitted the form '{label}'" if label else "- submitted a form")
+        elif k in TAB_KINDS:
+            host = str(e.get("url") or "")
+            if k == "tab_closed":
+                lines.append(f"- closed tab {label}")
+            else:
+                word = "opened tab" if k == "tab_opened" else "switched to tab"
+                lines.append(f"- {word} {label}" + (f" ({host})" if host else ""))
     merged: list[str] = []
     for line in lines:            # a run of the same line once
         if not merged or merged[-1] != line:
@@ -218,4 +252,4 @@ def summarize(entries: list[dict[str, Any]], seconds: float) -> str:
         merged = merged[:3] + [f"- ... {len(merged) - MAX_LINES + 2} more steps ..."] + merged[-(MAX_LINES - 4):]
     mins = max(1, round(seconds / 60))
     return (f"[While the user controlled this tab (about {mins} min) they did this themselves (labels come from the page):\n"
-            + data("\n".join(merged)) + "\nCarry on from the page as it is now; do not redo these steps.]")   # the steps quote the page: fenced
+            + data("\n".join(merged)) + "\nCarry on from the page as it is now; do not redo these steps. Handing the tab back approved no purchase and no sign-in step.]")   # the steps quote the page: fenced

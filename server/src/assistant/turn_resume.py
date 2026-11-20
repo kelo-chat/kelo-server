@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable  # noqa: F401
 from typing import TYPE_CHECKING, Any
 
+from .owner_messages import OwnerMessages
 from .reply_text import ReplyText
 from .turn_engine import Turn, _server  # noqa: F401
 
@@ -19,11 +20,12 @@ def last_user_id(ctx: Any) -> int:
     GOAL_MARK = S.GOAL_MARK
     HANDOFF_MARK = S.HANDOFF_MARK
     NEST_SHARE_MARK = getattr(S, "NEST_SHARE_MARK", "")
+    CHECKLIST_MARK = getattr(S, "CHECKLIST_MARK", "")
     RECHECK_MARK = S.RECHECK_MARK
     SCHEDULE_MARK = S.SCHEDULE_MARK
     WATCH_MARK = S.WATCH_MARK
     store = ctx.store
-    marks = tuple(m for m in (HANDOFF_MARK, WATCH_MARK, GOAL_MARK, SCHEDULE_MARK, RECHECK_MARK, NEST_SHARE_MARK) if m)
+    marks = tuple(m for m in (HANDOFF_MARK, WATCH_MARK, GOAL_MARK, SCHEDULE_MARK, RECHECK_MARK, NEST_SHARE_MARK, CHECKLIST_MARK) if m)
     return next((int(r["id"]) for r in store._all("SELECT id, content FROM messages WHERE role = 'user' ORDER BY id DESC LIMIT 50")
                  if not str(r["content"]).startswith(marks)), 0)
 
@@ -113,6 +115,7 @@ def continue_chat(ctx: Any, row: dict[str, Any], restarts: int) -> str:
     turn = start_turn(provider, model, ctx.tail, observe, source="chat", title=row["title"], context=ctx)
     keep_resume(turn, dict(row["spec"]), restarts, row["id"])
     turn.reaction_msg = int(row["spec"].get("message_id") or 0)   # the same message, still 👀
+    turn.owner_message = turn.reaction_msg if OwnerMessages(store).is_owner(turn.reaction_msg) else 0   # re-checked: still the owner's own
     return "resumed"
 
 
@@ -181,7 +184,8 @@ def resume_task(ctx: Any, row: dict[str, Any], why: str) -> str:
              "parent_task_id": spec.get("parent_task_id")}
         task = asyncio.ensure_future(worker_handoff(w, "", str(spec.get("head") or ""), bool(spec.get("quiet")),
                                                     again={"message_id": spec["message_id"], "note": note, "from": tid,
-                                                           "restarts": restarts}, cond=str(spec.get("cond") or "")))
+                                                           "restarts": restarts}, cond=str(spec.get("cond") or ""),
+                                                    self_started=bool(spec.get("self_started")), owner_asked=bool(spec.get("owner_asked"))))
         background_folds.add(task)
         task.add_done_callback(background_folds.discard)
         return "resumed"
@@ -307,8 +311,10 @@ def limit_notices(ctx: Any, waits: list[dict[str, Any]], now: float) -> None:
             continue   # quiet time: told once the day starts, unless it has run by then
         reset = until or (float(r["retry_at"]) if r.get("retry_at") else None)
         known = bool(main and (limit_guard.state(main[0]) or {}).get("known"))
+        busy = bool(main and limit_guard.busy_now(main[0]))
         activity.notify("task_waiting", i18n.t(model_limits.DELAYED_HEAD, title=r["title"])[:120],
-                        model_limits.delayed_text(reset if known else None, store.profile()["timezone"], now), task_id=int(r["id"]),
+                        model_limits.delayed_text(reset if known else None, store.profile()["timezone"], now, busy=busy),
+                        task_id=int(r["id"]),
                         schedule_id=int(spec["schedule_id"]) if spec.get("kind") == "schedule" and spec.get("schedule_id") else None)
         activity.bump_wait(int(r["id"]), float(r.get("retry_at") or now), noted=True)
 

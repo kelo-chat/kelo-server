@@ -1,8 +1,10 @@
 """Learning the user's preferences: once a night (after the journal) the user's main model reads the day's conversation, the times
 the user seemed to correct the assistant (spotted here in code), the rules learned so far and the start of user.md / MEMORY.md, and
 proposes short preference rules (and, in the same answer, up to GOALS_PER_NIGHT goals the user could take on, grounded in what they
-said; goals.py keeps them as suggestions) and up to 5 "rechecks": things the assistant told the user that may change and that they may act
-on, each backed by a quote of the assistant's own words (recheck.py keeps them). They ride on this one request: no call of its own.
+said; goals.py keeps them as suggestions). They ride on this one request: no call of its own. Corrections of the assistant's own
+earlier answers are not looked for here: corrections.py does that for the morning briefing and the hourly look.
+And up to 3 lessons from the day's finished runs that used tools (skill_lessons.py keeps them as skill proposals for the owner to approve;
+never memory).
 
 A rule is one short line describing what the user prefers ("Don't add events to my calendar on its own", "캘린더에 일정을 직접 넣지
 않기"), written in the owner's app language, stored in the database (table learned_rules) with its evidence (the owner's own words,
@@ -80,16 +82,7 @@ def _auto_prefixes() -> tuple[str, ...]:
 
 AUTO_PREFIXES = _auto_prefixes()
 
-# The user pushing back on an answer, in a few languages. Deliberately simple: the model weighs each hit itself.
-CORRECTION = re.compile(
-    r"^\s*(아니(?![면고])|아뇨|노노|no\b|nope\b|nein\b|non\b|não\b|нет\b|いいえ|違う|ちがう|不是|不对)"
-    r"|그게\s*아니|그거\s*아니|그건\s*아니|아니라고|틀렸|틀린\s*거|잘못\s*(했|알|찾|봤|이해)|다시\s*(해|하|찾|봐|알아|확인|써|만들)"
-    r"|말했잖|했잖아|그만\s*해|왜\s*자꾸|내\s*말은"
-    r"|that'?s\s+(wrong|not\s+(it|right|what))|that\s+is\s+wrong|not\s+what\s+i\s+(asked|meant|said|wanted)|i\s+(said|told\s+you|meant)\b"
-    r"|you\s+misunderstood|try\s+again|wrong\b|間違|错了",
-    re.IGNORECASE)
-
-PROMPT = f"""You help a personal assistant get better at serving one user. Below are the preference rules learned so far, notes the assistant keeps about the user, the times the user seemed to correct the assistant and the latest conversation.
+PROMPT = f"""You help a personal assistant get better at serving one user. Below are the preference rules learned so far, notes the assistant keeps about the user, the latest conversation.
 
 Find what the user said about how they want to be helped from now on, and answer with JSON only:
 {{"new": [{{"rule": "...", "quote": "...", "confidence": 0.9}}], "update": [{{"id": 1, "confidence": 0.0, "quote": "..."}}], "drop": [2], "goals": [{{"title": "...", "reason": "...", "evidence": "..."}}], "reasons": ["..."]}}
@@ -126,10 +119,6 @@ def quoted(quote: str) -> str:
     return f"“{quote[:EVIDENCE_MAX - 2]}”"
 
 
-def is_correction(text: str) -> bool:
-    return bool(CORRECTION.search(TIME_TAG.sub("", text or "")[:400]))
-
-
 def _clean(text: Any) -> str:
     return TIME_TAG.sub("", str(text or "")).strip()
 
@@ -138,20 +127,14 @@ def _norm(rule: str) -> str:
     return re.sub(r"[\W_]+", " ", rule.lower()).strip()
 
 
-# A Korean rule written as an order ("…하지 마라", "…해라") becomes the plain style the app shows ("…하지 않기", "…하기").
-_KO_DONT = re.compile(r"지\s*(?:마라|마세요|마십시오|말아라|말라|말\s*것)[.!]?$")
-_KO_DO = re.compile(r"(?:하라|해라|하세요|하십시오|할\s*것)[.!]?$")
-_EVIDENCE_LABEL = re.compile(r"^\s*(?:근거|이유|evidence|why|reason)\s*[:：]\s*", re.IGNORECASE)
-
-
 def tidy_rule(rule: Any) -> str:
-    text = re.sub(r"\s+", " ", str(rule or "")).strip().rstrip(".")
-    text = _KO_DONT.sub("지 않기", text)
-    return _KO_DO.sub("하기", text)
+    """The rule as the model wrote it (the prompt asks for a plain statement, never an order): one line, no closing full stop."""
+    return re.sub(r"\s+", " ", str(rule or "")).strip().rstrip(".")
 
 
 def tidy_evidence(evidence: Any) -> str:
-    return _EVIDENCE_LABEL.sub("", re.sub(r"\s+", " ", str(evidence or "")).strip())[:EVIDENCE_MAX]
+    """The evidence is the owner's own quote (checked against their messages): one line, cut at EVIDENCE_MAX."""
+    return re.sub(r"\s+", " ", str(evidence or "")).strip()[:EVIDENCE_MAX]
 
 
 _OLD_SUMMARY = re.compile(r"^(\d+) new, (\d+) updated, (\d+) dropped(?:, (\d+) goal)?")
@@ -212,11 +195,10 @@ class Reflection:
         self.last_use, self.sleep = last_use, sleep      # when the app was last used in the foreground (unix seconds)
         self.lock = asyncio.Lock()
         self.goals: Any = None   # the goal book (goals.py), set by the server: the run may also suggest goals
-        self.rechecks: Any = None   # recheck.RecheckExtractor, set by the server: the same request also asks for rechecks (no call of its own)
         self.offers: Any = None   # offers.OfferExtractor, set by the server: and for offers, grounded in the owner's own words
         self.upcoming: Any = None   # follow/upcoming.UpcomingExtractor, set by the server: and for dated things said in chat (follow items)
+        self.lessons: Any = None   # skill_lessons.LessonExtractor, set by the server: and lessons from the day's finished runs that used tools
         self.migrated = self.migrate_guide()
-        self.tidy_proposed()
         self.drop_inferred()
 
     # ------------------------------------------------------------------ on/off
@@ -255,16 +237,6 @@ class Reflection:
         cur = self.store._run("INSERT INTO learned_rules(rule, evidence, date, confidence, status, updated_at) VALUES(?,?,?,?,?,?)",
                               (rule, tidy_evidence(evidence), self._today(), _confidence(confidence), status, self.clock()))
         return int(cur.lastrowid)
-
-    def tidy_proposed(self) -> int:
-        """Rules still waiting for the user that an older version wrote as orders ("…하지 마라") read as preferences now."""
-        n = 0
-        for r in self.rules(("proposed",)):
-            tidy = tidy_rule(r["rule"])[:RULE_MAX]
-            if tidy != r["rule"] and len(tidy) >= 4:
-                self.store._run("UPDATE learned_rules SET rule = ? WHERE id = ?", (tidy, r["id"]))
-                n += 1
-        return n
 
     def drop_inferred(self) -> int:
         """Once: suggestions an older version inferred from behaviour (denied approvals, repeats) rather than the owner's words were
@@ -345,38 +317,16 @@ class Reflection:
 
     def messages_since(self, since: float) -> list[dict[str, Any]]:
         from .secret_guard import scrub_rows   # a message sent with a secret in it (after the warning) is read without it
-        return scrub_rows(self.store, self.store._all("SELECT id, role, content, created_at FROM messages WHERE created_at > ? ORDER BY id", (since,)))
+        return scrub_rows(self.store, self.store._all("SELECT id, role, content, created_at, author FROM messages WHERE created_at > ? ORDER BY id", (since,)))
 
     @staticmethod
     def from_user(m: dict[str, Any]) -> bool:
-        return m["role"] == "user" and not _clean(m["content"]).startswith(AUTO_PREFIXES)
+        """The owner's own message (author owner, owner_messages.py): never a hidden handoff, job report, schedule or nest row."""
+        return m.get("author") == "owner"
 
     def owner_words(self, msgs: list[dict[str, Any]]) -> list[str]:
         """The owner's own messages of a run (not the assistant's, not automatic runs): where a rule's quote must be found."""
         return [_clean(m["content"]).replace("<message_break/>", " ") for m in msgs if self.from_user(m)]
-
-    @staticmethod
-    def assistant_words(msgs: list[dict[str, Any]]) -> list[str]:
-        """The assistant's own messages of a run: where the quote of a recheck must be found."""
-        return [_clean(m["content"]).replace("<message_break/>", " ") for m in msgs if m["role"] == "assistant"]
-
-    def signals(self, msgs: list[dict[str, Any]], since: float) -> dict[str, list[dict[str, Any]]]:
-        """The times the user seemed to correct the assistant. Denied approvals and failed tasks are left out on purpose: behaviour
-        alone never makes a rule."""
-        corrections, last_answer = [], ""
-        for m in msgs:
-            text = _clean(m["content"])
-            if m["role"] != "user":
-                last_answer = text
-            elif self.from_user(m) and is_correction(text):
-                corrections.append({"user": text[:200], "after": last_answer[:160]})
-        return {"corrections": corrections[-8:]}
-
-    @staticmethod
-    def signals_text(sig: dict[str, list[dict[str, Any]]]) -> str:
-        out = [f"Times the user seemed to correct the assistant (a word match; judge each yourself): {len(sig['corrections'])}"]
-        out += [f'- user: "{c["user"]}"' + (f' (after: "{c["after"]}")' if c["after"] else "") for c in sig["corrections"]]
-        return "\n".join(out)
 
     def conversation_text(self, msgs: list[dict[str, Any]], budget: int) -> str:
         tz, lines, used = self.tz(), [], 0
@@ -393,9 +343,8 @@ class Reflection:
         left = len(msgs) - len(lines)
         return ((f"[{left} earlier messages left out]\n" if left else "") + "\n".join(reversed(lines))).strip()
 
-    def build_request(self, msgs: list[dict[str, Any]], since: float) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        sig = self.signals(msgs, since)
-
+    def build_request(self, msgs: list[dict[str, Any]], since: float,
+                      runs: list[dict[str, Any]] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         def head(name: str, tokens: int) -> str:
             p = self.home.root / name
             return clip_tokens(p.read_text(encoding="utf-8", errors="replace").strip(), tokens) if p.is_file() else ""
@@ -405,25 +354,27 @@ class Reflection:
         parts = [f"Language for rules, evidence and goals: {LANG_NAMES.get(lang, lang)}",
                  f"Rules so far:\n{clip_tokens(current, 1_200)}",
                  f"user.md (start):\n{head('user.md', 500) or '(empty)'}",
-                 f"MEMORY.md (start):\n{head('MEMORY.md', 800) or '(empty)'}",
-                 clip_tokens(self.signals_text(sig), 900)]
+                 f"MEMORY.md (start):\n{head('MEMORY.md', 800) or '(empty)'}"]
         if self.goals is not None:
             taken = "\n".join(f"- {t}" for t in self.goals.taken_titles()) or "(none)"
             parts.append(f"Goals and earlier suggestions (tracked, accepted or declined):\n{clip_tokens(taken, 500)}")
-        system = (PROMPT + (self.rechecks.prompt_part() if self.rechecks is not None else "")
+        system = (PROMPT
                   + (self.offers.prompt_part() if self.offers is not None else "")
-                  + (self.upcoming.prompt_part() if self.upcoming is not None else ""))
-        if self.rechecks is not None:
-            parts.append(clip_tokens(self.rechecks.known_block(), 500))
+                  + (self.upcoming.prompt_part() if self.upcoming is not None else "")
+                  + (self.lessons.prompt_part() if self.lessons is not None else ""))
         if self.offers is not None and (block := self.offers.known_block()):
             parts.append(clip_tokens(block, 400))
         if self.upcoming is not None:
             parts.append(clip_tokens(self.upcoming.known_block(), 400))
+        if self.lessons is not None:
+            parts.append(clip_tokens(self.lessons.known_block(), 500))
+            if runs and (block := self.lessons.runs_block(runs)):
+                parts.append(clip_tokens(block, 1_500))
         fixed = est_tokens(system) + sum(est_tokens(p) for p in parts) + 200
         convo = self.conversation_text(msgs, max(1_000, INPUT_TOKENS - fixed))
         user = "\n\n".join([*parts, f"Conversation:\n{convo}"])
         return ([{"role": "system", "content": system}, {"role": "user", "content": user}],
-                {"signals": sig, "tokens": est_tokens(system) + est_tokens(user)})
+                {"tokens": est_tokens(system) + est_tokens(user)})
 
     # ------------------------------------------------------------------ the run
     def _record(self, status: str, code: str = "", reason: str = "", changed: bool = False, **counts: int) -> dict[str, Any]:
@@ -503,7 +454,8 @@ class Reflection:
         if not chosen:
             return self._record("pending", "no_model", "no model is set")
         provider, model = chosen
-        messages, _info = self.build_request(msgs, since)
+        runs = self.lessons.runs_since(since, self.clock()) if self.lessons is not None else []
+        messages, _info = self.build_request(msgs, since, runs)
         req = ChatRequest(model=model, messages=messages, tools=[], extra={})
         parts: list[str] = []
         try:
@@ -513,20 +465,20 @@ class Reflection:
         except Exception as e:  # noqa: BLE001
             return self._record("failed", "model_error", f"{type(e).__name__}: {str(e)[:160]}")
         out = parse_output("".join(parts))
-        if out is None or not any(isinstance(out.get(k), list) for k in ("new", "update", "drop", "goals", "rechecks", "offers", "upcoming")):
+        if out is None or not any(isinstance(out.get(k), list) for k in ("new", "update", "drop", "goals", "offers", "upcoming", "upcoming_drop", "lessons")):
             return self._record("failed", "bad_output", "the model did not answer in the expected form; nothing was changed")
         added, updated, dropped = self.apply(out, self.owner_words(msgs))
         suggested = self.apply_goals(out)
-        rechecked = self.rechecks.apply(out, self.assistant_words(msgs)) if self.rechecks is not None else 0
         offered = self.offers.apply(out, self.owner_words(msgs)) if self.offers is not None else 0
-        upcoming = self.upcoming.apply(out, self.owner_words(msgs) + self.assistant_words(msgs)) if self.upcoming is not None else 0
+        upcoming = self.upcoming.apply(out, self.owner_words(msgs)) if self.upcoming is not None else 0   # the owner's words only
+        lessons = self.lessons.apply(out, runs) if self.lessons is not None else 0
         self.store.set_meta("reflection:seen_until", repr(msgs[-1]["created_at"]))
         raw = out.get("reasons")
         reasons = [str(r).strip()[:200] for r in (raw if isinstance(raw, list) else [raw]) if r is not None and str(r).strip()]
         summary = (f"{added} new, {updated} updated, {dropped} dropped" + (f", {suggested} goal(s) suggested" if suggested else "")
-                   + (f", {rechecked} recheck(s) kept" if rechecked else "") + (f", {offered} offer(s) made" if offered else "")
-                   + (f", {upcoming} upcoming kept" if upcoming else ""))
-        return self._record("done", "", "; ".join([summary, *reasons])[:600], bool(added or updated or dropped or suggested or rechecked or offered or upcoming),
+                   + (f", {offered} offer(s) made" if offered else "")
+                   + (f", {upcoming} upcoming kept" if upcoming else "") + (f", {lessons} lesson(s) kept" if lessons else ""))
+        return self._record("done", "", "; ".join([summary, *reasons])[:600], bool(added or updated or dropped or suggested or offered or upcoming or lessons),
                             added=added, updated=updated, dropped=dropped, goals=suggested)
 
     async def wait_idle(self) -> bool:

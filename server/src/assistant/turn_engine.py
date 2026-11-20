@@ -6,6 +6,7 @@ these moved out first (2026-11-10). server.py re-exports them.
 from __future__ import annotations
 
 import asyncio
+import re
 import secrets
 import time
 import uuid
@@ -13,14 +14,37 @@ from dataclasses import dataclass, field
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from .activity import is_short_reply, task_title
+from . import approval_edit
+from .activity import host_of, is_short_reply, rule_kind, task_title
+from .run_asks import RunAsks, purpose_body, purpose_lines
+from .chat_views import view_wanted
 from .injection_watch import current as injection_watch_var
-from .reply_text import ReplyText
-from .schedule_grants import APPLIED_TITLE, PROGRESS_TITLE
+from .privacy_guard import URL_TOOLS
+from .tools.browser import CHAT_CONTROL_WAIT_SECONDS, hold_patience
+from .reply_paths import ReplyPaths
+from .reply_text import BOOKKEEPING, ReplyText
+from .scheduled_runs import PROMISE_ROUND_NOTE, PROMISE_WAIT_S, RunEvidence, promise_check_needed
+from .tool_roles import for_kind
+from .schedule_grants import ACK_LINE, APPLIED_TITLE, PROGRESS_NOTICE, PROGRESS_TITLE
+
+SLOW_TOOL_PREFIXES = ("browser_",)
+SLOW_TOOL_NAMES = frozenset({"delegate", "web_search", "web_fetch"})
+ACK_SECONDS = 4.0   # seconds without text before acknowledging slow chat work
+_LEADING_BREAK = re.compile(r"^\s*<message_break\s*/?>")
+_TRAILING_BREAK = re.compile(r"<message_break\s*/?>\s*$")
+PROGRESS_MONITOR_INTERVAL = 10.0   # seconds between progress monitor checks
+
+
+def is_slow_tool(name: str) -> bool:
+    return name.startswith(SLOW_TOOL_PREFIXES) or name in SLOW_TOOL_NAMES
 
 if TYPE_CHECKING:   # only for annotations: TurnContext is create_app's own class (the conversation of a turn)
     from .agent import Tool
     TurnContext = Any
+
+# a reply that ends with a payment whose receipt was never checked gets one more round, with this note (not the user's words)
+RECEIPT_NOTE = ("[Not from the user: you paid on {site} but did not check the order. Open the site's order/receipt page now and call "
+                "purchase_result with what it shows before you finish.]")
 
 
 @dataclass(slots=True)
@@ -52,6 +76,12 @@ MODEL_STARTED = frozenset({"thinking", "text", "tool_started", "tool_result", "b
                            "secret_request", "human_check", "followup", "draft", "nest_changed"})
 
 
+# Run kinds Kelo starts on its own: nobody asked for this run and nobody can answer it. Such a run never raises a card, a hand-over
+# or a progress notice; a step that needs the owner's OK is skipped and the run goes on with what it has (the owner hears only its
+# result, through the path that kind already has).
+SELF_STARTED = frozenset({"recheck", "situation", "situation_select", "situation_write", "order_check", "checklist"})
+
+
 class Turn:
     """One reply in progress. Everything it emits is kept in order, so a reader whose connection broke (a phone that went to sleep,
     a tunnel that dropped the stream) can ask again from where it stopped instead of losing the reply."""
@@ -64,11 +94,22 @@ class Turn:
         self.touched = time.monotonic()    # the last time a reader asked
         self.finished = 0.0
         self.approvals: set[str] = set()
+        # (tool, site, card line) of the addresses the owner allowed in this reply: a second identical card for the same site is not
+        # asked again in the same reply (Coupang, 2026-11-18: two opens of one site asked twice)
+        self.opened_sites: set[tuple[str, str, str]] = set()
         self._cond = asyncio.Condition()
         self.task_id = 0                   # its record in the task log
         self.title = ""
+        self.why = ""                      # the run's own reason for its cards (its record): one "Why" line, and the push says it
+        self.reason = ""                   # the clause its one line before the first card gives ("Because <reason>, I am going to check ...")
+        self.self_started = False          # Kelo started this run on its own (SELF_STARTED, or the caller says so): no cards, hand-overs or progress notices
+        self.asks = RunAsks()              # what this run was allowed already (a site is not asked again in the run) and whether it said why
         self.source = "chat"               # chat | api | schedule:<id> | background
         self.unattended = False            # nobody is expected to watch: never stopped for want of a reader, approvals wait longer
+        self.can_call = False              # the app this reply writes to can ring a call screen (call_tools.py)
+        self.call_id = ""                  # the in-app call this reply speaks in (calls.py); "" for a typed reply
+        self.owner_words = ""              # a call reply: the owner's spoken words, without the notes the model gets with them
+        self.promise_checked = False       # the promise rule ran in this reply (promise_round): once per reply
         self.owner = "owner"               # whose browser tab it drives
         self.status_text = ""              # the live line for the agent screen ("Opening a site", ...)
         self.thinking_since: float | None = None   # monotonic time the model began its current reasoning (live_line: a long think)
@@ -86,19 +127,27 @@ class Turn:
         self.restarts = 0                  # how many restarts the turns before this one (the same work) went through
         self.offer = ""                    # restart | model: its last message gets a "Continue" button that resumes it
         self.down_error = ""               # the provider error that made it wait for the model
+        self.outage = False                # it failed because the provider was busy or unreachable (resume.is_outage), not because of the request
         self.limited = False               # it failed because the model's usage limit is used up (model_limits.py)
         self.limit_reset: float | None = None   # then: when the model may be called again
         self.goal_ids: set[int] = set()    # the goals it works on (goals.py "working": the app shows them as being worked on)
         self.goal_origin: set[int] = set() # the goals it was started for (a kickoff / resume): deleting one of them stops it
         self.reaction_msg = 0              # the owner's message it answers: 👀 now, its emoji when the work is over (reactions.py)
+        self.owner_message = 0             # the owner's own message (author owner, owner_messages.py) this turn answers; 0 = none
         self.reaction_choice = ""          # the emoji the model chose with `react`
         self.asked = False                 # it ended on a question to the user (quick_replies, await_reply)
+        self.evidence = RunEvidence()      # what its tool calls did (scheduled_runs.py): the closing phase and the promise rule read it
+        self.defer_report = False          # a scheduled run's working phase: its end says nothing to the owner, the closing phase decides
+        self.report = ""                   # ... and its private report (the text the working phase ended with)
         self.jobs: list[str] = []          # background jobs it handed work to (delegate)
+        self.picked: set[str] = set()      # ids of the items the owner picked or attached for this message (data_trail.py decision 4)
         self.request = ""                  # the user's words that started it (its last user message's text)
         self.cond = ""                     # the conditional task a watcher's hit started it for ("watcher:<id>"; schedule_grants.py)
+        self.owner_asked = False           # it carries the owner's request from the app (checklist items they added): connect_tools.asked_in_chat
         self.reacted = False               # the end reaction was sent (right before "done", or at the end of a failed reply)
         self.read_pending = False          # 👀 is due once the model starts answering (its first thinking, text or tool event)
         self.log: Any = None               # the turn log that writes its events down (turn_log.py), set by run_turn
+        self.ack_sent = False              # code-level acknowledgment sent before slow work (backlog long-runs)
 
     async def emit(self, item: dict[str, Any]) -> None:
         async with self._cond:
@@ -196,7 +245,8 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
                effort: str | None = None, fallback: bool = True, *, source: str = "chat", title: str = "",
                unattended: bool = False, owner: str | None = None, context: TurnContext | None = None,
                tools_: list[Tool] | None = None, max_steps: int | None = None, tool_scope: str | None = None, cond: str = "",
-               stream_wrap: Callable[[Any], Any] | None = None) -> Turn:
+               stream_wrap: Callable[[Any], Any] | None = None, why: str = "", reason: str = "", can_call: bool = False,
+               self_started: bool = False, owner_asked: bool = False) -> Turn:
     """Begin a reply in the background. Whoever is watching (a stream, or a phone asking again and again) reads it from the Turn.
     `context`: the stored conversation, built (and compacted when needed) for each model that runs the turn; `messages` is then
     only this turn's own message(s). Without it `messages` is sent as it is.
@@ -235,6 +285,7 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
     REPEAT_NOTE = S.REPEAT_NOTE
     RepeatGuard = S.RepeatGuard
     STEP_LIMIT_BACKGROUND = S.STEP_LIMIT_BACKGROUND
+    CONTINUE_JOB_TITLE = S.CONTINUE_JOB_TITLE
     STEP_LIMIT_CONTINUE = S.STEP_LIMIT_CONTINUE
     STEP_LIMIT_PROGRESS = S.STEP_LIMIT_PROGRESS
     STEP_LIMIT_STOPPED = S.STEP_LIMIT_STOPPED
@@ -269,11 +320,17 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
     limit_of = S.limit_of
     location_ask = S.location_ask
     log = S.log
-    looks_final = S.looks_final
     model_limits = S.model_limits
     one_run_tab = S.one_run_tab
     re = S.re
     readable_args = S.readable_args
+
+    def _item_detail(req: ApprovalRequest) -> str:
+        """A request's line on a shared card: its words, without the outside-text reason (that one is shown once, on "Why it asks")."""
+        text = req.detail or readable_args(req.arguments)
+        if req.why and text.startswith(req.why):
+            text = text[len(req.why):].lstrip("\n")
+        return text[:300]
     rule_kind = S.rule_kind
     run_agent = S.run_agent
     sched_zone = S.sched_zone
@@ -287,6 +344,7 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
     TurnContext = ctx.TurnContext
     activity = ctx.activity
     approval_site = ctx.approval_site
+    held_by = getattr(ctx, "held_by", None)   # the owner's hold of a tab (server: the browser or the phone is held by the owner)
     broker = ctx.broker
     chat_images = ctx.chat_images
     compactor = ctx.compactor
@@ -339,22 +397,29 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
     turns = ctx.turns
     window_for = ctx.window_for
     workers = ctx.workers
+    chat_views = getattr(ctx, "chat_views", None)   # the browser tabs and the phone the chat shows (chat_views.py)
     sweep()
     turn = Turn()
     turn.source, turn.unattended, turn.owner = source, unattended, owner or browser_owner.get()
+    turn.self_started = bool(self_started or (unattended and source in SELF_STARTED))   # an attended turn never is
+    turn.can_call = can_call   # the app the owner writes from can show a call screen (call_tools.py)
     turn.cond = cond
+    turn.owner_asked = owner_asked
     last_user = next((m.get("content") for m in reversed(messages) if m.get("role") == "user"), "")
     earlier_request, own_title = "", bool(title)
     if not title and isinstance(last_user, str) and is_short_reply(last_user):   # "너가" to "제가 할까요?": name it after the request
-        hidden = tuple(getattr(S, name) for name in ("HANDOFF_MARK", "WATCH_MARK", "GOAL_MARK", "SCHEDULE_MARK", "RECHECK_MARK", "NEST_SHARE_MARK") if hasattr(S, name))
+        hidden = tuple(getattr(S, name) for name in ("HANDOFF_MARK", "WATCH_MARK", "GOAL_MARK", "SCHEDULE_MARK", "RECHECK_MARK", "NEST_SHARE_MARK", "CHECKLIST_MARK") if hasattr(S, name))
         earlier = [str(m.get("content") or "") for m in reversed(store.messages(limit=12)) if m.get("role") == "user"
                    and isinstance(m.get("content"), str) and not str(m.get("content")).startswith(hidden)]
         earlier = [e for e in earlier if e.strip() != last_user.strip()]
         title = task_title(last_user, earlier)
         earlier_request = next((e for e in earlier if not is_short_reply(e)), "")
     turn.title = (title or title_from(last_user if isinstance(last_user, str) else ""))[:80]
-    # the user's own words for this turn (an order the agent starts without begin_order is read from them: tools/order.py)
-    turn.request = (last_user if isinstance(last_user, str) else " ".join(
+    turn.why = " ".join(why.split())[:200]
+    turn.reason = " ".join(reason.split())[:200]
+    # the user's own words for this turn (an order the agent starts without begin_order is read from them: tools/order.py); an offer's
+    # run has none: its request is the agent's own wording, and the owner only tapped the card (offers.py)
+    turn.request = "" if source == "offer" else (last_user if isinstance(last_user, str) else " ".join(
         str(p.get("text") or "") for p in (last_user or []) if isinstance(p, dict) and p.get("type") == "text"))[:2000]
     turn.task_id = activity.start_task(turn.title, source, turn.id)
     if (namer := getattr(ctx, "task_namer", None)) is not None and not own_title and isinstance(last_user, str):
@@ -380,9 +445,12 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
     open_cards: dict[str, dict[str, Any]] = {}
     applied: list[tuple[dict[str, Any], str]] = []   # applications an apply permission covered in this run: (grant, what), told at the end
 
+    by_name: dict[str, Any] = {}   # the turn's tools by name (set below, before the first model pass)
+
     def track(item: dict[str, Any]) -> None:
         kind = item.get("type")
         said.feed(item)
+        turn.evidence.feed(item, by_name)
         if kind != "thinking" and kind in MODEL_STARTED:
             turn.thinking_since = None   # the model moved on (text, a tool, a card): a later think starts its own clock
         if kind == "text":
@@ -416,13 +484,47 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
             outcome["status"], outcome["error"] = "failed", str(item.get("detail") or item.get("message", ""))
 
     repeats = RepeatGuard()   # text the model says again after a tool call is not passed on twice (repeats.py)
+    # the model's working folder (a provider sandbox path) in the reply's text becomes Kelo's own file name (reply_paths.py)
+    reply_paths = ReplyPaths(getattr(ctx, "home_relativize", None))
 
-    async def put(item: dict[str, Any]) -> None:
+    def show_view(item: dict[str, Any]) -> None:
+        """A browser or phone card of a chat reply (or of a job a chat asked for) makes its view: it stays in the chat until closed."""
+        if chat_views is None or item.get("type") not in ("browser", "device"):
+            return
+        parent = str((workers._row(turn.worker_id) or {}).get("parent_source") or "") if turn.worker_id else ""
+        if not view_wanted(turn, parent):
+            return
+        if item["type"] == "device":
+            chat_views.card("android", "phone", item, turn_id=turn.id, worker_id=turn.worker_id or None)
+        else:
+            chat_views.card(str(item.get("tab") or turn.owner), "browser", item, turn_id=turn.id, worker_id=turn.worker_id or None)
+
+    ended_on_break = [False]   # the text shown last ended with a <message_break/>
+
+    async def put(item: dict[str, Any], *, keep: bool = True) -> None:
+        """`keep`: False for a line only shown (the ack): it reaches the screen but is never stored as what the reply said."""
+        show_view(item)
+        if item.get("type") == "text":
+            text = reply_paths.feed(str(item.get("text", "")))
+            if not text:
+                return
+            if ended_on_break[0]:   # two breaks in a row make an empty line: the second one goes
+                text = _LEADING_BREAK.sub("", text, count=1)
+                if not text:
+                    return
+            if text.strip():
+                ended_on_break[0] = bool(_TRAILING_BREAK.search(text))
+            item = {**item, "text": text}
+        else:   # anything else comes after the text it follows: a path held back there is said first
+            tail = reply_paths.flush()
+            if tail:
+                for it in repeats.feed({"type": "text", "text": tail}):
+                    await deliver(it)
         for it in repeats.feed(item):
-            await deliver(it)
+            await deliver(it, keep)
 
-    async def deliver(item: dict[str, Any]) -> None:
-        if observe:
+    async def deliver(item: dict[str, Any], keep: bool = True) -> None:
+        if observe and keep:
             observe(item)   # what was said is saved as it is said, whether or not anyone is still reading
         try:
             track(item)
@@ -453,18 +555,52 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
         except Exception:  # noqa: BLE001 - never break the end of a reply
             log.exception("reaction update failed")
 
-    def tell_progress(count: int) -> None:
-        """Backlog 66: a long run says once how far it got. Not while the owner watches the reply live (they see it there)."""
-        if not turn.unattended and time.monotonic() - turn.touched < WATCHED_SECONDS:
+    async def tell_progress(count: int = 0) -> None:
+        """Backlog 66 / long runs: any run still working after 10 minutes sends one progress line in the path it already uses."""
+        if turn.self_started:
+            return   # nobody waits for this run: no progress notice
+        if applied:
+            followed = not turn.unattended and time.monotonic() - turn.touched < WATCHED_SECONDS
+            if not followed:
+                name = applied[0][0].get("task_name") or turn.title
+                items = "; ".join(dict.fromkeys(w for _, w in applied if w))
+                activity.notify("task_done", i18n.t(PROGRESS_TITLE, count=count or len(applied))[:120],
+                                (f"{name} · {items}" if name else items)[:400], task_id=turn.task_id)
             return
-        name = applied[0][0].get("task_name") or turn.title if applied else turn.title
-        items = "; ".join(dict.fromkeys(w for _, w in applied if w))
-        activity.notify("task_done", i18n.t(PROGRESS_TITLE, count=count)[:120],
-                        (f"{name} · {items}" if name else items)[:400], task_id=turn.task_id)
+
+        is_background = turn.unattended or bool(turn.worker_id)
+        if is_background:
+            proactive = getattr(ctx, "proactive", None)
+            if proactive is not None and hasattr(proactive, "awake") and not proactive.awake():
+                return
+
+        if turn.worker_id and (r := workers._row(turn.worker_id)) is not None and r.get("status_text"):
+            step_label = r["status_text"]
+        else:
+            step_label = turn.status_text or i18n.t("Thinking")
+
+        if turn.worker_id and (r := workers._row(turn.worker_id)) is not None:
+            step_count = max(int(r.get("steps") or 0), run_progress.count(run_key))
+        else:
+            step_count = count or run_progress.count(run_key)
+
+        line = i18n.t(PROGRESS_NOTICE, step=step_label, count=step_count)
+        try:
+            if not is_background:
+                await put({"type": "text", "text": f"{line}<message_break/>"})
+                if time.monotonic() - turn.touched >= WATCHED_SECONDS:
+                    activity.notify("task_done", line[:120], turn.title[:400], task_id=turn.task_id)
+            else:
+                activity.notify("task_done", line[:120], turn.title[:400], task_id=turn.task_id)
+        except Exception:  # noqa: BLE001 - a notification never breaks the reply
+            log.exception("could not tell how far the run got")
 
     async def finish() -> None:
         if turn.done:
             return
+        tail = reply_paths.flush()   # a stopped reply still says what it had started to write (a held path)
+        if tail:
+            await put({"type": "text", "text": tail})
         for approval_id in list(turn.approvals):   # deny anything still waiting for a person
             broker.discard(approval_id)
             deliveries.discard(approval_id)          # and forget any card sent for it
@@ -488,6 +624,10 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
             covered_calls.pop(key, None)
         try:
             schedule_grants.settle(turn_scopes(turn))   # a one-shot task that used its count: its grants go with this run
+            if turn.worker_id and (prow := workers._row(turn.worker_id)) is not None and prow.get("parent_cond"):
+                # the watcher or schedule that handed this job over: a checkout job can pay its one-shot purchase after that run has
+                # ended, and then the grant must go with the job (2026-11-17). settle() drops only a count that was used up.
+                schedule_grants.settle([str(prow["parent_cond"])])
             if turn.worker_id and (row := workers._row(turn.worker_id)) is not None and row["status"] in ("done", "failed", "stopped"):
                 schedule_grants.drop_job(turn.worker_id)   # a job's own grants end with the job
                 run_progress.end(run_key)
@@ -530,6 +670,13 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
                         activity.add_offer(int(row), turn.task_id, turn.offer, asked[0][0]["options"][0])
             except Exception:  # noqa: BLE001
                 log.exception("quick replies could not be attached")
+        if chat_views is not None:   # this reply's cards go after the reply's own message (chat_views.py)
+            try:
+                row = store._all("SELECT MAX(id) AS m FROM messages WHERE role = 'assistant' AND id > ?", (turn.msg_floor,))[0]["m"]
+                if row:
+                    chat_views.anchor(turn.id, int(row))
+            except Exception:  # noqa: BLE001
+                log.exception("the chat views could not be anchored")
         if (card := pending_comparisons.pop(turn.id, None)) is not None:   # the comparison card under the message this reply ended with
             try:
                 row = store._all("SELECT MAX(id) AS m FROM messages WHERE role = 'assistant' AND id > ?", (turn.msg_floor,))[0]["m"]
@@ -578,32 +725,39 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
                 log.exception("could not close a card of a stopped reply")
             await turn.emit({**closing, "state": "cancelled"})
 
-    async def approve(req: ApprovalRequest) -> bool:
+    async def settle(req: ApprovalRequest, ctx: dict[str, Any]) -> bool | None:
+        """Everything before a card: the owner's own rules, the task's permission, a step nobody can answer. True / False = settled, no card;
+        None = a card is needed, and `ctx` carries what that card reuses (card, group_card). Runs once per request: it logs and counts."""
         label = tool_labels.label(req.name)
         site = approval_site(req.name, req.arguments)
+        kind, target = approval_edit.where_of(req.name, req.arguments, site)   # for the history: what kind of step, and to whom
         from .tools.browser import POINT_TOOLS, step_key
         clicks = ("browser_click", *POINT_TOOLS)
         sel = step_key(req.name, req.arguments)   # the selector, or "point:x,y" of a browser_click_at / browser_drag
-        # a ref (e12) is judged by the words the page reading gave it, never by the ref itself
-        words = session.selector_words(sel) if session is not None and hasattr(session, "selector_words") else sel
-        final_click = req.name in clicks and ((req.name == "browser_click" and looks_final(words))
-                                              or (session is not None and session.judged(sel) == "pay"))
-        # a step whose target Kelo could not read at all (commit kind "unknown"): like a final click, no rule ever allows it
-        final_click = final_click or (session is not None and req.name in (*clicks, "browser_type")
-                                      and session.judged(sel) == "unknown")
+        # a step whose target Kelo could not read at all (commit kind "unknown"): no rule ever allows it
+        final_click = session is not None and req.name in (*clicks, "browser_type") and session.judged(sel) == "unknown"
         if not final_click and not req.force and (rule := activity.matching_rule(req.name, site)):
             # the user allowed this kind of step on this site before ("allow on this site"); payments never get here
             activity.log_approval(uuid.uuid4().hex, task_id=turn.task_id, tool=req.name, label=label, site=site, detail=req.detail,
-                                  decision="allowed_by_rule", rule_id=rule["id"], unattended=turn.unattended)
+                                  decision="allowed_by_rule", rule_id=rule["id"], unattended=turn.unattended, kind=kind, target=target)
+            return True
+        # a site the owner allowed a kind of step on earlier in this same run: not asked again in it (never for a step that cannot be remembered)
+        run_kind, run_host = rule_kind(req.name), host_of(site)
+        if not final_click and not req.force and turn.asks.allowed_before(run_kind, run_host):
+            activity.log_approval(uuid.uuid4().hex, task_id=turn.task_id, tool=req.name, label=label, site=site, detail=req.detail,
+                                  decision="allowed_this_run", unattended=turn.unattended, kind=kind, target=target)
             return True
         sched_id = int(turn.source[9:]) if turn.source.startswith("schedule:") and turn.source[9:].isdigit() else None
         if not final_click and not req.force and sched_id and activity.matching_schedule_rule(sched_id, req.name, site):
             # "keep allowing in this scheduled job": the same step on the same site in this schedule's runs; never payments
             activity.log_approval(uuid.uuid4().hex, task_id=turn.task_id, tool=req.name, label=label, site=site, detail=req.detail,
-                                  decision="allowed_by_rule", unattended=turn.unattended)
+                                  decision="allowed_by_rule", unattended=turn.unattended, kind=kind, target=target)
             return True
         # a "when X happens, do Y" task the user allowed at setup (task_allow, schedule_grants.py): a message or a change inside
         # its permission goes ahead without a card (logged, and the user is told right after it ran); one outside it asks
+        page_key = (req.name, site, req.detail or "")
+        if req.name in URL_TOOLS and page_key in turn.opened_sites:   # allowed earlier in this reply: no second card for the same site
+            return True
         commit = session.judged(sel) if session is not None and req.name in (*clicks, "browser_type") else ""
         secret = session is not None and req.name == "browser_type" and session.judged_secret(sel)
         # (a card the owner's own setting or the privacy guard asked for is never skipped by a task's permission either)
@@ -616,6 +770,19 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
                     what = await page_title() or site
                 covered_calls[(turn.id, req.id)] = (g, label, what)
             return True
+        if turn.self_started:   # nobody started this run and nobody can answer it: the step is skipped, never a card
+            log.info("turn %s (%s): %s on %s skipped, it would need the owner's OK", turn.id, turn.source, req.name, site or "-")
+            req.outcome = "skipped"
+            return False
+        ctx.update(label=label, site=site, kind=kind, target=target, commit=commit, final_click=final_click, run_kind=run_kind,
+                   run_host=run_host, sched_id=sched_id, grant_check=grant_check, page_key=page_key)
+        return None
+
+    async def card(req: ApprovalRequest, ctx: dict[str, Any]) -> bool:
+        """The card for one request (settle said it needs one): the owner's answer, or nobody's (skipped, expired)."""
+        label, site, kind, target, commit = ctx["label"], ctx["site"], ctx["kind"], ctx["target"], ctx["commit"]
+        final_click, run_kind, run_host, sched_id = ctx["final_click"], ctx["run_kind"], ctx["run_host"], ctx["sched_id"]
+        grant_check, page_key = ctx["grant_check"], ctx["page_key"]
         approval_id, fut = broker.create()
         turn.approvals.add(approval_id)
         current_approval.set((req.id, approval_id))   # the tool, once allowed, can tell which approval it runs under
@@ -628,32 +795,44 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
                 extra = {}
         timeout = UNATTENDED_APPROVAL_SECONDS if turn.unattended else APPROVAL_TIMEOUT_SECONDS
         notice_title = str(extra.pop("notice_title", "") or "")   # a card with its own notice title (purchase_result's wrong charge)
+        notice_body = str(extra.pop("notice_body", "") or "")     # the notice's own text (a designed mail: its words, not the card's detail)
         if grant_check is not None and grant_check.reason:   # the task has a permission of this kind, but this step is outside it
             extra["lines"] = [{"label": i18n.t("Why it asks"), "value": i18n.t(GRANT_REASONS.get(grant_check.reason, grant_check.reason))},
                               *(extra.get("lines") or arg_lines(req.arguments))][:4]
+        if turn.why:   # the run's own reason, from its record: the card says what it checks and why
+            extra["lines"] = purpose_lines(turn.why, list(extra.get("lines") or arg_lines(req.arguments)))
         urgent, missed = schedule_grants.urgency() if turn.unattended else (False, "")
         if urgent:
             extra.update(urgent=True, missed=missed)
+        issued_at = int(time.time())   # the moment the card is asked: a signed payment approval signs this (approval_sign.py)
+        if turn.unattended and (said := turn.asks.announce(turn.reason or turn.title, site or label)):   # one line before the run's first card
+            store.add_message("assistant", said)
         event = {"type": "approval_request", "approval_id": approval_id, "id": req.id, "name": req.name, "arguments": req.arguments,
                  "detail": req.detail or readable_args(req.arguments), "lines": arg_lines(req.arguments), "label": label,
                  "ask": tool_labels.ask(req.name, req.arguments), "site": site, "commit": commit,
                  "can_remember": bool(rule_kind(req.name) and site and not final_click and not req.force),
+                 "can_remember_recipient": bool(req.trail), "trail": req.trail,
                  "can_remember_schedule": bool(sched_id and schedule_rule_ok(req.name) and not final_click and not req.force
                                                and not extra.get("payment")),
-                 "schedule_id": sched_id, "task_id": turn.task_id, "expires_at": int(time.time() + timeout), **extra}
+                 "schedule_id": sched_id, "task_id": turn.task_id, "expires_at": int(time.time() + timeout), "issued_at": issued_at,
+                 **extra}
+        if req.editable and not extra.get("payment") and (editable := approval_edit.editable(req.name, req.arguments)) is not None:   # a message to send: the owner may fix its text first
+            event["editable"] = editable
         # source / worker_id / title: what asked (a chat reply, a background job, a scheduled run), so the chat can show the card too
         pending_approvals[approval_id] = {**event, "turn_id": turn.id, "asked_at": time.time(), "unattended": turn.unattended,
                                           "source": turn.source, "worker_id": turn.worker_id or None, "title": turn.title}
         activity.log_approval(approval_id, task_id=turn.task_id, tool=req.name, label=label, site=site, detail=req.detail,
-                              unattended=turn.unattended)
+                              unattended=turn.unattended, kind=kind, target=target)
+        push_what = notice_body or req.detail or turn.title
+        push_what = purpose_body(turn.why, turn.title, push_what) if not notice_body else push_what
         if turn.unattended and (urgent or extra.get("urgent")):   # time matters: an urgent notice that says what is missed without an answer
             until = datetime.fromtimestamp(time.time() + timeout, sched_zone(store.profile()["timezone"])).strftime("%H:%M")
             body = i18n.t("Answer by {time}, or {missed}", time=until, missed=missed) if missed else i18n.t("Answer by {time}", time=until)
             activity.notify("approval_waiting", notice_title[:120] or i18n.t("Urgent: please confirm {label}", label=label),
-                            f"{body} · {req.detail or turn.title}"[:400], task_id=turn.task_id, approval_id=approval_id, urgent=True)
+                            f"{body} · {push_what}"[:400], task_id=turn.task_id, approval_id=approval_id, urgent=True)
         elif turn.unattended:
-            activity.notify("approval_waiting", i18n.t("Please confirm: {label}", label=label), req.detail or turn.title, task_id=turn.task_id,
-                            approval_id=approval_id)
+            activity.notify("approval_waiting", i18n.t("Please confirm: {label}", label=label), push_what,
+                            task_id=turn.task_id, approval_id=approval_id)
         turn.waiting += 1
         activity.set_task_status(turn.task_id, "waiting_approval")
         turn.status_text = i18n.t("Waiting for approval")
@@ -661,10 +840,17 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
         allowed = False
         try:
             allowed = await asyncio.wait_for(fut, timeout)
+            if allowed:
+                turn.asks.allow(run_kind, run_host)   # the same site, the same kind in this run: not asked again
             if not allowed:
                 await stop_grace()
+            elif (pending_approvals.get(approval_id) or {}).get("edited"):
+                req.edited = True   # the owner fixed the message: the call re-checks its new text before it runs (agent/loop.py)
+            if allowed and req.name in URL_TOOLS:
+                turn.opened_sites.add(page_key)
             return allowed
         except asyncio.TimeoutError:
+            req.outcome = "expired"   # the run is told nobody answered (not that the user declined)
             activity.answer_approval(approval_id, "expired")
             if turn.unattended:   # nobody answered: the follow-ups offer to try the step again, the first reminder right away
                 try:
@@ -686,13 +872,85 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
                 deliveries.discard(approval_id)   # a card the phone may already have sent for it is dropped
                 pin_deliveries.discard(approval_id)   # and so is a payment PIN
 
+    async def approve(req: ApprovalRequest) -> bool:
+        ctx: dict[str, Any] = {}
+        settled = await settle(req, ctx)
+        return settled if settled is not None else await card(req, ctx)
+
+    async def approve_many(reqs: list[ApprovalRequest]) -> list[bool]:
+        """Answers for the calls of one step that share a card (Tool.shares_card): each settled as alone; the rest on one card when two or
+        more need it (group_card), on their own card when one does."""
+        ctxs: list[dict[str, Any]] = [{} for _ in reqs]
+        answers: list[bool | None] = [await settle(r, c) for r, c in zip(reqs, ctxs)]
+        left = [i for i, a in enumerate(answers) if a is None]
+        if len(left) == 1:
+            answers[left[0]] = await card(reqs[left[0]], ctxs[left[0]])
+        elif left:
+            for i, answer in zip(left, await group_card([reqs[i] for i in left], [ctxs[i] for i in left])):
+                answers[i] = answer
+        return [bool(a) for a in answers]
+
+    async def group_card(reqs: list[ApprovalRequest], ctxs: list[dict[str, Any]]) -> list[bool]:
+        """ONE card for several requests of one step: one approval id and one wait; the owner's answer applies to all of them. The card
+        lists the changes (lines: at most four, then `items` with every one); the apps that know `steps` answer it as any card."""
+        first, ctx = reqs[0], ctxs[0]
+        approval_id, fut = broker.create()
+        turn.approvals.add(approval_id)
+        timeout = UNATTENDED_APPROVAL_SECONDS if turn.unattended else APPROVAL_TIMEOUT_SECONDS
+        details = [_item_detail(r) for r in reqs]
+        whys = list(dict.fromkeys(r.why for r in reqs if r.why))
+        lines: list[dict[str, str]] = [{"label": i18n.t("Why it asks"), "value": "\n".join(whys)[:300]}] if whys else []
+        for i, d in enumerate(details, 1):
+            if len(lines) < 4:
+                lines.append({"label": str(i), "value": d})
+        issued_at = int(time.time())
+        event: dict[str, Any] = {
+            "type": "approval_request", "approval_id": approval_id, "id": first.id, "name": first.name, "arguments": {},
+            "detail": "\n".join(details)[:300], "lines": lines, "label": ctx["label"], "ask": i18n.t("Allow these {count} changes?", count=len(reqs)),
+            "site": ctx["site"], "commit": "", "can_remember": False, "can_remember_recipient": False, "trail": [],
+            "can_remember_schedule": False, "schedule_id": ctx["sched_id"], "task_id": turn.task_id, "expires_at": int(time.time() + timeout),
+            "issued_at": issued_at, "steps": [{"id": r.id, "name": r.name, "detail": d} for r, d in zip(reqs, details)],
+        }
+        if len(lines) - (1 if whys else 0) < len(details):
+            event["items"] = details   # every change, when the lines above do not show them all
+        pending_approvals[approval_id] = {**event, "turn_id": turn.id, "asked_at": time.time(), "unattended": turn.unattended,
+                                          "source": turn.source, "worker_id": turn.worker_id or None, "title": turn.title}
+        activity.log_approval(approval_id, task_id=turn.task_id, tool=first.name, label=ctx["label"], site=ctx["site"],
+                              detail="\n".join(details), unattended=turn.unattended, kind=ctx["kind"], target=ctx["target"])
+        turn.waiting += 1
+        activity.set_task_status(turn.task_id, "waiting_approval")
+        turn.status_text = i18n.t("Waiting for approval")
+        await put(event)
+        allowed = False
+        try:
+            allowed = bool(await asyncio.wait_for(fut, timeout))
+            if not allowed:
+                await stop_grace()
+            return [allowed] * len(reqs)
+        except asyncio.TimeoutError:
+            for r in reqs:
+                r.outcome = "expired"   # the run is told nobody answered (not that the user declined)
+            activity.answer_approval(approval_id, "expired")
+            return [False] * len(reqs)
+        finally:
+            broker.discard(approval_id)
+            pending_approvals.pop(approval_id, None)
+            activity.answer_approval(approval_id, "cancelled")
+            activity.resolve_approval_notes(approval_id)
+            turn.waiting -= 1
+            if turn.waiting <= 0:
+                activity.set_task_status(turn.task_id, "running")
+            if not allowed:
+                deliveries.discard(approval_id)
+                pin_deliveries.discard(approval_id)
+
     async def hand_over(info: dict[str, Any], gone: Callable[[], Awaitable[bool]]) -> str:
         """A human check on the tab this reply works in: a pending item of kind human_check (the chat's live card, the Work page,
         a notification) while the browser step waits. It ends when the check leaves the page (`gone`), the user skips the site
         (POST /api/approvals/{id} approve=false; approve=true from an older app = "done"), it runs out, or the reply stops."""
         site = str(info.get("site") or "")
         seen = handover_seen.setdefault(turn.worker_id or turn.id, {})
-        device = info.get("kind") == "device"   # the phone's screen in the browser view (android_show): the owner asked to look, no check
+        device = info.get("kind") == "device"   # the phone's live view (android_show, android/handover.py): the owner asked to look, no check
         if not device and (seen.get(site, 0) < 0 or seen.get(site, 0) >= HANDOVER_PER_SITE):
             return "repeat"   # skipped before, or solved twice already: never a loop of the same blocked page
         timeout = HANDOVER_UNATTENDED_SECONDS if turn.unattended else HANDOVER_SECONDS
@@ -864,6 +1122,10 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
         return effort_extra(real, effort or store.profile()["effort"], model_name)
 
     turn_tools = tools if tools_ is None else tools_
+    if tools_ is None and (settings.payment_specialist or settings.phone_worker or settings.browser_worker):   # the chat and every run on the app's own list: no payment tool, no phone tool, no acting browser tool (tool_roles.py)
+        turn_tools = for_kind(turn_tools, None, pay_split=settings.payment_specialist, phone_split=settings.phone_worker, browser_split=settings.browser_worker)
+    if turn.unattended and source.startswith("schedule:"):   # the working phase of a scheduled run cannot message the owner
+        turn_tools = [t for t in turn_tools if not getattr(t, "reaches_owner", False)]
     by_name = {t.name: t for t in turn_tools}
     toolbox = turn_toolbox(tool_scope or scope_of(source))
     committed = False   # something reached the user that a second try would repeat or contradict: text, or a tool that changes things
@@ -875,7 +1137,8 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
     limited: list[StepLimit] = []   # the pass used its step budget (agent/loop.py StepLimit: its progress decides what follows)
     used_browser = [False]
 
-    async def run_once(prov_: str, model_: str, thread: list[dict[str, Any]], *, stall_ok: bool = False) -> tuple[dict[str, Any] | None, bool, bool]:
+    async def run_once(prov_: str, model_: str, thread: list[dict[str, Any]], *, stall_ok: bool = False,
+                       first_pass_model: bool = False) -> tuple[dict[str, Any] | None, bool, bool]:
         """One pass of the agent loop; what it does streams to the client as it happens.
         Returns (its finish event, whether it wrote an answer, whether it did anything at all).
         With `stall_ok`, a pass that is going in circles through read-only tools (it repeats a call it already made, before
@@ -884,7 +1147,39 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
         done_event: dict[str, Any] | None = None
         answered = acted = False
         built = context is not None and context.provider == prov_ and context.model == model_
-        agen = run_agent(prov_, model_, thread, turn_tools, approve=approve,
+        is_chat = turn.source in ("chat", "api") and not turn.unattended and not turn.worker_id
+        start_mono = time.monotonic()
+        saw_text = [False]
+        first_tool_checked = [False]
+        first_tool_slow = [False]
+
+        def owner_holds() -> bool:
+            try:
+                return held_by is not None and held_by(turn.owner) is not None
+            except Exception:  # noqa: BLE001 - not knowing whether the owner holds it: no ack either way is worse, so ack
+                return False
+
+        async def maybe_ack() -> None:
+            if turn.done or not is_chat or not first_pass_model or getattr(turn, "ack_sent", False) or saw_text[0] or not first_tool_slow[0]:
+                return
+            if owner_holds():   # the owner holds this tab: "on it" would be a promise the step cannot keep; the step says it waits
+                return
+            if time.monotonic() - start_mono >= ACK_SECONDS:
+                turn.ack_sent = True
+                await put({"type": "text", "text": f"{i18n.t(ACK_LINE)}<message_break/>"}, keep=False)
+
+        async def ack_timer() -> None:
+            try:
+                await asyncio.sleep(ACK_SECONDS)
+                await maybe_ack()
+            except asyncio.CancelledError:
+                pass
+
+        ack_task: asyncio.Task[None] | None = None
+        if is_chat and first_pass_model and not getattr(turn, "ack_sent", False):
+            ack_task = asyncio.create_task(ack_timer())
+
+        agen = run_agent(prov_, model_, thread, turn_tools, approve=approve, approve_many=approve_many,
                          max_steps=max_steps or settings.max_steps, stream_fn=stream_fn,
                          request_extra=effort_args(prov_, model_), measure=measured,
                          context_window=window_for(prov_, model_).context, compact_at=settings.compact_at,
@@ -905,6 +1200,10 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
                     if not turn.worker_id:
                         continue   # a chat reply says what follows itself (step_limit_end); a job's run chains its chunks
                 if isinstance(ev, ToolStarted):
+                    if not first_tool_checked[0]:
+                        first_tool_checked[0] = True
+                        first_tool_slow[0] = is_slow_tool(ev.name)
+                    await maybe_ack()
                     acted = True
                     used_browser[0] = used_browser[0] or ev.name.startswith("browser_")
                     if (tool := by_name.get(ev.name)) is not None and not tool.read_only:
@@ -916,16 +1215,21 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
                     except Exception:  # noqa: BLE001
                         log.exception("could not note the links of %s", src)
                 if isinstance(ev, AssistantText) and ev.text:
+                    saw_text[0] = True
+                    if ack_task and not ack_task.done():
+                        ack_task.cancel()
                     acted = answered = committed = True
                 if isinstance(ev, ToolResult) and not ev.is_error and (tool := by_name.get(ev.name)) is not None and tool.ends_turn:
                     answered = True   # a job's final report ends its run: no answer text is due
+                if isinstance(ev, ToolResult) and not ev.is_error and ev.name not in BOOKKEEPING:
+                    run_progress.add(run_key)
+                    await maybe_ack()
                 if isinstance(ev, ToolResult) and (hit := covered_calls.pop((turn.id, ev.id), None)) is not None and not ev.is_error:
                     if hit[0].get("kind") == "apply":   # applications: one notice after the run (finish), not one per click
                         applied.append((hit[0], hit[2]))
-                        so_far = run_progress.add(run_key)
                         if run_progress.due(run_key):
                             try:
-                                tell_progress(so_far)
+                                await tell_progress(len(applied))
                             except Exception:  # noqa: BLE001 - a notification never breaks the reply
                                 log.exception("could not tell how far the run got")
                         await put(serialize(ev))
@@ -938,6 +1242,8 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
                 if stall_ok and not committed and isinstance(ev, ToolResult) and ev.output.startswith(REPEAT_NOTE):
                     break
         finally:
+            if ack_task and not ack_task.done():
+                ack_task.cancel()
             await agen.aclose()
         return done_event, answered, acted
 
@@ -963,29 +1269,99 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
         """The turn's first pass on this model. Too long for the model: lower its window, compact under it, try once more."""
         thread = await thread_for(prov_, model_)
         try:
-            return thread, await run_once(prov_, model_, thread, stall_ok=True)
+            return thread, await run_once(prov_, model_, thread, stall_ok=True, first_pass_model=True)
         except ContextOverflow as e:
             learn_window(prov_, model_, e.tokens)
             if committed or context is None:
                 raise
             await put({"type": "retry", "reason": "the conversation was too long for the model"})
             thread = await thread_for(prov_, model_)
-            return thread, await run_once(prov_, model_, thread, stall_ok=True)
+            return thread, await run_once(prov_, model_, thread, stall_ok=True, first_pass_model=True)
+
+    async def receipt_rounds(prov_: str, model_: str, thread: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Before the reply ends with a payment whose receipt no purchase_result closed: one more round, with a note to open the
+        order page now. Once per payment; what is still unchecked after that is said at the end (finish). Returns that round's
+        finish event (None: no round was made)."""
+        if payment_ledger is None:
+            return None
+        last: dict[str, Any] | None = None
+        while due := [p for p in payment_ledger.unchecked(turn.task_id) if not p.asked_receipt]:
+            for p in due:
+                p.asked_receipt = True
+            note = RECEIPT_NOTE.format(site=", ".join(dict.fromkeys(p.host for p in due)))
+            if toolbox is not None and "purchase_result" in by_name:
+                toolbox.activate(["purchase_result"], by_name)   # the receipt check is shown in this round, whatever loaded before
+            try:
+                done_event, _, _ = await run_once(prov_, model_, [*thread, {"role": "system", "content": note}])
+            except Exception:  # noqa: BLE001 - the reply already said its words; the end says what is still unchecked
+                log.exception("the receipt round of turn %s failed", turn.id)
+                break
+            last = done_event or last
+        return last
+
+    async def promise_round(prov_: str, model_: str, thread: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """The promise rule (scheduled_runs.py), before an attended reply ends (owner 2026-11-20): a later action the reply promised
+        with nothing set up to do it gets one more round of this reply, to set up exactly that now and confirm it in one sentence (a
+        missing detail: one question). It is the same reply, so a call speaks it and the chat shows one message. How the reply said it
+        will respond from now on is no such promise; in a call those words are kept for the call's next turns (call_keep.py). Once per
+        reply. Returns that round's finish event (None: no round)."""
+        judge = getattr(ctx, "promise_judge", None)
+        if (judge is None or turn.promise_checked or turn.source not in ("chat", "api") or turn.unattended or turn.worker_id
+                or turn.evidence.kept_promise or stopping[0] or not said.text().strip()
+                or not promise_check_needed(turn.waiting, pending_approvals.values(), turn.id)):
+            return None
+        turn.promise_checked = True
+        try:
+            verdict = await asyncio.wait_for(judge.judge(said.text(), turn.owner_words or turn.request, steps=said.timeline()),
+                                             PROMISE_WAIT_S)
+        except Exception:  # noqa: BLE001 - a check never breaks a reply (a slow one is skipped)
+            log.info("turn %s: the promise check did not answer in time", turn.id)
+            return None
+        book = getattr(ctx, "call_book", None)
+        if verdict.keeps and turn.call_id and book is not None:
+            book.keep(turn.call_id, verdict.keeps)
+        if not verdict.promise or said.lead_in_done(verdict.promise):
+            return None
+        log.info("turn %s: a later action was promised with nothing set up; one round to set it up", turn.id)
+        try:
+            done_event, _, _ = await run_once(prov_, model_, [*thread, {"role": "system",
+                                                                         "content": PROMISE_ROUND_NOTE.format(quote=verdict.promise)}])
+        except Exception:  # noqa: BLE001 - the reply already said its words
+            log.exception("the promise round of turn %s failed", turn.id)
+            return None
+        return done_event
 
     async def pump() -> None:
         ui_sink.set(put)   # browser cards and other extra events from tools reach this reply (this task only)
         current_turn.set({"task_id": turn.task_id, "turn_id": turn.id, "source": turn.source, "unattended": turn.unattended,
-                          "cond": turn.cond, "request": turn.request})
+                          "cond": turn.cond, "request": turn.request, "picked": sorted(turn.picked),
+                          "owner_message": turn.owner_message, "can_call": turn.can_call,
+                          "self_started": turn.self_started, "owner_asked": turn.owner_asked})
         browser_owner.set(turn.owner)
+        # a chat reply's step on a tab the owner holds is told at once (browser tools); a job keeps the long wait
+        hold_patience.set(CHAT_CONTROL_WAIT_SECONDS if turn.source in ("chat", "api") and not turn.unattended and not turn.worker_id else None)
         injection_watch_var.set(watch)
         approval_timeout.set(UNATTENDED_APPROVAL_SECONDS if turn.unattended else APPROVAL_TIMEOUT_SECONDS)
-        handover.set(hand_over)   # a human check on this reply's tab is handed to the user (BrowserSession.snapshot)
+        handover.set(None if turn.self_started else hand_over)   # a human check on this reply's tab is handed to the user (BrowserSession.snapshot)
         entry_context.set((entries, None if turn.unattended else wait_entry))   # fill-in cards: a followed reply waits for the answer
         location_ask.set(None if turn.unattended else ask_location)   # my_location may ask the phone with a card (location.py)
         attempts = [(provider, model)]
         fb = fallback_model() if fallback else None
         if fb and provider_identity(fb[0]) != provider_identity(provider):   # a fallback on the same provider is no way out of its trouble
             attempts.append(fb)
+
+        async def monitor_progress() -> None:
+            while not turn.done:
+                try:
+                    await asyncio.sleep(PROGRESS_MONITOR_INTERVAL)
+                    if not turn.done and run_progress.due(run_key):
+                        await tell_progress()
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    log.exception("progress monitor error")
+
+        mon_task = asyncio.create_task(monitor_progress())
         try:
             for i, (prov_, model_) in enumerate(attempts):
                 try:
@@ -1010,6 +1386,9 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
                         # never a blank screen or an error code
                         await put({"type": "text", "text": i18n.t(NO_ANSWER_LINE)})
                         await offer_continue_button()
+                    done_event = await receipt_rounds(prov_, model_, thread) or done_event
+                    if done_event and answered and not limited:   # a promised later action nothing set up: set it up now (promise_round)
+                        done_event = await promise_round(prov_, model_, thread) or done_event
                     if done_event:
                         cached = {"cache_read_tokens": tokens[2], "cache_write_tokens": tokens[3]} if tokens[2] or tokens[3] else {}
                         if tokens[0]:
@@ -1025,6 +1404,7 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
                                    "reason": i18n.t(FALLBACK_REASON), "detail": f"{type(e).__name__}: {str(e)[:160]}"})
                         continue
                     lim = limit_of(e)
+                    turn.outage = is_outage(e)
                     if lim is not None:
                         turn.limited, turn.limit_reset = True, lim.until   # what the usage limit holds it for (workers.py reads it)
                     if turn.resume is not None and is_outage(e):   # the provider is down, not the request: wait for it
@@ -1045,6 +1425,7 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
                                    "detail": f"{type(e).__name__}: {str(e)[:300]}"})
                     return
         finally:
+            mon_task.cancel()
             await finish()
 
     async def offer_continue_button() -> None:
@@ -1059,7 +1440,10 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
         to a background job that carries on in chunks (it keeps this task's permissions) and the user is told so. A reply that went
         in circles stops with a plain line and a Continue button."""
         nxt, job = "continue", ""
-        if ev.progress >= STEP_LIMIT_PROGRESS and "delegate" in by_name and turn.source != "handoff":
+        existing = workers.open_job_for(turn.id, turn.task_id, turn.owner or "", turn.jobs) if turn.source != "handoff" else None
+        if existing is not None and ev.progress >= STEP_LIMIT_PROGRESS:
+            nxt, job = "background", existing["id"]   # a job of this reply (or on its tab or phone) carries on: never a second one
+        elif ev.progress >= STEP_LIMIT_PROGRESS and "delegate" in by_name and turn.source != "handoff":
             asked = next((m["content"] for m in reversed(thread) if m.get("role") == "user" and isinstance(m.get("content"), str)), "")
             said = "".join(answer).strip()[-2000:]
             task = (f"Carry on with the user's request from the chat; the chat reply ran out of steps. The user asked:\n{asked[:4000]}\n\n"
@@ -1067,7 +1451,8 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
                     "Do the items that are left, one after another; do not redo finished ones. Check what is already done before you "
                     "act when you are not sure. The permission the user gave for this task holds in this job too.")
             try:
-                out = await workers.delegate({"task": task, "kind": "browser" if used_browser[0] and session is not None else "general"})
+                out = await workers.delegate({"task": task, "title": i18n.t(CONTINUE_JOB_TITLE, request=title_from(asked, 40)),
+                                              "kind": "browser" if used_browser[0] and session is not None else "general"})
             except Exception:  # noqa: BLE001 - then the Continue button
                 log.exception("could not hand the rest of the reply to a job")
                 out = "Error"
@@ -1106,12 +1491,14 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
 
 
 def start_background(ctx: Any, prompt: str, *, title: str, source: str, owner: str, note: str, saved_as: str, extra_note: str = "",
-                     restarts: int = 0, resumed_from: int | None = None, cond: str = "") -> Turn:
+                     restarts: int = 0, resumed_from: int | None = None, cond: str = "", two_phase: bool = False) -> Turn:
     """A turn nobody watches (a schedule, a task handed over from the agent screen): the user's main model with the full prompt,
     the conversation as a chat turn sees it (summary + history, compacted inline if it must be), and `note` saying the user is
     away. Its answer is added to the conversation, led by `saved_as`; it never starts the after-turn fold itself.
     `cond`: the conditional task it works for ("watcher:<id>", a watcher's hit tried again): what the owner allowed that task
-    covers its steps as it did on the first run (schedule_grants.current_scopes). Raises HTTPException when no model is set."""
+    covers its steps as it did on the first run (schedule_grants.current_scopes). `two_phase`: a scheduled run's working phase: its end
+    says nothing to the owner (no chat message, no notification); `turn.report` keeps what it wrote and the caller's closing phase
+    decides (scheduled_runs.py). Raises HTTPException when no model is set."""
     S = _server()   # read at each call (tests tune some of these on assistant.server)
     NO_REPLY = S.NO_REPLY
     collapse_repeat = S.collapse_repeat
@@ -1130,7 +1517,9 @@ def start_background(ctx: Any, prompt: str, *, title: str, source: str, owner: s
 
     def observe(item: dict[str, Any] | None) -> None:
         if item is None:
-            if said and said.text().strip() != NO_REPLY and turn.task_id not in retried:   # NO_REPLY (or a retry asked for): nothing joins the chat
+            if two_phase:
+                turn.report = collapse_repeat(said.text()) if said else ""   # private: the closing phase decides what the owner reads
+            elif said and said.text().strip() != NO_REPLY and turn.task_id not in retried:   # NO_REPLY (or a retry asked for): nothing joins the chat
                 store.add_message("assistant", f"{saved_as}\n" + collapse_repeat(said.text()))
             said.clear()
         else:
@@ -1139,6 +1528,7 @@ def start_background(ctx: Any, prompt: str, *, title: str, source: str, owner: s
     turn = start_turn(provider, model, ctx.tail, observe, source=source, title=title, unattended=True, owner=owner, context=ctx,
                       cond=cond)
     sid = source[9:] if source.startswith("schedule:") else ""
+    turn.defer_report = two_phase
     turn.rerun = ({"kind": "schedule", "schedule_id": int(sid)} if sid.isdigit() else
                   {"kind": "background", "prompt": prompt[:8000], "title": title, "source": source, "owner": owner, "note": note,
                    "saved_as": saved_as, **({"cond": cond} if cond else {})})

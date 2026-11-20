@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 from ..agent import Ours, Tool
 from ..agent.loop import outside_seen
 from ..agent.fence import data
-from ..agent import found_secrets
+from ..agent import facts, found_secrets
 from ..cred_keyring import spawn_sync, via
 from ..credentials import (
     SECRET_MARK,
@@ -35,7 +35,9 @@ from ..credentials import (
 from .. import forbidden, local_login
 from ..deliverables import Deliverables, LibraryFileError
 from ..home import Home, HomeError
+from ..data_trail import USES_PARAM
 from ..i18n import t
+from ..injection_watch import current as injection_watch_var
 from ..keyguard import Locked
 from ..mcp_oauth import open_token
 from ..netguard import NetGuardError, Reply, fetch, fetch_local
@@ -137,6 +139,34 @@ async def mcp_session_call(fetcher: Fetcher, cred: dict[str, Any], method: str, 
 MAX_DOWNLOAD = 50 * 1024**2
 
 
+def asked_in_chat() -> bool:
+    """Kelo's own settings the owner asks for in the chat (snooze a reminder, which calendars Kelo reads, the briefing, a schedule), or
+    asks for from the app in a turn that carries their request (items they added to the checklist: Turn.owner_asked, checklist.py):
+    the request is the owner's go-ahead, so no card, unless a page, mail or message (outside text) reached this run or nobody is in
+    the chat. A step Kelo takes by itself (a background job, a watcher) or after outside text still asks."""
+    turn = current_turn.get() or {}
+    seen = outside_seen.get()
+    asked = (turn.get("source") == "chat" and not turn.get("unattended")) or bool(turn.get("owner_asked"))
+    return asked and not (seen and seen[0])
+
+
+def owner_request() -> bool:
+    """The owner's own chat message (or an app request they made) asked for this run's step, and nothing says it was not theirs: a change
+    to their own things (calendar events) then needs no card. Unattended runs and a message from anyone else (a group, a forward) do not
+    count; a run the injection watch flagged does not either. The outside-text rule (outside_rule.py) still decides per step."""
+    turn = current_turn.get() or {}
+    if turn.get("unattended"):
+        return False
+    asked = (turn.get("source") == "chat" and bool(turn.get("owner_message"))) or bool(turn.get("owner_asked"))
+    if not asked:
+        return False
+    try:
+        watch = injection_watch_var.get()
+        return not (watch is not None and watch.flagged())
+    except Exception:  # noqa: BLE001 - unsure: the card asks
+        return False
+
+
 def connect_tools(store: Store, home: Home | None = None, fetcher: Fetcher = fetch, local_fetcher: Fetcher = fetch_local,
                   keyring: Any = None) -> list[Tool]:
     library = Deliverables(home) if home is not None else None
@@ -177,11 +207,7 @@ def connect_tools(store: Store, home: Home | None = None, fetcher: Fetcher = fet
         """No approval card for a change to the owner's own device app when the owner asked for it in their own chat message and
         nothing from outside (a page, mail, message, another app's data) has reached this run. A step Kelo takes by itself (a
         background job, a schedule, a watcher) or after outside text still asks; a task the owner set up runs under its own permission."""
-        if not own_device(args):
-            return False
-        turn = current_turn.get() or {}
-        seen = outside_seen.get()
-        return turn.get("source") == "chat" and not turn.get("unattended") and not (seen and seen[0])
+        return own_device(args) and asked_in_chat()
 
     def registration(args: dict[str, Any]) -> tuple[str, list[str], dict[str, Any], str, str]:
         """(name, hosts, placement, MCP endpoint, check URL) from the call; raises NetGuardError when something is not allowed."""
@@ -205,7 +231,15 @@ def connect_tools(store: Store, home: Home | None = None, fetcher: Fetcher = fet
         except NetGuardError:
             return False
         old = store.credential(name)
-        return bool(old and old["kind"] == "api" and old["secret"] and (sorted(old["hosts"]) != sorted(hosts) or old["placement"] != placement))
+        # has_secret, not the opened secret: a locked vault shows no value, but the key is still stored (keychain rows too)
+        return bool(old and old["kind"] == "api" and old.get("has_secret") and (sorted(old["hosts"]) != sorted(hosts) or old["placement"] != placement))
+
+    def refuse_locked_move(args: dict[str, Any]) -> str | None:
+        """A call that would drop a stored key while the vault is locked is refused before any card: the key cannot be moved without
+        opening the vault, and a card must not look like a choice the owner can make here."""
+        if store.vault_locked() and moves_stored_key(args):
+            return "the vault is locked, so a key already saved for this service cannot be moved now; ask the user to unlock the vault first"
+        return None
 
     async def describe_move(args: dict[str, Any]) -> str:
         name, hosts, _, _, _ = registration(args)
@@ -314,7 +348,8 @@ def connect_tools(store: Store, home: Home | None = None, fetcher: Fetcher = fet
         store.add_vault_log(name, "replaced" if old and old["secret"] else "saved", f"service key found on a page, for {', '.join(hosts)}")
         spawn_sync(store, keyring)
         found.forget(ref)
-        # the apps turn this line into a "Saved in the Keychain" card (KeySavedRules in shared chat/KeySaved.kt and iOS): keep its start
+        # the apps turn the facts above into a "Saved in the Keychain" card (KeySavedRules in shared chat/KeySaved.kt and iOS)
+        facts.put(saved_key={"service": name, "hosts": list(hosts)})   # the apps read this, not the sentence below
         return Ours(f"Saved the key for {name!r} in the keychain (hosts: {', '.join(hosts)}). You never see it. Use connector_get / connector_send "
                     f"with name={name!r}; keep what you learn about this API in notes/services/{name}.md with write_file.")
 
@@ -454,6 +489,7 @@ def connect_tools(store: Store, home: Home | None = None, fetcher: Fetcher = fet
              # no Allow/Deny card: typing the key into the entry (which shows the hosts) is the consent. Only a call that would move
              # a key that is already stored to other hosts asks first.
              add_service_key, requires_approval=True, auto_approve=lambda a: not moves_stored_key(a), describe=describe_move,
+             validate=refuse_locked_move,
              declined="The user kept the saved key where it is; nothing was changed. Do not ask again unless they bring it up."),
         Tool("save_found_secret",
              "Save a key you came across (shown to you as [secret #N: ..., hidden]) in the keychain: you never see its value. Give the "
@@ -479,25 +515,26 @@ def connect_tools(store: Store, home: Home | None = None, fetcher: Fetcher = fet
              "give url as a path such as /api/states.",
              {"type": "object", "properties": {"name": name_prop, "url": url_prop,
                                                            "headers": {"type": "object"}}, "required": ["name", "url"]},
-             connector_get, untrusted=True, source="connector", read_only=True, own_data=own_device),
+             connector_get, untrusted=True, source="connector", read_only=True, own_data=own_device, trail="connector"),
         Tool("connector_download", "Save a picture or file from a connected service (GET) into the user's library, for example a camera "
              "snapshot, a photo or a PDF. Then show or share it with the library's file tools.",
              {"type": "object", "properties": {"name": name_prop, "url": url_prop, "save_as": {"type": "string", "description": "file name"},
                                                "headers": {"type": "object"}}, "required": ["name", "url"]},
-             connector_download, source="connector"),
-        Tool("connector_send", "Change something in a connected service (the server adds the key). The user approves each call, "
-             "except for a change to their own smart-home app (Home Assistant) that they asked for in their own message: that goes ahead "
-             "at once (switching, locking, heating). A change nobody asked for, or one prompted by text from a page, mail or message, is "
-             "asked first.",
+             connector_download, source="connector", trail="connector"),
+        Tool("connector_send", "Change something in a connected service (the server adds the key). A change to the user's own devices on their own network "
+             "that they asked for in this chat goes ahead at once; any other call, or one prompted by something you read, shows the user "
+             "a card first.",
              {"type": "object", "properties": {"name": name_prop, "method": {"type": "string", "enum": ["POST", "PUT", "PATCH", "DELETE"]},
-                                               "url": url_prop, "json": {"description": "request body"}, "headers": {"type": "object"}},
+                                               "url": url_prop, "json": {"description": "request body"}, "headers": {"type": "object"},
+                                               "uses": USES_PARAM},
               "required": ["name", "url"]}, connector_send, requires_approval=True, untrusted=True, source="connector",
              auto_approve=asked_directly),
         Tool("mcp_list_tools", "List the tools of a connected MCP server with their input schemas.",
              {"type": "object", "properties": {"name": name_prop, "cursor": {"type": "string"}}, "required": ["name"]},
              mcp_list_tools, untrusted=True, source="mcp", read_only=True, own_data=own_device),
-        Tool("mcp_call_tool", "Call one tool of a connected MCP server. The user approves each call (not for the user's own smart-home "
-             "app when they asked for it in their own message).",
-             {"type": "object", "properties": {"name": name_prop, "tool": {"type": "string"}, "arguments": {"type": "object"}},
-              "required": ["name", "tool"]}, mcp_call_tool, requires_approval=True, untrusted=True, source="mcp", auto_approve=asked_directly),
+        Tool("mcp_call_tool", "Call one tool of a connected MCP server. Same rule as connector_send: the user's own devices, asked for in this "
+             "chat, go at once; anything else shows a card first.",
+             {"type": "object", "properties": {"name": name_prop, "tool": {"type": "string"}, "arguments": {"type": "object"},
+                                               "uses": USES_PARAM},
+              "required": ["name", "tool"]}, mcp_call_tool, requires_approval=True, untrusted=True, source="mcp", auto_approve=asked_directly, trail="connector"),
     ]

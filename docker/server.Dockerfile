@@ -8,6 +8,14 @@ LABEL chat.kelo.image="1"
 
 ARG TARGETARCH
 ARG BROWSER=chromium
+# BROWSER=chrome: the exact Google Chrome build (the pool .deb version). Changing it is a decision with a rollback tag (review 2026-11-18:
+# the 0.10.5 rebuild moved Chrome 157 -> 158 without anyone choosing it). The package is held after install (apt-mark hold).
+# The Chrome OS platform version that shipped with each milestone, stated by the desktop identity (browser_identity.py
+# CHROME_OS_PLATFORM_VERSIONS must have these rows; tests/test_browser_identity.py checks it). Source: chromiumdash, cros/fetch_serving_builds,
+# read 2026-11-18 (Chrome 158 beta builds 158.0.8127.24 run ChromeOS 16868.13.0). A milestone with no row keeps the Linux identity.
+# milestone  chromeos_platform_version
+#   158      16868.13.0
+ARG CHROME_VERSION=158.0.8127.36-1
 
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy \
@@ -15,7 +23,7 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl tini procps socat dbus-x11 poppler-utils \
-      xvfb openbox x11vnc novnc websockify \
+      tigervnc-standalone-server openbox \
       fonts-liberation fonts-noto-cjk fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
@@ -32,7 +40,13 @@ RUN set -eux; \
       curl -fsSL https://dl.google.com/linux/linux_signing_key.pub -o /etc/apt/keyrings/google-chrome.asc; \
       echo "deb [arch=$arch signed-by=/etc/apt/keyrings/google-chrome.asc] https://dl.google.com/linux/chrome/deb/ stable main" \
         > /etc/apt/sources.list.d/google-chrome.list; \
-      apt-get update; apt-get install -y --no-install-recommends google-chrome-stable; \
+      apt-get update; \
+      curl -fsSL "https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_${CHROME_VERSION}_${arch}.deb" \
+        -o /tmp/google-chrome.deb; \
+      apt-get install -y --no-install-recommends /tmp/google-chrome.deb; \
+      rm -f /tmp/google-chrome.deb; \
+      apt-mark hold google-chrome-stable; \
+      echo "$CHROME_VERSION" > /etc/kelo-chrome-version; \
       ln -s /usr/bin/google-chrome-stable /usr/local/bin/browser; \
     else \
       apt-get update; apt-get install -y --no-install-recommends chromium; \
@@ -69,6 +83,16 @@ RUN mkdir -p /run/kelo-route /run/kelo-vpn && chown assistant:assistant /run/kel
 # the key container (keyring_service.py): its own user and state folder (a new keyring-state volume gets this owner; /state belongs to the server's user)
 RUN useradd -m -u 1005 keyring && mkdir -p /keyring-state && chown keyring:keyring /keyring-state && chmod 700 /keyring-state
 RUN mkdir -p /run/workroom && chown 1003:1050 /run/workroom && chmod 2770 /run/workroom
+# the voice container (voice_service.py): its own user; the Silero VAD model baked in, root-owned and checked by its hash (docker/voice.lock);
+# the socket folder is shared only with the server (group 1051); the speech models come from the voice-models volume the server writes
+COPY docker/voice.lock /tmp/voice.lock
+RUN set -eux; . /tmp/voice.lock; mkdir -p /opt/voice; \
+    curl -fsSL -o /opt/voice/silero_vad.onnx "$SILERO_VAD_URL"; \
+    echo "$SILERO_VAD_SHA256  /opt/voice/silero_vad.onnx" | sha256sum -c -; \
+    chmod 644 /opt/voice/silero_vad.onnx; rm -f /tmp/voice.lock
+RUN groupadd -g 1051 voice-io && useradd -m -u 1006 -g voice-io voice \
+    && mkdir -p /run/voice /voice-models && chown 1006:1051 /run/voice && chmod 2770 /run/voice \
+    && chown assistant:assistant /voice-models && chmod 755 /voice-models
 
 RUN pip install --no-cache-dir uv
 WORKDIR /app
@@ -83,6 +107,8 @@ COPY version.json ./
 COPY releases ./releases
 # the one-line installers kelo.chat serves at /install.sh and /install.ps1 (api/site.py)
 COPY scripts/install.sh scripts/install.ps1 ./scripts/
+# the Windows one-line installer at /install-windows.ps1 (api/site.py)
+COPY scripts/windows/kelo-get.ps1 ./scripts/windows/
 ARG KELO_VERSION=""
 LABEL org.opencontainers.image.version="${KELO_VERSION}"
 
@@ -96,5 +122,5 @@ COPY docker/chromium-policy.json /etc/opt/chrome/policies/managed/kelo.json
 
 ENV DISPLAY=:99 SCREEN=1440x900x24 ASSISTANT_HOME=/state ASSISTANT_CONTENT_DIR=/app/content
 USER assistant
-EXPOSE 8080 6080
+EXPOSE 8080
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

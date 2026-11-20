@@ -3,7 +3,8 @@ task), every approval it asked for and how it was answered, the user's standing 
 notifications (each one also wakes the paired phones with a push when nobody saw it arrive; see push.py).
 
 Everything lives in the app's SQLite file next to the conversation. No secret ever goes in: approvals keep the tool, its short
-label, the site and the one-line description shown on the card (never the arguments), and tasks keep the user's words and the
+label, the site and the one-line description shown on the card (never the arguments; of an edited message only the two versions,
+secret-scrubbed and short: approval_edit.py), and tasks keep the user's words and the
 assistant's answer, as the conversation does.
 """
 
@@ -53,6 +54,8 @@ DECISIONS = ("pending", "allowed_once", "allowed_always", "allowed_by_rule", "de
                                                   # progressed: the user's part of a sign-in is done, the sign-in goes on
 KEEP_TASKS = 5000
 KEEP_APPROVALS = 3000
+# How the apps' "Past approvals" list sorts a decision: allow, deny, expired (a request nobody answered); the rest as it is
+APPROVAL_RESULTS = {"allowed_once": "allow", "allowed_always": "allow", "allowed_by_rule": "allow", "denied": "deny", "expired": "expired"}
 KEEP_NOTIFICATIONS = 1000
 RESTART_RESULT = N_("Stopped because the server restarted")   # the result of a task a restart cut off (not something the user did)
 
@@ -61,10 +64,11 @@ RESTART_RESULT = N_("Stopped because the server restarted")   # the result of a 
 RULE_KINDS: dict[str, str] = {"browser_click": "browser_action", "browser_type": "browser_action", "browser_login": "login",
                               # a point step: only when its element was read (one Kelo could not read never matches a rule, turn_engine)
                               "browser_click_at": "browser_action", "browser_drag": "browser_action",
-                              "workroom_install": "install"}   # install: one package (its "site" is <name>.pypi|npm.install, workroom.install_site)
+                              "workroom_install": "install",   # install: one package (its "site" is <name>.pypi|npm.install, workroom.install_site)
+                              "web_fetch": "web_read"}         # a read of one public page: remembered per site, like a click (never a send)
 KIND_LABELS = {"browser_action": N_("Clicking and typing on a site"), "login": N_("Typing a saved login"),
-               "install": N_("Installing a program in the work room")}
-NEVER_REMEMBER = ("confirm_purchase", "purchase_result", "browser_fill_card", "wallet_", "browser_upload", "find_login_code",   # the last two: every time
+               "install": N_("Installing a program in the work room"), "web_read": N_("Reading a web page on a site")}
+NEVER_REMEMBER = ("forget_", "confirm_purchase", "checkout_review", "order_preapprove", "checkout_submit", "purchase_result", "browser_fill_card", "wallet_", "browser_upload", "find_login_code",   # the last two: every time
                   "task_allow")   # the setup question of a conditional task is asked once, never remembered
 
 
@@ -75,15 +79,15 @@ def restart_results() -> list[str]:
 
 def rule_kind(tool: str) -> str:
     """The kind of rule an approval of `tool` may become, or "" when it can never be remembered."""
-    if tool.startswith(NEVER_REMEMBER) or tool.startswith("schedule_"):
+    if tool.startswith(NEVER_REMEMBER) or tool.startswith(("schedule_", "event_reminders_")):
         return ""
     return RULE_KINDS.get(tool, "")
 
 
 def schedule_rule_ok(tool: str) -> bool:
     """Whether an approval of `tool` in a scheduled run may become a rule for that schedule ("keep allowing in this scheduled job").
-    Never for payments (confirm_purchase, card filling, anything of the wallet) or for changing schedules themselves."""
-    return bool(tool) and not tool.startswith(NEVER_REMEMBER) and not tool.startswith("schedule_")
+    Never for payments (confirm_purchase, card filling, anything of the wallet) or for changing schedules or event reminders themselves."""
+    return bool(tool) and not tool.startswith(NEVER_REMEMBER) and not tool.startswith(("schedule_", "event_reminders_"))
 
 
 def host_of(value: str) -> str:
@@ -152,6 +156,7 @@ def result_line(answer: str, limit: int = 120) -> str:
 class Activity:
     def __init__(self, store: Any, clock: Any = time.time):
         self.store, self._clock = store, clock
+        self.on_settled: Callable[[list[str]], None] | None = None   # set by the server: a "settled" push (push.PushClient.settle), item ids only
         self.on_notify: Callable[[dict[str, Any]], None] | None = None   # set by the server: a push to the phones (push.PushClient.notify)
         with store._lock:
             store._db.executescript(SCHEMA)
@@ -162,11 +167,15 @@ class Activity:
             for col, ddl in (("resume", "TEXT NOT NULL DEFAULT ''"), ("restarts", "INTEGER NOT NULL DEFAULT 0"),
                              ("resumed_from", "INTEGER"), ("resumed_as", "INTEGER"), ("resume_state", "TEXT NOT NULL DEFAULT ''"),
                              ("wait_since", "REAL"), ("retry_at", "REAL"), ("waits", "INTEGER NOT NULL DEFAULT 0"),
-                             ("wait_noted", "INTEGER NOT NULL DEFAULT 0")):
+                             ("wait_noted", "INTEGER NOT NULL DEFAULT 0"), ("steps", "TEXT NOT NULL DEFAULT ''")):
                 if col not in have:   # going on after a restart or a model outage (resume.py)
                     store._db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
             store._db.execute("CREATE TABLE IF NOT EXISTS resume_offers (message_id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, "
                               "why TEXT NOT NULL, label TEXT NOT NULL, created_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'open')")
+            log_cols = {r[1] for r in store._db.execute("PRAGMA table_info(approval_log)")}
+            for col in ("kind", "target", "via", "edit_field", "edit_before", "edit_after"):
+                if col not in log_cols:   # the tool's effect kind, the recipient shown, who answered, and the owner's fix of the message
+                    store._db.execute(f"ALTER TABLE approval_log ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
             note_cols = {r[1] for r in store._db.execute("PRAGMA table_info(notifications)")}
             if "followup_id" not in note_cols:
                 store._db.execute("ALTER TABLE notifications ADD COLUMN followup_id INTEGER")   # a follow-up's notification (followups.py)
@@ -174,6 +183,8 @@ class Activity:
                 store._db.execute("ALTER TABLE notifications ADD COLUMN provider TEXT NOT NULL DEFAULT ''")
             if "urgent" not in note_cols:     # time matters (a card of a task marked urgent at setup): the phone may break quiet hours
                 store._db.execute("ALTER TABLE notifications ADD COLUMN urgent INTEGER NOT NULL DEFAULT 0")
+            if "settled" not in note_cols:    # the item it waited for (approval_id) was answered, ran out or was cancelled: the phones take it down
+                store._db.execute("ALTER TABLE notifications ADD COLUMN settled INTEGER NOT NULL DEFAULT 0")
             store._db.commit()
         now = clock()
         # a restart ended whatever was running: "interrupted", and the server decides at start-up whether it goes on (resume.py)
@@ -274,6 +285,7 @@ class Activity:
         tid = int(self.store._run("INSERT INTO tasks(turn_id, title, status, source, started_at, seen) VALUES(?,?,?,?,?,0)",
                                   (turn_id, (title or t("Conversation"))[:80], "running", source, self._clock())).lastrowid or 0)
         self.store._run("DELETE FROM tasks WHERE id <= ? - ?", (tid, KEEP_TASKS))
+        self.store._run("DELETE FROM trail_labels WHERE run_id GLOB '[0-9]*' AND CAST(run_id AS INTEGER) <= ? - ?", (tid, KEEP_TASKS))   # the labels go with the run (data_trail.py)
         return tid
 
     def rename_task(self, task_id: int, title: str) -> None:
@@ -306,6 +318,21 @@ class Activity:
                         (status, result, answer[:20000], error[:500], self._clock(), int(seen), input_tokens, output_tokens, task_id))
         return self.task(task_id)
 
+    def set_outcome(self, task_id: int, text: str) -> dict[str, Any] | None:
+        """The closing phase of a scheduled run (scheduled_runs.py) decided: `text` is what the owner was told (the task shows its first
+        line and becomes unread), "" = there was nothing to tell (the task is read, as a quiet run is). The working report stays as
+        the task's answer."""
+        if text.strip():
+            self.store._run("UPDATE tasks SET result = ?, seen = 0 WHERE id = ?", (result_line(text) or t("Finished"), task_id))
+        else:
+            self.store._run("UPDATE tasks SET result = ?, seen = 1 WHERE id = ?", (t("There was nothing to tell"), task_id))
+        return self.task(task_id)
+
+    def set_steps(self, task_id: int, steps: str) -> None:
+        """The tool steps of a finished run as a short JSON summary (skill_lessons.run_steps): read by the nightly look-back for lessons.
+        Never the tool arguments or results."""
+        self.store._run("UPDATE tasks SET steps = ? WHERE id = ?", (steps[:4000], task_id))
+
     def _task(self, r: dict[str, Any], full: bool = False) -> dict[str, Any]:
         src = r["source"]
         out = {"id": r["id"], "turn_id": r["turn_id"], "title": r["title"], "status": r["status"], "result": r["result"], "source": src,
@@ -330,6 +357,12 @@ class Activity:
     def unseen_tasks(self) -> int:
         return int(self.store._all("SELECT COUNT(*) AS n FROM tasks WHERE seen = 0 AND status NOT IN ('running', 'waiting_approval', 'waiting_model')")[0]["n"])
 
+    def last_reply_failed(self) -> bool:
+        """The newest chat reply (a task from the chat; a running one counts as newest) ended failed: the apps' character shows the error
+        face until a later reply works. Background tasks do not count."""
+        rows = self.store._all("SELECT status FROM tasks WHERE source = 'chat' ORDER BY id DESC LIMIT 1")
+        return bool(rows) and rows[0]["status"] == "failed"
+
     def mark_tasks_seen(self, up_to: int) -> int:
         n = self.store._run("UPDATE tasks SET seen = 1 WHERE id <= ? AND seen = 0 AND status NOT IN ('running', 'waiting_approval', 'waiting_model')",
                             (up_to,)).rowcount
@@ -340,18 +373,26 @@ class Activity:
 
     # ------------------------------------------------------------------ approvals
     def log_approval(self, approval_id: str, *, task_id: int | None, tool: str, label: str, site: str, detail: str,
-                     decision: str = "pending", rule_id: int | None = None, unattended: bool = False) -> None:
+                     decision: str = "pending", rule_id: int | None = None, unattended: bool = False, kind: str = "",
+                     target: str = "") -> None:
+        """`kind`: the tool's effect (read, change, send, delete; "" for another step); `target`: the recipient or place to show."""
         now = self._clock()
         self.store._run("INSERT OR REPLACE INTO approval_log(id, task_id, tool, label, site, detail, decision, asked_at, answered_at, rule_id, "
-                        "unattended) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        "unattended, kind, target) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (approval_id, task_id, tool, label, site, detail[:300], decision, now, None if decision == "pending" else now,
-                         rule_id, int(unattended)))
+                         rule_id, int(unattended), kind, target[:200]))
         self.store._run("DELETE FROM approval_log WHERE rowid <= (SELECT MAX(rowid) FROM approval_log) - ?", (KEEP_APPROVALS,))
 
-    def answer_approval(self, approval_id: str, decision: str) -> None:
-        """Only the first answer counts: a late reply cannot turn an expired request into an allowed one."""
-        self.store._run("UPDATE approval_log SET decision = ?, answered_at = ? WHERE id = ? AND decision = 'pending'",
-                        (decision, self._clock(), approval_id))
+    def answer_approval(self, approval_id: str, decision: str, via: str = "") -> None:
+        """Only the first answer counts: a late reply cannot turn an expired request into an allowed one. `via`: where the answer came
+        from (app, notification, messenger); "" for a decision nobody gave (expired, cancelled)."""
+        self.store._run("UPDATE approval_log SET decision = ?, answered_at = ?, via = ? WHERE id = ? AND decision = 'pending'",
+                        (decision, self._clock(), via, approval_id))
+
+    def note_edit(self, approval_id: str, field: str, before: str, after: str) -> None:
+        """The owner fixed the outgoing message before allowing it: both versions, secrets hidden and short (approval_edit.py)."""
+        self.store._run("UPDATE approval_log SET edit_field = ?, edit_before = ?, edit_after = ? WHERE id = ?",
+                        (field, before, after, approval_id))
 
     def approval(self, approval_id: str) -> dict[str, Any] | None:
         rows = self.store._all("SELECT * FROM approval_log WHERE id = ?", (approval_id,))
@@ -361,7 +402,9 @@ class Activity:
     def _approval(r: dict[str, Any]) -> dict[str, Any]:
         return {"id": r["id"], "task_id": r["task_id"], "tool": r["tool"], "label": r["label"], "site": r["site"], "detail": r["detail"],
                 "decision": r["decision"], "asked_at": r["asked_at"], "answered_at": r["answered_at"], "rule_id": r["rule_id"],
-                "unattended": bool(r["unattended"]), "can_remember": bool(rule_kind(r["tool"]) and r["site"])}
+                "unattended": bool(r["unattended"]), "can_remember": bool(rule_kind(r["tool"]) and r["site"]),
+                "kind": r["kind"], "where": r["site"] or r["target"], "via": r["via"], "edited": bool(r["edit_field"]),
+                "result": APPROVAL_RESULTS.get(r["decision"], r["decision"])}
 
     def approvals(self, limit: int = 50, before: float | None = None, task_id: int | None = None) -> list[dict[str, Any]]:
         rows = self.store._all("SELECT * FROM approval_log WHERE (? IS NULL OR asked_at < ?) AND (? IS NULL OR task_id = ?) "
@@ -440,6 +483,10 @@ class Activity:
         return self.store._run("DELETE FROM schedule_rules WHERE id = ? AND (? IS NULL OR schedule_id = ?)",
                                (rule_id, schedule_id, schedule_id)).rowcount > 0
 
+    def drop_schedule_rules(self, schedule_id: int) -> int:
+        """Every "keep allowing in this scheduled job" rule of a schedule: its task changed, so the owner is asked again (audit F6)."""
+        return self.store._run("DELETE FROM schedule_rules WHERE schedule_id = ?", (int(schedule_id),)).rowcount
+
     def matching_schedule_rule(self, schedule_id: int | None, tool: str, site: str) -> dict[str, Any] | None:
         if not schedule_id or not schedule_rule_ok(tool):
             return None
@@ -498,5 +545,23 @@ class Activity:
         self.store._run("UPDATE notifications SET seen = 1 WHERE payment_id IS NOT NULL AND payment_id <= ? AND seen = 0", (up_to_payment,))
 
     def resolve_approval_notes(self, approval_id: str) -> None:
-        """An approval that was answered (or ran out) no longer needs its notification."""
+        """An approval that was answered (or ran out) no longer needs its notification: it is marked seen and settled, and the phones
+        are told once (a "settled" push with the item id only) so they take the notification down."""
         self.store._run("UPDATE notifications SET seen = 1 WHERE approval_id = ? AND seen = 0", (approval_id,))
+        fresh = self.store._run("UPDATE notifications SET settled = 1 WHERE approval_id = ? AND settled = 0", (approval_id,)).rowcount
+        if fresh and self.on_settled is not None:    # once per item: a second call finds nothing left to settle
+            try:
+                self.on_settled([approval_id])
+            except Exception:  # noqa: BLE001 - a push problem never breaks the answer
+                logging.getLogger("uvicorn.error").warning("push: could not queue a settled push")
+
+    def settled_items(self, ids: list[str]) -> list[str]:
+        """Of the item ids a phone still shows a notification for, the ones that do not wait any more. An id this server has no
+        notification for (pruned, or another server's) counts as settled."""
+        ids = [i for i in dict.fromkeys(ids) if i][:200]
+        if not ids:
+            return []
+        marks = ",".join("?" for _ in ids)
+        waiting = {r["approval_id"] for r in self.store._all(
+            f"SELECT DISTINCT approval_id FROM notifications WHERE approval_id IN ({marks}) AND settled = 0", tuple(ids))}
+        return [i for i in ids if i not in waiting]
