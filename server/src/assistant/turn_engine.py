@@ -688,7 +688,7 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
         await react_end(turn.final_status)   # a reply that ended without "done" or "error" (stopped, cut off)
         try:
             if not stopping[0]:   # a server going down: the task stays "interrupted" for the next start (resume_after_restart)
-                task_closed(turn, turn.final_status, said.text(), turn.final_error)
+                task_closed(turn, turn.final_status, said.text(), turn.final_error, (said.parts() or [""])[-1])
         except Exception:  # noqa: BLE001
             log.exception("task log update failed")
         await turn.close()
@@ -1336,13 +1336,16 @@ def run_turn(ctx: Any, provider: str, model: str, messages: list[dict[str, Any]]
         current_turn.set({"task_id": turn.task_id, "turn_id": turn.id, "source": turn.source, "unattended": turn.unattended,
                           "cond": turn.cond, "request": turn.request, "picked": sorted(turn.picked),
                           "owner_message": turn.owner_message, "can_call": turn.can_call,
-                          "self_started": turn.self_started, "owner_asked": turn.owner_asked})
+                          "self_started": turn.self_started, "owner_asked": turn.owner_asked,
+                          "blocks": turn.evidence.blocks})
         browser_owner.set(turn.owner)
         # a chat reply's step on a tab the owner holds is told at once (browser tools); a job keeps the long wait
         hold_patience.set(CHAT_CONTROL_WAIT_SECONDS if turn.source in ("chat", "api") and not turn.unattended and not turn.worker_id else None)
         injection_watch_var.set(watch)
         approval_timeout.set(UNATTENDED_APPROVAL_SECONDS if turn.unattended else APPROVAL_TIMEOUT_SECONDS)
-        handover.set(None if turn.self_started else hand_over)   # a human check on this reply's tab is handed to the user (BrowserSession.snapshot)
+        # a human check on this reply's tab is handed to the user (BrowserSession.snapshot). Never for a run Kelo started itself, nor for a
+        # scheduled run (owner 2026-11-21): nobody waits for it, the check ends the run as blocked (run_blocks)
+        handover.set(None if turn.self_started or turn.source.startswith("schedule:") else hand_over)
         entry_context.set((entries, None if turn.unattended else wait_entry))   # fill-in cards: a followed reply waits for the answer
         location_ask.set(None if turn.unattended else ask_location)   # my_location may ask the phone with a card (location.py)
         attempts = [(provider, model)]
@@ -1508,7 +1511,6 @@ def start_background(ctx: Any, prompt: str, *, title: str, source: str, owner: s
     resolve_model = ctx.resolve_model
     start_turn = ctx.start_turn
     store = ctx.store
-    retried = getattr(getattr(ctx, "schedules", None), "retried_tasks", {})   # tasks of runs that asked to be tried again later
     provider, model = resolve_model(None, None)
     tz = store.profile()["timezone"]
     text = f"{note}\n\n{prompt}" + (f"\n\n{extra_note}" if extra_note else "")
@@ -1519,7 +1521,7 @@ def start_background(ctx: Any, prompt: str, *, title: str, source: str, owner: s
         if item is None:
             if two_phase:
                 turn.report = collapse_repeat(said.text()) if said else ""   # private: the closing phase decides what the owner reads
-            elif said and said.text().strip() != NO_REPLY and turn.task_id not in retried:   # NO_REPLY (or a retry asked for): nothing joins the chat
+            elif said and said.text().strip() != NO_REPLY:   # NO_REPLY: nothing joins the chat
                 store.add_message("assistant", f"{saved_as}\n" + collapse_repeat(said.text()))
             said.clear()
         else:
